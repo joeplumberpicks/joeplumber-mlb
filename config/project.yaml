@@ -1,0 +1,7 @@
+project_name: joeplumber-mlb
+drive_root: /content/drive/MyDrive/joeplumber-mlb
+paths:
+  raw: data/raw
+  processed: data/processed
+  marts: data/marts
+seasons: [2019, 2020, 2021, 2022, 2023, 2024]
