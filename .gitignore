@@ -1,0 +1,21 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+.env
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Data and parquet outputs
+data/raw/*
+data/processed/*
+data/marts/*
+*.parquet
+
+# Keep placeholders
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/marts/.gitkeep
