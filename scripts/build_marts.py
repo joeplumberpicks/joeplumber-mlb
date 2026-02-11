@@ -24,12 +24,22 @@ def _as_date_norm(s: pd.Series) -> pd.Series:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Build marts from processed spine + events.")
+    p = argparse.ArgumentParser(description="Build MLB marts.")
     p.add_argument("--season", type=int, required=True)
     p.add_argument("--start", type=str, default=None, help="Optional YYYY-MM-DD")
     p.add_argument("--end", type=str, default=None, help="Optional YYYY-MM-DD")
     p.add_argument("--force", action="store_true", help="Overwrite existing parquet outputs.")
     return p.parse_args()
+
+
+def _validate_date(value: str | None, label: str) -> str | None:
+    if value is None:
+        return None
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"{label} must be YYYY-MM-DD; got {value!r}") from exc
+    return value
 
 
 def build_model_spine_game(games: pd.DataFrame, game_runs: pd.DataFrame | None) -> pd.DataFrame:
@@ -50,6 +60,7 @@ def build_model_spine_game(games: pd.DataFrame, game_runs: pd.DataFrame | None) 
         spine["away_runs"] = spine["away_runs_final"]
         spine["total_runs"] = spine.get("total_runs_final", spine["home_runs"] + spine["away_runs"])
     else:
+        # fallback
         spine["home_runs"] = spine.get("home_runs", pd.NA)
         spine["away_runs"] = spine.get("away_runs", pd.NA)
         spine["total_runs"] = spine.get("total_runs", pd.NA)
@@ -59,6 +70,22 @@ def build_model_spine_game(games: pd.DataFrame, game_runs: pd.DataFrame | None) 
 
 def build_team_game(model_spine_game: pd.DataFrame) -> pd.DataFrame:
     g = model_spine_game.copy()
+
+    required = [
+        "game_pk",
+        "season",
+        "game_date",
+        "home_team_id",
+        "home_team_name",
+        "away_team_id",
+        "away_team_name",
+        "home_runs",
+        "away_runs",
+        "total_runs",
+    ]
+    missing = [c for c in required if c not in g.columns]
+    if missing:
+        raise ValueError(f"model_spine_game missing columns needed for team_game: {missing}")
 
     home = pd.DataFrame(
         {
@@ -104,6 +131,7 @@ def build_batter_game(events_pa: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"events_pa missing required columns for batter_game: {missing}")
 
+    # Ensure boolean/int columns exist
     for c in ["is_hit", "is_1b", "is_2b", "is_3b", "is_hr", "is_bb", "is_hbp", "is_so", "is_rbi", "runs_on_play"]:
         if c not in df.columns:
             df[c] = 0
@@ -176,11 +204,9 @@ def main() -> None:
     args = parse_args()
     print(SIGNATURE)
 
-    if args.start:
-        datetime.strptime(args.start, "%Y-%m-%d")
-    if args.end:
-        datetime.strptime(args.end, "%Y-%m-%d")
-    if args.start and args.end and args.start > args.end:
+    start = _validate_date(args.start, "--start")
+    end = _validate_date(args.end, "--end")
+    if start and end and start > end:
         raise ValueError("--start must be <= --end")
 
     config = load_config()
@@ -188,29 +214,26 @@ def main() -> None:
     dirs = resolve_data_dirs(config)
     processed = dirs["processed"]
 
-    games = read_parquet(processed / "games.parquet")
-    games = games[games["season"].astype(int) == int(args.season)].copy()
+    games = read_parquet(processed / "games.parquet").copy()
     games["game_date"] = _as_date_norm(games["game_date"])
+    games = games[games["season"].astype(int) == int(args.season)]
+    if start:
+        games = games[games["game_date"] >= pd.to_datetime(start).normalize()]
+    if end:
+        games = games[games["game_date"] <= pd.to_datetime(end).normalize()]
+    games = games.reset_index(drop=True)
 
-    if args.start:
-        games = games[games["game_date"] >= pd.to_datetime(args.start).normalize()]
-    if args.end:
-        games = games[games["game_date"] <= pd.to_datetime(args.end).normalize()]
-
-    events_pa = read_parquet(processed / "events_pa.parquet")
-    events_pa = events_pa.copy()
+    events_pa = read_parquet(processed / "events_pa.parquet").copy()
     events_pa["game_date"] = _as_date_norm(events_pa["game_date"])
     events_pa = events_pa[events_pa["season"].astype(int) == int(args.season)]
-    if args.start:
-        events_pa = events_pa[events_pa["game_date"] >= pd.to_datetime(args.start).normalize()]
-    if args.end:
-        events_pa = events_pa[events_pa["game_date"] <= pd.to_datetime(args.end).normalize()]
+    if start:
+        events_pa = events_pa[events_pa["game_date"] >= pd.to_datetime(start).normalize()]
+    if end:
+        events_pa = events_pa[events_pa["game_date"] <= pd.to_datetime(end).normalize()]
+    events_pa = events_pa.reset_index(drop=True)
 
     game_runs_path = processed / "game_runs.parquet"
     game_runs = read_parquet(game_runs_path) if game_runs_path.exists() else None
-    if game_runs is not None and not game_runs.empty:
-        game_runs = game_runs.copy()
-        game_runs["game_date"] = _as_date_norm(game_runs["game_date"])
 
     model_spine_game = build_model_spine_game(games, game_runs).sort_values(["game_pk"], kind="mergesort")
     team_game = build_team_game(model_spine_game).sort_values(["game_pk", "team_side"], kind="mergesort")
