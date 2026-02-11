@@ -1,0 +1,8 @@
+pandas
+numpy
+pyarrow
+pyyaml
+tqdm
+requests
+pybaseball
+mlb-statsapi

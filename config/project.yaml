@@ -1,0 +1,10 @@
+project_name: joeplumber-mlb
+drive_root: /content/drive/MyDrive/joeplumber-mlb
+paths:
+  raw: data/raw
+  processed: data/processed
+  marts: data/marts
+seasons: [2019, 2020, 2021, 2022, 2023, 2024]
+features:
+  rolling_windows_days: [3, 7, 15, 30]
+  min_history_days: 45
