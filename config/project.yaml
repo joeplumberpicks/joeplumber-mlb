@@ -5,3 +5,6 @@ paths:
   processed: data/processed
   marts: data/marts
 seasons: [2019, 2020, 2021, 2022, 2023, 2024]
+features:
+  rolling_windows_days: [3, 7, 15, 30]
+  min_history_days: 45
