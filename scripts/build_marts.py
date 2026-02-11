@@ -2,7 +2,7 @@
 """
 Build marts from processed spine + events.
 
-Writes to /data/processed (Drive-rooted via config/project.yaml):
+Writes to processed (Drive-rooted via config/project.yaml):
 - model_spine_game.parquet
 - team_game.parquet
 - batter_game.parquet
@@ -12,7 +12,7 @@ Requires:
 - games.parquet (from build_spine.py)
 - events_pa.parquet (from build_events.py)
 Optional:
-- game_runs.parquet (from build_events.py) – will be used if present
+- game_runs.parquet (from build_events.py)
 """
 
 from __future__ import annotations
@@ -33,25 +33,8 @@ from src.utils.drive import ensure_drive_mounted, resolve_data_dirs
 from src.utils.io import load_config, read_parquet, write_parquet
 
 
-# -------------------------
-# Helpers
-# -------------------------
 def _as_date_norm(s: pd.Series) -> pd.Series:
-    """Datetime normalize to midnight; coercing errors to NaT."""
     return pd.to_datetime(s, errors="coerce").dt.normalize()
-
-
-def _safe_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
-
-
-def _require(df: pd.DataFrame, cols: list[str], name: str) -> None:
-    missing = [c for c in cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"{name} missing required columns: {missing}")
 
 
 def _maybe_overwrite(path: Path, force: bool) -> None:
@@ -59,14 +42,7 @@ def _maybe_overwrite(path: Path, force: bool) -> None:
         raise FileExistsError(f"{path.name} exists. Re-run with --force to overwrite.")
 
 
-# -------------------------
-# Core marts builders
-# -------------------------
 def build_model_spine_game(games: pd.DataFrame, game_runs: pd.DataFrame | None) -> pd.DataFrame:
-    """
-    Merge spine games with run outcomes (final/1st) if available.
-    Ensures `home_runs`, `away_runs`, `total_runs` exist for downstream team_game.
-    """
     games = games.copy()
     games["game_date"] = _as_date_norm(games["game_date"])
 
@@ -74,29 +50,20 @@ def build_model_spine_game(games: pd.DataFrame, game_runs: pd.DataFrame | None) 
 
     if game_runs is not None and not game_runs.empty:
         gr = game_runs.copy()
-        if "game_date" in gr.columns:
-            gr["game_date"] = _as_date_norm(gr["game_date"])
-        else:
-            # allow merge on game_pk only if no date available
-            pass
+        gr["game_date"] = _as_date_norm(gr["game_date"])
 
-        # Normalize merge keys for stability
-        merge_keys = ["game_pk"]
-        if "season" in spine.columns and "season" in gr.columns:
-            merge_keys.append("season")
-        if "game_date" in spine.columns and "game_date" in gr.columns:
-            merge_keys.append("game_date")
+        # Normalize merge keys
+        spine["game_date"] = _as_date_norm(spine["game_date"])
+        gr["game_date"] = _as_date_norm(gr["game_date"])
 
-        spine = spine.merge(gr, on=merge_keys, how="left")
+        spine = spine.merge(gr, on=["game_pk", "season", "game_date"], how="left")
 
-    # Ensure canonical run columns exist (what team_game expects)
-    # Prefer final columns if present
+    # Ensure canonical run columns exist
     if "home_runs_final" in spine.columns and "away_runs_final" in spine.columns:
         spine["home_runs"] = spine["home_runs_final"]
         spine["away_runs"] = spine["away_runs_final"]
         spine["total_runs"] = spine.get("total_runs_final", spine["home_runs"] + spine["away_runs"])
     else:
-        # If no run info exists, keep placeholders (still lets pipeline run)
         spine["home_runs"] = spine.get("home_runs", pd.NA)
         spine["away_runs"] = spine.get("away_runs", pd.NA)
         spine["total_runs"] = spine.get("total_runs", pd.NA)
@@ -105,23 +72,6 @@ def build_model_spine_game(games: pd.DataFrame, game_runs: pd.DataFrame | None) 
 
 
 def build_team_game(model_spine_game: pd.DataFrame) -> pd.DataFrame:
-    """
-    Two rows per game: home + away team. Requires home_runs/away_runs.
-    """
-    needed = [
-        "game_pk",
-        "season",
-        "game_date",
-        "home_team_id",
-        "home_team_name",
-        "away_team_id",
-        "away_team_name",
-        "home_runs",
-        "away_runs",
-        "total_runs",
-    ]
-    _require(model_spine_game, needed, "model_spine_game")
-
     g = model_spine_game.copy()
 
     home = pd.DataFrame(
@@ -139,6 +89,7 @@ def build_team_game(model_spine_game: pd.DataFrame) -> pd.DataFrame:
             "total_runs": g["total_runs"],
         }
     )
+
     away = pd.DataFrame(
         {
             "game_pk": g["game_pk"],
@@ -155,117 +106,93 @@ def build_team_game(model_spine_game: pd.DataFrame) -> pd.DataFrame:
         }
     )
 
-    out = pd.concat([home, away], ignore_index=True)
-    return out
+    return pd.concat([home, away], ignore_index=True)
 
 
 def build_batter_game(events_pa: pd.DataFrame) -> pd.DataFrame:
-    """
-    Batter-game aggregation from PA-level events.
-    Creates a robust minimal schema for rolling features.
-    """
-    batter_col = _safe_col(events_pa, ["batter_id", "batter", "batterId"])
-    game_col = _safe_col(events_pa, ["game_pk", "gamePk", "game_id"])
-    if batter_col is None or game_col is None:
-        raise ValueError("events_pa must include game_pk and batter_id columns (or recognizable variants).")
-
     df = events_pa.copy()
-    df.rename(columns={game_col: "game_pk", batter_col: "batter_id"}, inplace=True)
 
-    # event type column (optional but helpful)
-    ev_col = _safe_col(df, ["event_type", "event", "eventType", "play_event"])
-    if ev_col is None:
-        df["event_type_norm"] = ""
-    else:
-        df["event_type_norm"] = df[ev_col].astype(str).str.lower()
+    # Ensure required columns exist
+    required = ["game_pk", "season", "game_date", "batter_id"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"events_pa missing required columns for batter_game: {missing}")
 
-    # Define common flags (best-effort; works even if event strings vary)
-    et = df["event_type_norm"]
-    df["is_pa"] = 1
-    df["is_bb"] = et.str.contains("walk")
-    df["is_so"] = et.str.contains("strikeout")
-    df["is_hbp"] = et.str.contains("hit_by_pitch|hbp")
-    df["is_single"] = et.str.contains("single")
-    df["is_double"] = et.str.contains("double")
-    df["is_triple"] = et.str.contains("triple")
-    df["is_hr"] = et.str.contains("home_run|homered|home run|hr")
+    df["game_date"] = _as_date_norm(df["game_date"])
 
-    # Hits & TB (approx)
-    df["is_hit"] = df["is_single"] | df["is_double"] | df["is_triple"] | df["is_hr"]
+    # Use provided boolean flags (already present in your events_pa)
+    for c in ["is_hit", "is_1b", "is_2b", "is_3b", "is_hr", "is_bb", "is_hbp", "is_so", "is_rbi"]:
+        if c not in df.columns:
+            df[c] = 0
+
+    df["pa"] = 1
+    df["ab"] = ((df["is_bb"] == 0) & (df["is_hbp"] == 0)).astype(int)
+    df["h"] = df["is_hit"].astype(int)
+
+    # Total bases from flags
     df["tb"] = (
-        df["is_single"].astype(int) * 1
-        + df["is_double"].astype(int) * 2
-        + df["is_triple"].astype(int) * 3
+        df["is_1b"].astype(int) * 1
+        + df["is_2b"].astype(int) * 2
+        + df["is_3b"].astype(int) * 3
         + df["is_hr"].astype(int) * 4
     )
 
-    # AB proxy: count PA that are not BB/HBP (best-effort)
-    df["is_ab"] = (~df["is_bb"] & ~df["is_hbp"]).astype(int)
-
-    agg = (
-        df.groupby(["game_pk", "batter_id"], as_index=False)
+    out = (
+        df.groupby(["game_pk", "season", "game_date", "batter_id"], as_index=False)
         .agg(
-            pa=("is_pa", "sum"),
-            ab=("is_ab", "sum"),
+            pa=("pa", "sum"),
+            ab=("ab", "sum"),
+            h=("h", "sum"),
+            tb=("tb", "sum"),
+            hr=("is_hr", "sum"),
+            bb=("is_bb", "sum"),
+            so=("is_so", "sum"),
+            hbp=("is_hbp", "sum"),
+            rbi=("is_rbi", "sum"),
+            runs_on_play=("runs_on_play", "sum"),
+        )
+        .sort_values(["game_pk", "batter_id"], kind="mergesort")
+        .reset_index(drop=True)
+    )
+
+    return out
+
+
+def build_pitcher_game(events_pa: pd.DataFrame) -> pd.DataFrame:
+    df = events_pa.copy()
+
+    required = ["game_pk", "season", "game_date", "pitcher_id"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"events_pa missing required columns for pitcher_game: {missing}")
+
+    df["game_date"] = _as_date_norm(df["game_date"])
+
+    for c in ["is_hit", "is_hr", "is_bb", "is_hbp", "is_so", "outs_on_play", "runs_on_play"]:
+        if c not in df.columns:
+            df[c] = 0
+
+    df["bf"] = 1
+
+    out = (
+        df.groupby(["game_pk", "season", "game_date", "pitcher_id"], as_index=False)
+        .agg(
+            batters_faced=("bf", "sum"),
             h=("is_hit", "sum"),
             hr=("is_hr", "sum"),
             bb=("is_bb", "sum"),
             so=("is_so", "sum"),
             hbp=("is_hbp", "sum"),
-            tb=("tb", "sum"),
-        )
-        .sort_values(["game_pk", "batter_id"], kind="mergesort")
-        .reset_index(drop=True)
-    )
-    return agg
-
-
-def build_pitcher_game(events_pa: pd.DataFrame) -> pd.DataFrame:
-    """
-    Pitcher-game aggregation from PA-level events.
-    Minimal schema for rolling pitcher features.
-    """
-    pitcher_col = _safe_col(events_pa, ["pitcher_id", "pitcher", "pitcherId"])
-    game_col = _safe_col(events_pa, ["game_pk", "gamePk", "game_id"])
-    if pitcher_col is None or game_col is None:
-        raise ValueError("events_pa must include game_pk and pitcher_id columns (or recognizable variants).")
-
-    df = events_pa.copy()
-    df.rename(columns={game_col: "game_pk", pitcher_col: "pitcher_id"}, inplace=True)
-
-    ev_col = _safe_col(df, ["event_type", "event", "eventType", "play_event"])
-    if ev_col is None:
-        df["event_type_norm"] = ""
-    else:
-        df["event_type_norm"] = df[ev_col].astype(str).str.lower()
-
-    et = df["event_type_norm"]
-    df["bf"] = 1
-    df["so"] = et.str.contains("strikeout").astype(int)
-    df["bb"] = et.str.contains("walk").astype(int)
-    df["hbp"] = et.str.contains("hit_by_pitch|hbp").astype(int)
-    df["hr"] = et.str.contains("home_run|homered|home run|hr").astype(int)
-    df["h"] = (et.str.contains("single|double|triple|home_run|homered|home run|hr")).astype(int)
-
-    agg = (
-        df.groupby(["game_pk", "pitcher_id"], as_index=False)
-        .agg(
-            batters_faced=("bf", "sum"),
-            h=("h", "sum"),
-            hr=("hr", "sum"),
-            bb=("bb", "sum"),
-            so=("so", "sum"),
-            hbp=("hbp", "sum"),
+            outs=("outs_on_play", "sum"),
+            runs=("runs_on_play", "sum"),
         )
         .sort_values(["game_pk", "pitcher_id"], kind="mergesort")
         .reset_index(drop=True)
     )
-    return agg
+
+    return out
 
 
-# -------------------------
-# CLI / main
-# -------------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build marts (model spine + team + batter/pitcher game tables).")
     p.add_argument("--season", type=int, required=True)
@@ -278,7 +205,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # validate date args
     if args.start:
         datetime.strptime(args.start, "%Y-%m-%d")
     if args.end:
@@ -292,24 +218,34 @@ def main() -> None:
     processed = dirs["processed"]
 
     games = read_parquet(processed / "games.parquet")
-    # filter by season and optional date window
-    if "season" in games.columns:
-        games = games[games["season"].astype(int) == int(args.season)].copy()
+    games = games[games["season"].astype(int) == int(args.season)].copy()
+    games["game_date"] = _as_date_norm(games["game_date"])
 
-    if args.start or args.end:
-        games = games.copy()
-        games["game_date"] = _as_date_norm(games["game_date"])
-        if args.start:
-            games = games[games["game_date"] >= pd.to_datetime(args.start).normalize()]
-        if args.end:
-            games = games[games["game_date"] <= pd.to_datetime(args.end).normalize()]
+    if args.start:
+        games = games[games["game_date"] >= pd.to_datetime(args.start).normalize()]
+    if args.end:
+        games = games[games["game_date"] <= pd.to_datetime(args.end).normalize()]
 
-    # events_pa is required for batter/pitcher game
     events_pa = read_parquet(processed / "events_pa.parquet")
+    # keep only same season/window for stability
+    events_pa = events_pa.copy()
+    events_pa["game_date"] = _as_date_norm(events_pa["game_date"])
+    events_pa = events_pa[events_pa["season"].astype(int) == int(args.season)]
+    if args.start:
+        events_pa = events_pa[events_pa["game_date"] >= pd.to_datetime(args.start).normalize()]
+    if args.end:
+        events_pa = events_pa[events_pa["game_date"] <= pd.to_datetime(args.end).normalize()]
 
-    # game_runs optional
     game_runs_path = processed / "game_runs.parquet"
     game_runs = read_parquet(game_runs_path) if game_runs_path.exists() else None
+    if game_runs is not None and not game_runs.empty:
+        game_runs = game_runs.copy()
+        game_runs["game_date"] = _as_date_norm(game_runs["game_date"])
+        game_runs = game_runs[game_runs["season"].astype(int) == int(args.season)]
+        if args.start:
+            game_runs = game_runs[game_runs["game_date"] >= pd.to_datetime(args.start).normalize()]
+        if args.end:
+            game_runs = game_runs[game_runs["game_date"] <= pd.to_datetime(args.end).normalize()]
 
     model_spine_game = build_model_spine_game(games, game_runs).sort_values(["game_pk"], kind="mergesort")
     team_game = build_team_game(model_spine_game).sort_values(["game_pk", "team_side"], kind="mergesort")
@@ -317,21 +253,19 @@ def main() -> None:
     batter_game = build_batter_game(events_pa)
     pitcher_game = build_pitcher_game(events_pa)
 
-    # Output paths
     out_model = processed / "model_spine_game.parquet"
     out_team = processed / "team_game.parquet"
     out_batter = processed / "batter_game.parquet"
     out_pitcher = processed / "pitcher_game.parquet"
 
-    for p in (out_model, out_team, out_batter, out_pitcher):
-        _maybe_overwrite(p, args.force)
+    for pth in (out_model, out_team, out_batter, out_pitcher):
+        _maybe_overwrite(pth, args.force)
 
     write_parquet(model_spine_game, out_model)
     write_parquet(team_game, out_team)
     write_parquet(batter_game, out_batter)
     write_parquet(pitcher_game, out_pitcher)
 
-    print(f"model_spine_game columns: {list(model_spine_game.columns)}")
     print(f"model_spine_game rows: {len(model_spine_game)}")
     print(f"team_game rows: {len(team_game)}")
     print(f"batter_game rows: {len(batter_game)}")
