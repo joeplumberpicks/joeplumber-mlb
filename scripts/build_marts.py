@@ -133,22 +133,36 @@ def build_model_spine_game(games: pd.DataFrame, game_runs: pd.DataFrame) -> pd.D
 
 def build_team_game(model_spine_game: pd.DataFrame) -> pd.DataFrame:
     """
-    Two rows per game: home + away with runs, opponent, and basic context.
+    Two rows per game: home + away. Robust to run column naming differences:
+    - accepts home_runs/away_runs OR home_runs_final/away_runs_final
     """
     if model_spine_game.empty:
         return pd.DataFrame()
 
-    required = ["game_pk", "season", "game_date", "home_runs", "away_runs", "home_team_id", "away_team_id"]
-    missing = [c for c in required if c not in model_spine_game.columns]
+    g = model_spine_game.copy()
+
+    # ---- FIX: support *_final naming ----
+    if "home_runs" not in g.columns and "home_runs_final" in g.columns:
+        g["home_runs"] = pd.to_numeric(g["home_runs_final"], errors="coerce")
+    if "away_runs" not in g.columns and "away_runs_final" in g.columns:
+        g["away_runs"] = pd.to_numeric(g["away_runs_final"], errors="coerce")
+
+    # Also handle 1st inning if needed
+    if "home_runs_1st" not in g.columns and "home_runs_first" in g.columns:
+        g["home_runs_1st"] = pd.to_numeric(g["home_runs_first"], errors="coerce")
+    if "away_runs_1st" not in g.columns and "away_runs_first" in g.columns:
+        g["away_runs_1st"] = pd.to_numeric(g["away_runs_first"], errors="coerce")
+
+    required = ["game_pk", "season", "game_date", "home_team_id", "away_team_id", "home_runs", "away_runs"]
+    missing = [c for c in required if c not in g.columns]
     if missing:
         raise ValueError(f"model_spine_game missing columns needed for team_game: {missing}")
 
-    g = model_spine_game.copy()
-
-    # Ensure first-inning cols exist
-    for c in ["home_runs_1st", "away_runs_1st"]:
-        if c not in g.columns:
-            g[c] = pd.NA
+    # Ensure these exist (safe defaults)
+    if "home_runs_1st" not in g.columns:
+        g["home_runs_1st"] = pd.NA
+    if "away_runs_1st" not in g.columns:
+        g["away_runs_1st"] = pd.NA
 
     home = pd.DataFrame(
         {
@@ -162,6 +176,7 @@ def build_team_game(model_spine_game: pd.DataFrame) -> pd.DataFrame:
             "runs_1st": g["home_runs_1st"],
         }
     )
+
     away = pd.DataFrame(
         {
             "game_pk": g["game_pk"],
