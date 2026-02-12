@@ -57,6 +57,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-partial", action="store_true", help="Allow <90% starter-context join coverage.")
     parser.add_argument("--with-bullpen", action="store_true", help="Enable optional bullpen context merge.")
     parser.add_argument("--with-offense", action="store_true", help="Enable optional offense discipline merge.")
+    parser.add_argument("--with-weather", action="store_true", help="Enable weather_game merge.")
+    parser.add_argument("--with-weather-factors", action="store_true", help="Enable weather_factors_game merge.")
+    parser.add_argument("--weather", type=str, default=None, help="Weather game path override.")
+    parser.add_argument("--weather-factors", type=str, default=None, help="Weather factors game path override.")
     return parser.parse_args()
 
 
@@ -99,6 +103,28 @@ def main() -> None:
 
     pitches_path = Path(args.pitches) if args.pitches else Path(f"data/raw/statcast/pitches_{args.season}.parquet")
 
+    weather_path: Path | None = None
+    if args.with_weather:
+        weather_path = Path(args.weather) if args.weather else Path(f"data/processed/weather_game_{args.season}.parquet")
+        if not weather_path.exists():
+            raise FileNotFoundError(
+                "--with-weather was set but weather game parquet is missing: "
+                f"{weather_path}. Build it with scripts/build_weather_game.py first."
+            )
+
+    weather_factors_path: Path | None = None
+    if args.with_weather_factors:
+        weather_factors_path = (
+            Path(args.weather_factors)
+            if args.weather_factors
+            else Path(f"data/processed/weather_factors_game_{args.season}.parquet")
+        )
+        if not weather_factors_path.exists():
+            raise FileNotFoundError(
+                "--with-weather-factors was set but weather factors parquet is missing: "
+                f"{weather_factors_path}. Build it with scripts/train_weather_factors.py first."
+            )
+
     build_and_write_model_features_game(
         season=args.season,
         spine_path=spine_path,
@@ -106,6 +132,8 @@ def main() -> None:
         output_path=output_path,
         bullpen_path=bullpen_path,
         offense_path=offense_path,
+        weather_game_path=weather_path,
+        weather_factors_path=weather_factors_path,
         pitches_path=pitches_path if pitches_path.exists() else None,
         start=args.start,
         end=args.end,

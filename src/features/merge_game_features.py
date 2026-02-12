@@ -153,6 +153,38 @@ def _merge_optional_offense(
     return out
 
 
+def _merge_optional_weather_game(out: pd.DataFrame, weather_game: pd.DataFrame) -> pd.DataFrame:
+    req = {"game_date", "game_pk"}
+    miss = req - set(weather_game.columns)
+    if miss:
+        raise ValueError(f"weather_game missing required columns: {sorted(miss)}")
+
+    wx = weather_game.copy()
+    wx["game_date"] = pd.to_datetime(wx["game_date"], errors="coerce").dt.normalize()
+    wx["game_pk"] = pd.to_numeric(wx["game_pk"], errors="coerce").astype("Int64")
+    wx = wx.sort_values(["game_date", "game_pk"], kind="mergesort")
+    wx = wx.drop_duplicates(subset=["game_pk"], keep="first")
+
+    drop_cols = [c for c in ["home_team", "away_team"] if c in wx.columns]
+    if drop_cols:
+        wx = wx.drop(columns=drop_cols)
+    return out.merge(wx, on=["game_date", "game_pk"], how="left")
+
+
+def _merge_optional_weather_factors(out: pd.DataFrame, weather_factors: pd.DataFrame) -> pd.DataFrame:
+    req = {"game_date", "game_pk"}
+    miss = req - set(weather_factors.columns)
+    if miss:
+        raise ValueError(f"weather_factors_game missing required columns: {sorted(miss)}")
+
+    wf = weather_factors.copy()
+    wf["game_date"] = pd.to_datetime(wf["game_date"], errors="coerce").dt.normalize()
+    wf["game_pk"] = pd.to_numeric(wf["game_pk"], errors="coerce").astype("Int64")
+    wf = wf.sort_values(["game_date", "game_pk"], kind="mergesort")
+    wf = wf.drop_duplicates(subset=["game_pk"], keep="first")
+    return out.merge(wf, on=["game_date", "game_pk"], how="left")
+
+
 def build_model_features_game(
     season: int,
     spine: pd.DataFrame,
@@ -160,6 +192,8 @@ def build_model_features_game(
     *,
     bullpen: pd.DataFrame | None = None,
     offense: pd.DataFrame | None = None,
+    weather_game: pd.DataFrame | None = None,
+    weather_factors: pd.DataFrame | None = None,
     hand_lookup: pd.Series | None = None,
     start: str | None = None,
     end: str | None = None,
@@ -247,6 +281,12 @@ def build_model_features_game(
     if offense is not None:
         out = _merge_optional_offense(out, offense, hand_lookup=hand_lookup)
 
+    if weather_game is not None:
+        out = _merge_optional_weather_game(out, weather_game)
+
+    if weather_factors is not None:
+        out = _merge_optional_weather_factors(out, weather_factors)
+
     out = out.sort_values(["game_date", "game_pk"], kind="mergesort").reset_index(drop=True)
     return out
 
@@ -259,6 +299,8 @@ def build_and_write_model_features_game(
     *,
     bullpen_path: Path | None = None,
     offense_path: Path | None = None,
+    weather_game_path: Path | None = None,
+    weather_factors_path: Path | None = None,
     pitches_path: Path | None = None,
     start: str | None = None,
     end: str | None = None,
@@ -271,6 +313,10 @@ def build_and_write_model_features_game(
     context = _load_required(context_path, "statcast game context")
     bullpen = _load_required(bullpen_path, "bullpen context") if bullpen_path is not None else None
     offense = _load_required(offense_path, "offense discipline") if offense_path is not None else None
+    weather_game = _load_required(weather_game_path, "weather game") if weather_game_path is not None else None
+    weather_factors = (
+        _load_required(weather_factors_path, "weather factors game") if weather_factors_path is not None else None
+    )
 
     hand_lookup = pd.Series(dtype="string")
     if pitches_path is not None and pitches_path.exists():
@@ -282,6 +328,8 @@ def build_and_write_model_features_game(
         context=context,
         bullpen=bullpen,
         offense=offense,
+        weather_game=weather_game,
+        weather_factors=weather_factors,
         hand_lookup=hand_lookup,
         start=start,
         end=end,

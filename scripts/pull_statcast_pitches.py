@@ -23,6 +23,7 @@ from src.statcast_ingestion import (
 )
 from src.utils.io import load_config, read_parquet, write_parquet
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Pull pitch-by-pitch Statcast data and save parquet output."

@@ -342,3 +342,29 @@ Run hitter Walks inference:
 ```bash
 python scripts/infer_hitter_bb.py --season 2024
 ```
+
+
+## Weather layer
+
+Weather park mapping is season-aware and supports per-game venue overrides.
+Default mappings live in `data/reference/mlb_stadiums.csv`, and special-series overrides
+(e.g., Athletics home series in Las Vegas) can be set in `data/reference/park_overrides.csv`.
+
+Build game-level weather features (hour nearest first pitch):
+
+```bash
+python scripts/build_weather_game.py --season 2024
+```
+
+Train weather effects models and create per-game weather factors:
+
+```bash
+python scripts/train_weather_factors.py --season 2024
+```
+
+Merge shared game features with weather + weather factors:
+
+```bash
+python scripts/build_model_features_game.py --season 2024 --with-weather --with-weather-factors
+```
+
