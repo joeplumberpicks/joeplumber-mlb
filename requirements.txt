@@ -6,3 +6,4 @@ tqdm
 requests
 pybaseball
 mlb-statsapi
+scikit-learn
