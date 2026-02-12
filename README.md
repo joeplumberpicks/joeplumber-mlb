@@ -19,6 +19,11 @@ Milestone 1 foundation for a Colab-first MLB modeling repo that writes spine tab
    ```bash
    !pip install -r requirements.txt
    ```
+4. **(Recommended in Colab) Set Drive data root for all scripts:**
+   ```bash
+   export JOEPLUMBER_DATA_ROOT=/content/drive/MyDrive/joeplumber-mlb/data
+   ```
+   Omit this for local development to use the repository-local `data/` directory.
 
 ## Backbone workflow
 
