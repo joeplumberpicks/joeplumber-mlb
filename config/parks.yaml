@@ -1,5 +1,6 @@
 shrink_k: 30
 min_games_prior: 10
+min_games_prior_split: 10
 hr_mult_clip: [0.75, 1.30]
 runs_delta_clip: [-0.8, 0.8]
 yrfi_delta_clip: [-0.08, 0.08]

@@ -378,7 +378,7 @@ Build deterministic per-game park reference table:
 python scripts/build_park_game.py --season 2024
 ```
 
-Train leakage-safe per-game park factors (HR / runs / YRFI):
+Train leakage-safe per-game park factors (HR / runs / YRFI), including handedness splits (`vsR`/`vsL`):
 
 ```bash
 python scripts/train_park_factors.py --season 2024
@@ -393,3 +393,6 @@ python scripts/build_model_features_game.py --season 2024 --with-park --with-par
 Default outputs:
 - `data/processed/park_game_{season}.parquet`
 - `data/processed/park_factors_game_{season}.parquet`
+
+`park_hr_mult_vsR` and `park_hr_mult_vsL` are batter-handedness buckets (fallback to pitcher-hand buckets only if batter hand is unavailable in upstream data).
+Hitter and pitcher models can consume these as park-context interaction features (e.g. handedness-adjusted HR environment).

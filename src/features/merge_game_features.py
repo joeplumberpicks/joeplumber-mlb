@@ -233,7 +233,20 @@ def _merge_optional_park_factors(out: pd.DataFrame, park_factors: pd.DataFrame) 
 
     keep_cols = [
         c
-        for c in ["game_date", "game_pk", "park_games_prior", "park_hr_mult", "park_runs_delta", "park_yrfi_delta"]
+        for c in [
+            "game_date",
+            "game_pk",
+            "park_games_prior",
+            "park_hr_mult",
+            "park_runs_delta",
+            "park_yrfi_delta",
+            "park_hr_mult_vsR",
+            "park_hr_mult_vsL",
+            "park_games_prior_vsR",
+            "park_games_prior_vsL",
+            "park_hr_rate_vsR_prior",
+            "park_hr_rate_vsL_prior",
+        ]
         if c in pf.columns
     ]
     return out.merge(pf[keep_cols], on=["game_date", "game_pk"], how="left")
