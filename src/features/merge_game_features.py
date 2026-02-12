@@ -185,6 +185,59 @@ def _merge_optional_weather_factors(out: pd.DataFrame, weather_factors: pd.DataF
     return out.merge(wf, on=["game_date", "game_pk"], how="left")
 
 
+
+
+def _merge_optional_park_game(out: pd.DataFrame, park_game: pd.DataFrame) -> pd.DataFrame:
+    req = {"game_date", "game_pk", "park_id"}
+    miss = req - set(park_game.columns)
+    if miss:
+        raise ValueError(f"park_game missing required columns: {sorted(miss)}")
+
+    pg = park_game.copy()
+    pg["game_date"] = pd.to_datetime(pg["game_date"], errors="coerce").dt.normalize()
+    pg["game_pk"] = pd.to_numeric(pg["game_pk"], errors="coerce").astype("Int64")
+    pg = pg.sort_values(["game_date", "game_pk"], kind="mergesort")
+    pg = pg.drop_duplicates(subset=["game_pk"], keep="first")
+
+    keep_cols = [
+        c
+        for c in [
+            "game_date",
+            "game_pk",
+            "park_id",
+            "roof_type",
+            "cf_bearing_deg",
+            "lat",
+            "lon",
+            "timezone",
+            "stadium_name",
+            "city",
+            "state",
+        ]
+        if c in pg.columns
+    ]
+    return out.merge(pg[keep_cols], on=["game_date", "game_pk"], how="left")
+
+
+def _merge_optional_park_factors(out: pd.DataFrame, park_factors: pd.DataFrame) -> pd.DataFrame:
+    req = {"game_date", "game_pk"}
+    miss = req - set(park_factors.columns)
+    if miss:
+        raise ValueError(f"park_factors_game missing required columns: {sorted(miss)}")
+
+    pf = park_factors.copy()
+    pf["game_date"] = pd.to_datetime(pf["game_date"], errors="coerce").dt.normalize()
+    pf["game_pk"] = pd.to_numeric(pf["game_pk"], errors="coerce").astype("Int64")
+    pf = pf.sort_values(["game_date", "game_pk"], kind="mergesort")
+    pf = pf.drop_duplicates(subset=["game_pk"], keep="first")
+
+    keep_cols = [
+        c
+        for c in ["game_date", "game_pk", "park_games_prior", "park_hr_mult", "park_runs_delta", "park_yrfi_delta"]
+        if c in pf.columns
+    ]
+    return out.merge(pf[keep_cols], on=["game_date", "game_pk"], how="left")
+
 def build_model_features_game(
     season: int,
     spine: pd.DataFrame,
@@ -194,6 +247,8 @@ def build_model_features_game(
     offense: pd.DataFrame | None = None,
     weather_game: pd.DataFrame | None = None,
     weather_factors: pd.DataFrame | None = None,
+    park_game: pd.DataFrame | None = None,
+    park_factors: pd.DataFrame | None = None,
     hand_lookup: pd.Series | None = None,
     start: str | None = None,
     end: str | None = None,
@@ -287,6 +342,31 @@ def build_model_features_game(
     if weather_factors is not None:
         out = _merge_optional_weather_factors(out, weather_factors)
 
+    if park_game is not None:
+        out = _merge_optional_park_game(out, park_game)
+
+    if park_factors is not None:
+        out = _merge_optional_park_factors(out, park_factors)
+
+    if park_game is not None:
+        park_match = float(out["park_id"].notna().mean()) if "park_id" in out.columns and len(out) else 0.0
+        if park_match < 0.95:
+            msg = f"Park game merge match rate below 95%: {park_match:.4f}"
+            if allow_partial:
+                log.warning(msg)
+            else:
+                raise SystemExit(2)
+
+    if park_factors is not None:
+        pf_col = "park_hr_mult" if "park_hr_mult" in out.columns else None
+        pf_match = float(out[pf_col].notna().mean()) if pf_col and len(out) else 0.0
+        if pf_match < 0.95:
+            msg = f"Park factors merge match rate below 95%: {pf_match:.4f}"
+            if allow_partial:
+                log.warning(msg)
+            else:
+                raise SystemExit(2)
+
     out = out.sort_values(["game_date", "game_pk"], kind="mergesort").reset_index(drop=True)
     return out
 
@@ -301,6 +381,8 @@ def build_and_write_model_features_game(
     offense_path: Path | None = None,
     weather_game_path: Path | None = None,
     weather_factors_path: Path | None = None,
+    park_game_path: Path | None = None,
+    park_factors_path: Path | None = None,
     pitches_path: Path | None = None,
     start: str | None = None,
     end: str | None = None,
@@ -317,6 +399,8 @@ def build_and_write_model_features_game(
     weather_factors = (
         _load_required(weather_factors_path, "weather factors game") if weather_factors_path is not None else None
     )
+    park_game = _load_required(park_game_path, "park game") if park_game_path is not None else None
+    park_factors = _load_required(park_factors_path, "park factors game") if park_factors_path is not None else None
 
     hand_lookup = pd.Series(dtype="string")
     if pitches_path is not None and pitches_path.exists():
@@ -330,6 +414,8 @@ def build_and_write_model_features_game(
         offense=offense,
         weather_game=weather_game,
         weather_factors=weather_factors,
+        park_game=park_game,
+        park_factors=park_factors,
         hand_lookup=hand_lookup,
         start=start,
         end=end,

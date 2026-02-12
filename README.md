@@ -368,3 +368,28 @@ Merge shared game features with weather + weather factors:
 python scripts/build_model_features_game.py --season 2024 --with-weather --with-weather-factors
 ```
 
+
+
+## Park layer
+
+Build deterministic per-game park reference table:
+
+```bash
+python scripts/build_park_game.py --season 2024
+```
+
+Train leakage-safe per-game park factors (HR / runs / YRFI):
+
+```bash
+python scripts/train_park_factors.py --season 2024
+```
+
+Merge shared game features with park metadata + park factors:
+
+```bash
+python scripts/build_model_features_game.py --season 2024 --with-park --with-park-factors
+```
+
+Default outputs:
+- `data/processed/park_game_{season}.parquet`
+- `data/processed/park_factors_game_{season}.parquet`

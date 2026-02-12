@@ -61,6 +61,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--with-weather-factors", action="store_true", help="Enable weather_factors_game merge.")
     parser.add_argument("--weather", type=str, default=None, help="Weather game path override.")
     parser.add_argument("--weather-factors", type=str, default=None, help="Weather factors game path override.")
+    parser.add_argument("--with-park", action="store_true", help="Enable park_game merge.")
+    parser.add_argument("--park", type=str, default=None, help="Park game path override.")
+    parser.add_argument("--with-park-factors", action="store_true", help="Enable park_factors_game merge.")
+    parser.add_argument("--park-factors", type=str, default=None, help="Park factors path override.")
     return parser.parse_args()
 
 
@@ -125,6 +129,29 @@ def main() -> None:
                 f"{weather_factors_path}. Build it with scripts/train_weather_factors.py first."
             )
 
+
+    park_path: Path | None = None
+    if args.with_park:
+        park_path = Path(args.park) if args.park else Path(f"data/processed/park_game_{args.season}.parquet")
+        if not park_path.exists():
+            raise FileNotFoundError(
+                "--with-park was set but park_game parquet is missing: "
+                f"{park_path}. Build it with scripts/build_park_game.py first."
+            )
+
+    park_factors_path: Path | None = None
+    if args.with_park_factors:
+        park_factors_path = (
+            Path(args.park_factors)
+            if args.park_factors
+            else Path(f"data/processed/park_factors_game_{args.season}.parquet")
+        )
+        if not park_factors_path.exists():
+            raise FileNotFoundError(
+                "--with-park-factors was set but park_factors parquet is missing: "
+                f"{park_factors_path}. Build it with scripts/train_park_factors.py first."
+            )
+
     build_and_write_model_features_game(
         season=args.season,
         spine_path=spine_path,
@@ -134,6 +161,8 @@ def main() -> None:
         offense_path=offense_path,
         weather_game_path=weather_path,
         weather_factors_path=weather_factors_path,
+        park_game_path=park_path,
+        park_factors_path=park_factors_path,
         pitches_path=pitches_path if pitches_path.exists() else None,
         start=args.start,
         end=args.end,
