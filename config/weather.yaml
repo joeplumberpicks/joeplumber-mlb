@@ -1,0 +1,15 @@
+provider: visualcrossing
+visualcrossing_api_key_env: VISUAL_CROSSING_API_KEY
+timezone_default: America/New_York
+query:
+  granularity: hourly
+  max_retries: 4
+  base_backoff_seconds: 1.0
+  backoff_cap_seconds: 30.0
+  timeout_seconds: 25
+park_bearing_to_cf_deg:
+  default: 0
+  SUTTER_HEALTH_PARK: 0
+  STEINBRENNER_FIELD: 0
+  TROPICANA_FIELD:
+  LAS_VEGAS_BALLPARK:
