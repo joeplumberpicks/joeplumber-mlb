@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, time, timedelta
+from datetime import time, timedelta
 from pathlib import Path
 
 import pandas as pd
 import yaml
 
+from src.utils.paths import reference_dir
 from src.weather.features import add_weather_transforms
 from src.weather.providers import NWSClient, RetryConfig, VisualCrossingClient
 from src.weather.stadiums import load_park_overrides, load_stadium_reference, resolve_park_for_game
-from src.utils.paths import reference_dir
 
 
 def _load_yaml(path: Path) -> dict:
@@ -96,6 +96,19 @@ def _resolve_games(games: pd.DataFrame, spine: pd.DataFrame | None, season: int)
     return g.reset_index(drop=True)
 
 
+def _filter_regular_season(games: pd.DataFrame, include_spring_training: bool, log: logging.Logger) -> pd.DataFrame:
+    if include_spring_training:
+        return games
+    gt_col = next((c for c in ["game_type", "type", "gameType"] if c in games.columns), None)
+    if gt_col is None:
+        return games
+    before = len(games)
+    out = games.loc[games[gt_col].astype("string").str.upper() == "R"].copy()
+    dropped = before - len(out)
+    log.info("regular_season_filter column=%s dropped=%d kept=%d", gt_col, dropped, len(out))
+    return out
+
+
 def build_weather_game(
     season: int,
     start: str | None,
@@ -107,6 +120,7 @@ def build_weather_game(
     *,
     max_games: int | None = None,
     allow_partial: bool = False,
+    include_spring_training: bool = False,
     config_path: Path = Path("config/weather.yaml"),
     overrides_path: Path = reference_dir() / "park_overrides.csv",
     logger: logging.Logger | None = None,
@@ -117,6 +131,7 @@ def build_weather_game(
         raise FileNotFoundError(f"Missing games parquet: {games_path}")
 
     games = pd.read_parquet(games_path, engine="pyarrow")
+    games = _filter_regular_season(games, include_spring_training=include_spring_training, log=log)
     spine = pd.read_parquet(spine_path, engine="pyarrow") if spine_path and spine_path.exists() else None
     cfg = _load_yaml(config_path)
     provider_name = provider or str(cfg.get("provider", "visualcrossing"))
@@ -161,7 +176,7 @@ def build_weather_game(
 
     if unresolved_count > 0:
         sample = base.loc[unresolved_mask, ["game_pk", "home_team", "game_date"]].head(10)
-        log.warning("park_unresolved_samples:\n%s", sample.to_string(index=False))
+        log.warning("park_unresolved_samples\n%s", sample.to_string(index=False))
 
     if unresolved_rate > 0.05 and not allow_partial:
         raise SystemExit(
@@ -173,7 +188,8 @@ def build_weather_game(
     missing_coords = base["lat"].isna() | base["lon"].isna()
     if missing_coords.any():
         missing_parks = sorted(base.loc[missing_coords, "park_id"].dropna().unique().tolist())
-        raise ValueError(f"Missing stadium coordinates for resolved park_ids: {missing_parks}")
+        if missing_parks:
+            raise ValueError(f"Missing stadium coordinates for resolved park_ids: {missing_parks}")
 
     rows: list[dict[str, object]] = []
     for rec in base.to_dict(orient="records"):
@@ -262,3 +278,15 @@ def build_weather_game(
     out.to_parquet(out_path, index=False, engine="pyarrow")
     log.info("wrote_weather_game rows=%d path=%s", len(out), out_path)
     return out
+
+
+def run_smoke_test(season: int, games_path: Path, spine_path: Path, logger: logging.Logger | None = None) -> None:
+    log = logger or logging.getLogger(__name__)
+    games = pd.read_parquet(games_path, engine="pyarrow")
+    spine = pd.read_parquet(spine_path, engine="pyarrow") if spine_path.exists() else None
+    filtered = _filter_regular_season(games, include_spring_training=False, log=log)
+    resolved = _resolve_games(filtered, spine=spine, season=season)
+    if resolved.empty:
+        raise AssertionError("Weather smoke test produced empty resolved games")
+    unresolved = resolved["home_team"].isna().mean()
+    log.info("weather_smoke_ok season=%s rows=%d unresolved_home_team_rate=%.4f", season, len(resolved), unresolved)

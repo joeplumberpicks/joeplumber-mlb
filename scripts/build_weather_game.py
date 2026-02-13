@@ -10,8 +10,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.weather.build_weather_game import build_weather_game
 from src.utils.paths import get_data_root, processed_dir, reference_dir
+from src.weather.build_weather_game import build_weather_game, run_smoke_test
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-games", type=int, default=None)
     parser.add_argument("--overrides", type=str, default=str(reference_dir() / "park_overrides.csv"))
     parser.add_argument("--allow-partial", action="store_true")
+    parser.add_argument("--include-spring-training", action="store_true")
+    parser.add_argument("--smoke-test", action="store_true")
     return parser.parse_args()
 
 
@@ -33,8 +35,17 @@ def main() -> None:
     print(f"Using data root: {get_data_root()}")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
     args = parse_args()
-    output = Path(args.output) if args.output else (processed_dir() / f"weather_game_{args.season}.parquet")
 
+    if args.smoke_test:
+        run_smoke_test(
+            season=args.season,
+            games_path=Path(args.games),
+            spine_path=Path(args.spine),
+            logger=logging.getLogger("build_weather_game"),
+        )
+        return
+
+    output = Path(args.output) if args.output else (processed_dir() / f"weather_game_{args.season}.parquet")
     build_weather_game(
         season=args.season,
         start=args.start,
@@ -45,6 +56,7 @@ def main() -> None:
         provider=args.provider,
         max_games=args.max_games,
         allow_partial=args.allow_partial,
+        include_spring_training=args.include_spring_training,
         overrides_path=Path(args.overrides),
         logger=logging.getLogger("build_weather_game"),
     )

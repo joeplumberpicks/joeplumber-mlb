@@ -355,10 +355,16 @@ Weather park mapping is season-aware and supports per-game venue overrides.
 Default mappings live in `data/reference/mlb_stadiums.csv`, and special-series overrides
 (e.g., Athletics home series in Las Vegas) can be set in `data/reference/park_overrides.csv`.
 
-Build game-level weather features (hour nearest first pitch):
+Build game-level weather features (hour nearest first pitch). By default this keeps regular-season games only (`game_type == "R"` when available):
 
 ```bash
 python scripts/build_weather_game.py --season 2024
+```
+
+Include spring-training games explicitly if needed:
+
+```bash
+python scripts/build_weather_game.py --season 2024 --include-spring-training
 ```
 
 Train weather effects models and create per-game weather factors:
