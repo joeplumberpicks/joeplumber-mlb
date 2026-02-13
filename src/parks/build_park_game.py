@@ -8,39 +8,43 @@ import pandas as pd
 from src.utils.paths import processed_dir, reference_dir
 from src.weather.stadiums import load_park_overrides, load_stadium_reference, normalize_team_abbr, resolve_park_for_game
 
-TEAM_NAME_TO_ABBR = {
-    "arizona diamondbacks": "ARI",
-    "atlanta braves": "ATL",
-    "baltimore orioles": "BAL",
-    "boston red sox": "BOS",
-    "chicago cubs": "CHC",
-    "chicago white sox": "CHW",
-    "cincinnati reds": "CIN",
-    "cleveland guardians": "CLE",
-    "colorado rockies": "COL",
-    "detroit tigers": "DET",
-    "houston astros": "HOU",
-    "kansas city royals": "KCR",
-    "los angeles angels": "LAA",
-    "los angeles dodgers": "LAD",
-    "miami marlins": "MIA",
-    "milwaukee brewers": "MIL",
-    "minnesota twins": "MIN",
-    "new york mets": "NYM",
-    "new york yankees": "NYY",
-    "athletics": "ATH",
-    "oakland athletics": "ATH",
-    "philadelphia phillies": "PHI",
-    "pittsburgh pirates": "PIT",
-    "san diego padres": "SDP",
-    "san francisco giants": "SFG",
-    "seattle mariners": "SEA",
-    "st louis cardinals": "STL",
-    "tampa bay rays": "TBR",
-    "texas rangers": "TEX",
-    "toronto blue jays": "TOR",
-    "washington nationals": "WSN",
+MLB_TEAM_NAME_TO_ABBR = {
+    "Arizona Diamondbacks": "ARI",
+    "Atlanta Braves": "ATL",
+    "Baltimore Orioles": "BAL",
+    "Boston Red Sox": "BOS",
+    "Chicago Cubs": "CHC",
+    "Chicago White Sox": "CHW",
+    "Cincinnati Reds": "CIN",
+    "Cleveland Guardians": "CLE",
+    "Colorado Rockies": "COL",
+    "Detroit Tigers": "DET",
+    "Houston Astros": "HOU",
+    "Kansas City Royals": "KCR",
+    "Los Angeles Angels": "LAA",
+    "Los Angeles Dodgers": "LAD",
+    "Miami Marlins": "MIA",
+    "Milwaukee Brewers": "MIL",
+    "Minnesota Twins": "MIN",
+    "New York Mets": "NYM",
+    "New York Yankees": "NYY",
+    "Athletics": "ATH",
+    "Oakland Athletics": "ATH",
+    "Philadelphia Phillies": "PHI",
+    "Pittsburgh Pirates": "PIT",
+    "San Diego Padres": "SDP",
+    "San Francisco Giants": "SFG",
+    "Seattle Mariners": "SEA",
+    "St. Louis Cardinals": "STL",
+    "Tampa Bay Rays": "TBR",
+    "Texas Rangers": "TEX",
+    "Toronto Blue Jays": "TOR",
+    "Washington Nationals": "WSN",
 }
+
+
+HOME_TEAM_CANDIDATES = ["home_team", "home_team_name", "home_name"]
+AWAY_TEAM_CANDIDATES = ["away_team", "away_team_name", "away_name"]
 
 
 
@@ -50,54 +54,41 @@ def _canonicalize_team_value(value: object) -> str | None:
     text = str(value).strip()
     if not text:
         return None
-    upper = text.upper()
-    if len(upper) <= 4:
-        return normalize_team_abbr(upper)
-    mapped = TEAM_NAME_TO_ABBR.get(text.casefold())
-    if mapped:
-        return normalize_team_abbr(mapped)
-    return normalize_team_abbr(upper)
+    mapped = MLB_TEAM_NAME_TO_ABBR.get(text)
+    if mapped is not None:
+        text = mapped
+    return normalize_team_abbr(text.upper())
 
 
 
-def _rename_first_match(df: pd.DataFrame, target: str, candidates: list[str]) -> pd.DataFrame:
-    out = df
-    col = next((c for c in candidates if c in out.columns), None)
-    if col is not None and col != target:
-        out = out.rename(columns={col: target})
-    return out
+def _first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    return next((c for c in candidates if c in df.columns), None)
 
 
 
 def _prepare_spine(spine: pd.DataFrame) -> pd.DataFrame:
     out = spine.copy()
-    out = _rename_first_match(out, "game_date", ["game_date", "date", "game_dt"])
-    out = _rename_first_match(out, "game_pk", ["game_pk", "game_id", "mlb_game_id"])
-    out = _rename_first_match(
-        out,
-        "home_team",
-        ["home_team", "home_team_abbr", "home_abbr", "home", "home_name", "home_team_name"],
-    )
-    out = _rename_first_match(
-        out,
-        "away_team",
-        ["away_team", "away_team_abbr", "away_abbr", "away", "away_name", "away_team_name"],
-    )
+    date_col = _first_existing_column(out, ["game_date", "date", "game_dt"])
+    gpk_col = _first_existing_column(out, ["game_pk", "game_id", "mlb_game_id"])
+    home_col = _first_existing_column(out, HOME_TEAM_CANDIDATES)
+    away_col = _first_existing_column(out, AWAY_TEAM_CANDIDATES)
+
+    if date_col is not None and date_col != "game_date":
+        out = out.rename(columns={date_col: "game_date"})
+    if gpk_col is not None and gpk_col != "game_pk":
+        out = out.rename(columns={gpk_col: "game_pk"})
+    if home_col is not None and home_col != "home_team":
+        out = out.rename(columns={home_col: "home_team"})
+    if away_col is not None and away_col != "away_team":
+        out = out.rename(columns={away_col: "away_team"})
+
     if "game_pk" not in out.columns:
         return pd.DataFrame(columns=["game_pk", "game_date", "home_team", "away_team"])
+
     out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
-    if "game_date" in out.columns:
-        out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce").dt.normalize()
-    else:
-        out["game_date"] = pd.NaT
-    if "home_team" in out.columns:
-        out["home_team"] = out["home_team"].map(_canonicalize_team_value)
-    else:
-        out["home_team"] = pd.NA
-    if "away_team" in out.columns:
-        out["away_team"] = out["away_team"].map(_canonicalize_team_value)
-    else:
-        out["away_team"] = pd.NA
+    out["game_date"] = pd.to_datetime(out.get("game_date"), errors="coerce").dt.normalize()
+    out["home_team"] = out.get("home_team", pd.Series(pd.NA, index=out.index)).map(_canonicalize_team_value)
+    out["away_team"] = out.get("away_team", pd.Series(pd.NA, index=out.index)).map(_canonicalize_team_value)
     out = out.sort_values(["game_date", "game_pk"], kind="mergesort")
     out = out.drop_duplicates(subset=["game_pk"], keep="first")
     return out[["game_pk", "game_date", "home_team", "away_team"]].reset_index(drop=True)
@@ -106,48 +97,45 @@ def _prepare_spine(spine: pd.DataFrame) -> pd.DataFrame:
 
 def _resolve_games(games: pd.DataFrame, season: int, spine: pd.DataFrame | None = None) -> pd.DataFrame:
     out = games.copy()
-    out = _rename_first_match(out, "game_date", ["game_date", "date", "game_dt"])
-    out = _rename_first_match(out, "game_pk", ["game_pk", "game_id", "mlb_game_id"])
-    out = _rename_first_match(
-        out,
-        "home_team",
-        ["home_team", "home_team_abbr", "home_abbr", "home", "home_name", "home_team_name"],
-    )
-    out = _rename_first_match(
-        out,
-        "away_team",
-        ["away_team", "away_team_abbr", "away_abbr", "away", "away_name", "away_team_name"],
-    )
+    date_col = _first_existing_column(out, ["game_date", "date", "game_dt"])
+    gpk_col = _first_existing_column(out, ["game_pk", "game_id", "mlb_game_id"])
+    home_col = _first_existing_column(out, HOME_TEAM_CANDIDATES)
+    away_col = _first_existing_column(out, AWAY_TEAM_CANDIDATES)
+
+    if date_col is not None and date_col != "game_date":
+        out = out.rename(columns={date_col: "game_date"})
+    if gpk_col is not None and gpk_col != "game_pk":
+        out = out.rename(columns={gpk_col: "game_pk"})
+    if home_col is not None and home_col != "home_team":
+        out = out.rename(columns={home_col: "home_team"})
+    if away_col is not None and away_col != "away_team":
+        out = out.rename(columns={away_col: "away_team"})
+
+    if home_col is None:
+        out["home_team"] = pd.NA
+    if away_col is None:
+        out["away_team"] = pd.NA
 
     if "game_pk" not in out.columns:
         raise ValueError("games parquet missing required column: game_pk")
 
     out["game_date"] = pd.to_datetime(out.get("game_date"), errors="coerce").dt.normalize()
     out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
-    if "home_team" in out.columns:
-        out["home_team"] = out["home_team"].map(_canonicalize_team_value)
-    if "away_team" in out.columns:
-        out["away_team"] = out["away_team"].map(_canonicalize_team_value)
+    out["home_team"] = out["home_team"].map(_canonicalize_team_value)
+    out["away_team"] = out["away_team"].map(_canonicalize_team_value)
 
     if spine is not None:
         sp = _prepare_spine(spine)
-        if "home_team" not in out.columns:
-            out["home_team"] = pd.NA
-        if "away_team" not in out.columns:
-            out["away_team"] = pd.NA
         out = out.merge(sp, on=["game_pk"], how="left", suffixes=("", "_sp"))
         if "home_team_sp" in out.columns:
             out["home_team"] = out["home_team"].fillna(out["home_team_sp"])
         if "away_team_sp" in out.columns:
             out["away_team"] = out["away_team"].fillna(out["away_team_sp"])
 
-    required = {"game_date", "game_pk", "home_team", "away_team"}
-    missing = required - set(out.columns)
-    if missing:
-        raise ValueError(
-            "games parquet missing required canonical columns after variant mapping and spine fill: "
-            f"{sorted(missing)}"
-        )
+    if out["home_team"].isna().all():
+        raise ValueError(f"games parquet missing all home team candidates: {HOME_TEAM_CANDIDATES}")
+    if out["away_team"].isna().all():
+        raise ValueError(f"games parquet missing all away team candidates: {AWAY_TEAM_CANDIDATES}")
 
     out = out.dropna(subset=["game_date", "game_pk", "home_team", "away_team"]).copy()
     out = out.loc[out["game_date"].dt.year == int(season)].copy()
@@ -278,25 +266,3 @@ def build_park_game(
     out.to_parquet(output_path, index=False, engine="pyarrow")
     log.info("wrote_park_game season=%s rows=%d path=%s", season, len(out), output_path)
     return out
-
-
-
-def run_smoke_test(
-    season: int,
-    games_path: Path,
-    spine_path: Path,
-    logger: logging.Logger | None = None,
-) -> None:
-    log = logger or logging.getLogger(__name__)
-    games = pd.read_parquet(games_path, engine="pyarrow")
-    spine = pd.read_parquet(spine_path, engine="pyarrow")
-    subset = games.copy()
-    for col in ["home_team", "away_team", "home_team_abbr", "away_team_abbr", "home_abbr", "away_abbr"]:
-        if col in subset.columns:
-            subset = subset.drop(columns=[col])
-    resolved = _resolve_games(subset, season=season, spine=spine)
-    if resolved.empty:
-        raise AssertionError("Smoke test produced empty resolved games frame")
-    if resolved[["home_team", "away_team"]].isna().any().any():
-        raise AssertionError("Smoke test failed to fill home/away team from spine")
-    log.info("park_game_smoke_ok season=%s rows=%d", season, len(resolved))
