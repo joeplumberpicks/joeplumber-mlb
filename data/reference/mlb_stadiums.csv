@@ -1,0 +1,33 @@
+team_abbr,season_start,season_end,park_id,stadium_name,city,state,lat,lon,timezone,roof_type,cf_bearing_deg
+ARI,1900,2099,CHASE_FIELD,Chase Field,Phoenix,AZ,33.4453,-112.0667,America/Phoenix,retractable,0
+ATL,1900,2099,TRUIST_PARK,Truist Park,Atlanta,GA,33.8907,-84.4677,America/New_York,open,5
+BAL,1900,2099,CAMDEN_YARDS,Oriole Park at Camden Yards,Baltimore,MD,39.2839,-76.6217,America/New_York,open,-10
+BOS,1900,2099,FENWAY_PARK,Fenway Park,Boston,MA,42.3467,-71.0972,America/New_York,open,-15
+CHC,1900,2099,WRIGLEY_FIELD,Wrigley Field,Chicago,IL,41.9484,-87.6553,America/Chicago,open,-2
+CWS,1900,2099,GUARANTEED_RATE_FIELD,Guaranteed Rate Field,Chicago,IL,41.8299,-87.6338,America/Chicago,open,3
+CIN,1900,2099,GREAT_AMERICAN_BALL_PARK,Great American Ball Park,Cincinnati,OH,39.0979,-84.5081,America/New_York,open,12
+CLE,1900,2099,PROGRESSIVE_FIELD,Progressive Field,Cleveland,OH,41.4962,-81.6852,America/New_York,open,-8
+COL,1900,2099,COORS_FIELD,Coors Field,Denver,CO,39.7559,-104.9942,America/Denver,open,0
+DET,1900,2099,COMERICA_PARK,Comerica Park,Detroit,MI,42.339,-83.0485,America/New_York,open,4
+HOU,1900,2099,DAIKIN_PARK,Daikin Park,Houston,TX,29.7573,-95.3555,America/Chicago,retractable,7
+KC,1900,2099,KAUFFMAN_STADIUM,Kauffman Stadium,Kansas City,MO,39.0517,-94.4803,America/Chicago,open,0
+LAA,1900,2099,ANGEL_STADIUM,Angel Stadium,Anaheim,CA,33.8003,-117.8827,America/Los_Angeles,open,1
+LAD,1900,2099,DODGER_STADIUM,Dodger Stadium,Los Angeles,CA,34.0739,-118.24,America/Los_Angeles,open,0
+MIA,1900,2099,LOANDEPOT_PARK,loanDepot park,Miami,FL,25.7781,-80.2197,America/New_York,retractable,-2
+MIL,1900,2099,AMERICAN_FAMILY_FIELD,American Family Field,Milwaukee,WI,43.028,-87.9712,America/Chicago,retractable,6
+MIN,1900,2099,TARGET_FIELD,Target Field,Minneapolis,MN,44.9817,-93.2778,America/Chicago,open,-3
+NYM,1900,2099,CITI_FIELD,Citi Field,New York,NY,40.7571,-73.8458,America/New_York,open,1
+NYY,1900,2099,YANKEE_STADIUM,Yankee Stadium,New York,NY,40.8296,-73.9262,America/New_York,open,-5
+PHI,1900,2099,CITIZENS_BANK_PARK,Citizens Bank Park,Philadelphia,PA,39.9061,-75.1665,America/New_York,open,-4
+PIT,1900,2099,PNC_PARK,PNC Park,Pittsburgh,PA,40.4469,-80.0057,America/New_York,open,2
+SD,1900,2099,PETCO_PARK,Petco Park,San Diego,CA,32.7073,-117.1573,America/Los_Angeles,open,0
+SEA,1900,2099,T_MOBILE_PARK,T-Mobile Park,Seattle,WA,47.5914,-122.3325,America/Los_Angeles,retractable,-9
+SF,1900,2099,ORACLE_PARK,Oracle Park,San Francisco,CA,37.7786,-122.3893,America/Los_Angeles,open,-12
+STL,1900,2099,BUSCH_STADIUM,Busch Stadium,St. Louis,MO,38.6226,-90.1928,America/Chicago,open,4
+TEX,1900,2099,GLOBE_LIFE_FIELD,Globe Life Field,Arlington,TX,32.7473,-97.0848,America/Chicago,retractable,5
+TOR,1900,2099,ROGERS_CENTRE,Rogers Centre,Toronto,ON,43.6414,-79.3894,America/Toronto,retractable,-1
+WSH,1900,2099,NATIONALS_PARK,Nationals Park,Washington,DC,38.8729,-77.0074,America/New_York,open,2
+ATH,2025,2026,SUTTER_HEALTH_PARK,Sutter Health Park,West Sacramento,CA,38.5806,-121.5138,America/Los_Angeles,open,0
+TBR,2025,2025,STEINBRENNER_FIELD,George M. Steinbrenner Field,Tampa,FL,27.98,-82.506,America/New_York,open,0
+TBR,2026,2099,TROPICANA_FIELD,Tropicana Field,St. Petersburg,FL,27.7683,-82.6534,America/New_York,dome,0
+ATH,2100,2100,LAS_VEGAS_BALLPARK,Las Vegas Ballpark,Las Vegas,NV,36.0909,-115.1837,America/Los_Angeles,open,0
