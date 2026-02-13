@@ -11,6 +11,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.parks.train_park_factors import run_smoke_test, train_park_factors
+from src.utils.paths import get_data_root, processed_dir
 
 
 def parse_args() -> argparse.Namespace:
@@ -21,13 +22,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--park-game", type=str, default=None)
     parser.add_argument("--targets-game", type=str, default=None)
     parser.add_argument("--targets-hitter", type=str, default=None)
-    parser.add_argument("--events", type=str, default="data/processed/events_pa.parquet")
+    parser.add_argument("--events", type=str, default=str(processed_dir() / "events_pa.parquet"))
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--smoke-test", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
+    print(f"Using data root: {get_data_root()}")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
     args = parse_args()
     log = logging.getLogger("train_park_factors")
@@ -36,17 +38,17 @@ def main() -> None:
         run_smoke_test(log)
         return
 
-    park_game_path = Path(args.park_game) if args.park_game else Path(f"data/processed/park_game_{args.season}.parquet")
+    park_game_path = Path(args.park_game) if args.park_game else (processed_dir() / f"park_game_{args.season}.parquet")
     targets_game_path = (
-        Path(args.targets_game) if args.targets_game else Path(f"data/processed/targets/targets_game_{args.season}.parquet")
+        Path(args.targets_game) if args.targets_game else (processed_dir() / f"targets/targets_game_{args.season}.parquet")
     )
     targets_hitter_path = (
         Path(args.targets_hitter)
         if args.targets_hitter
-        else Path(f"data/processed/targets/targets_hitter_game_{args.season}.parquet")
+        else (processed_dir() / f"targets/targets_hitter_game_{args.season}.parquet")
     )
     output_path = (
-        Path(args.output) if args.output else Path(f"data/processed/park_factors_game_{args.season}.parquet")
+        Path(args.output) if args.output else (processed_dir() / f"park_factors_game_{args.season}.parquet")
     )
 
     train_park_factors(

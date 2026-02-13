@@ -10,6 +10,7 @@ import yaml
 from src.weather.features import add_weather_transforms
 from src.weather.providers import NWSClient, RetryConfig, VisualCrossingClient
 from src.weather.stadiums import load_park_overrides, load_stadium_reference, resolve_park_for_game
+from src.utils.paths import reference_dir
 
 
 def _load_yaml(path: Path) -> dict:
@@ -43,18 +44,45 @@ def _nearest_row(hourly: pd.DataFrame, target: pd.Timestamp) -> pd.Series | None
 
 
 def _resolve_games(games: pd.DataFrame, spine: pd.DataFrame | None, season: int) -> pd.DataFrame:
-    if "game_pk" not in games.columns:
+    g = games.copy()
+
+    date_col = next((c for c in ["game_date", "date", "game_dt"] if c in g.columns), None)
+    gpk_col = next((c for c in ["game_pk", "game_id", "mlb_game_id"] if c in g.columns), None)
+    home_col = next(
+        (c for c in ["home_team", "home_team_abbr", "home_abbr", "home_name_abbr", "home_name"] if c in g.columns),
+        None,
+    )
+    away_col = next(
+        (c for c in ["away_team", "away_team_abbr", "away_abbr", "away_name_abbr", "away_name"] if c in g.columns),
+        None,
+    )
+
+    if date_col is not None and date_col != "game_date":
+        g = g.rename(columns={date_col: "game_date"})
+    if gpk_col is not None and gpk_col != "game_pk":
+        g = g.rename(columns={gpk_col: "game_pk"})
+    if home_col is not None and home_col != "home_team":
+        g = g.rename(columns={home_col: "home_team"})
+    if away_col is not None and away_col != "away_team":
+        g = g.rename(columns={away_col: "away_team"})
+
+    if "game_pk" not in g.columns:
         raise ValueError("games parquet missing required column: game_pk")
 
-    g = games.copy()
     g["game_date"] = pd.to_datetime(g.get("game_date"), errors="coerce").dt.normalize()
     g["game_pk"] = pd.to_numeric(g["game_pk"], errors="coerce").astype("Int64")
 
     if "home_team" not in g.columns or "away_team" not in g.columns:
         if spine is not None and {"game_pk", "home_team", "away_team"}.issubset(spine.columns):
             g = g.merge(spine[["game_pk", "home_team", "away_team"]], on="game_pk", how="left", suffixes=("", "_sp"))
-            g["home_team"] = g["home_team"].fillna(g.get("home_team_sp"))
-            g["away_team"] = g["away_team"].fillna(g.get("away_team_sp"))
+            if "home_team" not in g.columns:
+                g["home_team"] = pd.NA
+            if "away_team" not in g.columns:
+                g["away_team"] = pd.NA
+            if "home_team_sp" in g.columns:
+                g["home_team"] = g["home_team"].fillna(g["home_team_sp"])
+            if "away_team_sp" in g.columns:
+                g["away_team"] = g["away_team"].fillna(g["away_team_sp"])
 
     required = {"game_date", "game_pk", "home_team", "away_team"}
     miss = required - set(g.columns)
@@ -80,7 +108,7 @@ def build_weather_game(
     max_games: int | None = None,
     allow_partial: bool = False,
     config_path: Path = Path("config/weather.yaml"),
-    overrides_path: Path = Path("data/reference/park_overrides.csv"),
+    overrides_path: Path = reference_dir() / "park_overrides.csv",
     logger: logging.Logger | None = None,
 ) -> pd.DataFrame:
     """Build one weather row per game using nearest hourly conditions to game start."""

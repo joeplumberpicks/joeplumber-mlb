@@ -11,6 +11,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.weather.build_weather_game import build_weather_game
+from src.utils.paths import get_data_root, processed_dir, reference_dir
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,20 +19,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--season", type=int, required=True)
     parser.add_argument("--start", type=str, default=None)
     parser.add_argument("--end", type=str, default=None)
-    parser.add_argument("--games", type=str, default="data/processed/games.parquet")
-    parser.add_argument("--spine", type=str, default="data/processed/model_spine_game.parquet")
+    parser.add_argument("--games", type=str, default=str(processed_dir() / "games.parquet"))
+    parser.add_argument("--spine", type=str, default=str(processed_dir() / "model_spine_game.parquet"))
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--provider", type=str, default="visualcrossing")
     parser.add_argument("--max-games", type=int, default=None)
-    parser.add_argument("--overrides", type=str, default="data/reference/park_overrides.csv")
+    parser.add_argument("--overrides", type=str, default=str(reference_dir() / "park_overrides.csv"))
     parser.add_argument("--allow-partial", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
+    print(f"Using data root: {get_data_root()}")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
     args = parse_args()
-    output = Path(args.output) if args.output else Path(f"data/processed/weather_game_{args.season}.parquet")
+    output = Path(args.output) if args.output else (processed_dir() / f"weather_game_{args.season}.parquet")
 
     build_weather_game(
         season=args.season,

@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.utils.paths import reference_dir
+
 REQUIRED_COLUMNS = [
     "team_abbr",
     "season_start",
@@ -129,7 +131,7 @@ def _coerce_schema(df: pd.DataFrame) -> pd.DataFrame:
 def load_stadium_reference(path: Path | None = None, logger: logging.Logger | None = None) -> pd.DataFrame:
     """Load stadium coordinates and season-aware park mapping."""
     log = logger or logging.getLogger(__name__)
-    ref_path = path or Path("data/reference/mlb_stadiums.csv")
+    ref_path = path or (reference_dir() / "mlb_stadiums.csv")
     if ref_path.exists():
         return _coerce_schema(pd.read_csv(ref_path))
 
@@ -138,7 +140,7 @@ def load_stadium_reference(path: Path | None = None, logger: logging.Logger | No
 
 
 def load_park_overrides(path: Path | None = None) -> pd.DataFrame:
-    override_path = path or Path("data/reference/park_overrides.csv")
+    override_path = path or (reference_dir() / "park_overrides.csv")
     if not override_path.exists():
         return pd.DataFrame(columns=["game_pk", "park_id_override", "notes"])
     overrides = pd.read_csv(override_path)

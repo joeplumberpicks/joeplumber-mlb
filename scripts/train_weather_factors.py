@@ -11,6 +11,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.weather.train_weather_factors import run_smoke_test, train_weather_factors_from_paths
+from src.utils.paths import get_data_root, models_dir, processed_dir
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--season", type=int, required=True)
     parser.add_argument("--features-weather", type=str, default=None)
     parser.add_argument("--targets-game", type=str, default=None)
-    parser.add_argument("--events", type=str, default="data/processed/events_pa.parquet")
+    parser.add_argument("--events", type=str, default=str(processed_dir() / "events_pa.parquet"))
     parser.add_argument("--hitter-targets", type=str, default=None)
     parser.add_argument("--model-out", type=str, default=None)
     parser.add_argument("--output", type=str, default=None)
@@ -29,6 +30,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    print(f"Using data root: {get_data_root()}")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
     args = parse_args()
     log = logging.getLogger("train_weather_factors")
@@ -37,14 +39,14 @@ def main() -> None:
         run_smoke_test(log)
         return
 
-    weather = Path(args.features_weather) if args.features_weather else Path(f"data/processed/weather_game_{args.season}.parquet")
-    targets = Path(args.targets_game) if args.targets_game else Path(f"data/processed/targets/targets_game_{args.season}.parquet")
-    model_out = Path(args.model_out) if args.model_out else Path(f"data/models/weather_factors_{args.season}")
-    output = Path(args.output) if args.output else Path(f"data/processed/weather_factors_game_{args.season}.parquet")
+    weather = Path(args.features_weather) if args.features_weather else (processed_dir() / f"weather_game_{args.season}.parquet")
+    targets = Path(args.targets_game) if args.targets_game else (processed_dir() / f"targets/targets_game_{args.season}.parquet")
+    model_out = Path(args.model_out) if args.model_out else (models_dir() / f"weather_factors_{args.season}")
+    output = Path(args.output) if args.output else (processed_dir() / f"weather_factors_game_{args.season}.parquet")
     hitter_targets = (
         Path(args.hitter_targets)
         if args.hitter_targets
-        else Path(f"data/processed/targets/targets_hitter_game_{args.season}.parquet")
+        else (processed_dir() / f"targets/targets_hitter_game_{args.season}.parquet")
     )
 
     train_weather_factors_from_paths(

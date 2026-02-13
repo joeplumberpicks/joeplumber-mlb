@@ -9,12 +9,55 @@ from src.weather.stadiums import load_park_overrides, load_stadium_reference, re
 
 
 def _resolve_games(games: pd.DataFrame, season: int) -> pd.DataFrame:
-    required = {"game_date", "game_pk", "home_team", "away_team"}
-    missing = required - set(games.columns)
-    if missing:
-        raise ValueError(f"games parquet missing required columns: {sorted(missing)}")
-
     out = games.copy()
+    date_col = next((c for c in ["game_date", "date", "game_dt"] if c in out.columns), None)
+    gpk_col = next((c for c in ["game_pk", "game_id", "mlb_game_id"] if c in out.columns), None)
+    home_col = next(
+        (
+            c
+            for c in [
+                "home_team",
+                "home_team_abbr",
+                "home_abbr",
+                "home_name_abbr",
+                "home_name",
+            ]
+            if c in out.columns
+        ),
+        None,
+    )
+    away_col = next(
+        (
+            c
+            for c in [
+                "away_team",
+                "away_team_abbr",
+                "away_abbr",
+                "away_name_abbr",
+                "away_name",
+            ]
+            if c in out.columns
+        ),
+        None,
+    )
+
+    if date_col and date_col != "game_date":
+        out = out.rename(columns={date_col: "game_date"})
+    if gpk_col and gpk_col != "game_pk":
+        out = out.rename(columns={gpk_col: "game_pk"})
+    if home_col and home_col != "home_team":
+        out = out.rename(columns={home_col: "home_team"})
+    if away_col and away_col != "away_team":
+        out = out.rename(columns={away_col: "away_team"})
+
+    required = {"game_date", "game_pk", "home_team", "away_team"}
+    missing = required - set(out.columns)
+    if missing:
+        raise ValueError(
+            "games parquet missing required canonical columns after variant mapping: "
+            f"{sorted(missing)}"
+        )
+
     out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce").dt.normalize()
     out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
     out = out.dropna(subset=["game_date", "game_pk", "home_team", "away_team"]).copy()

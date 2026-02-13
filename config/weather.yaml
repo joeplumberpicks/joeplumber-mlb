@@ -1,5 +1,5 @@
 provider: visualcrossing
-visualcrossing_api_key_env: DHPXPFPPB2WW427R8AYL3SR8Q
+visualcrossing_api_key_env: VISUAL_CROSSING_API_KEY
 timezone_default: America/New_York
 query:
   granularity: hourly
