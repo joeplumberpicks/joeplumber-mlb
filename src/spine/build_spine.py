@@ -54,12 +54,33 @@ def _normalize_pa_df(df: pd.DataFrame, season: int) -> pd.DataFrame:
     return out
 
 
+def _normalize_parks_df(df: pd.DataFrame, season: int) -> pd.DataFrame:
+    out = df.copy()
+
+    if "park_id" not in out.columns and "venue_id" in out.columns:
+        out["park_id"] = out["venue_id"]
+    if "venue_id" not in out.columns and "park_id" in out.columns:
+        out["venue_id"] = out["park_id"]
+
+    if "season" not in out.columns:
+        out["season"] = season
+
+    for col in PARK_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.NA
+
+    return out
+
+
 def load_or_placeholder(raw_path: Path, columns: list[str], label: str, season: int) -> pd.DataFrame:
     if raw_path.exists():
         df = read_parquet(raw_path)
         if label == "plate_appearances":
             df = _normalize_pa_df(df, season)
             print_rowcount("plate_appearances_normalized", df)
+        if label == "parks":
+            df = _normalize_parks_df(df, season)
+            print_rowcount("parks_normalized", df)
         require_columns(df, columns, label)
         print_rowcount(label, df)
         return df
@@ -119,6 +140,41 @@ def build_spine_for_season(season: int, dirs: dict[str, Path], force: bool = Fal
     return {"games": out_games, "pa": out_pa, "weather": out_weather, "parks": out_parks}
 
 
+def _apply_park_venue_mapping(model_spine: pd.DataFrame, processed_by_season: Path, seasons: list[int]) -> pd.DataFrame:
+    if "park_id" not in model_spine.columns:
+        model_spine["park_id"] = pd.NA
+    if "venue_id" not in model_spine.columns:
+        model_spine["venue_id"] = pd.NA
+
+    parks_frames: list[pd.DataFrame] = []
+    for season in seasons:
+        parks_path = processed_by_season / f"parks_{season}.parquet"
+        if parks_path.exists():
+            parks_df = read_parquet(parks_path)
+            parks_df = _normalize_parks_df(parks_df, season)
+            parks_frames.append(parks_df)
+
+    if not parks_frames:
+        return model_spine
+
+    parks_all = pd.concat(parks_frames, ignore_index=True).drop_duplicates()
+    venue_to_park = {}
+    park_to_venue = {}
+
+    if "venue_id" in parks_all.columns and "park_id" in parks_all.columns:
+        for _, row in parks_all.dropna(subset=["venue_id", "park_id"]).iterrows():
+            venue_to_park[row["venue_id"]] = row["park_id"]
+            park_to_venue[row["park_id"]] = row["venue_id"]
+
+    park_missing = model_spine["park_id"].isna() & model_spine["venue_id"].notna()
+    model_spine.loc[park_missing, "park_id"] = model_spine.loc[park_missing, "venue_id"].map(venue_to_park)
+
+    venue_missing = model_spine["venue_id"].isna() & model_spine["park_id"].notna()
+    model_spine.loc[venue_missing, "venue_id"] = model_spine.loc[venue_missing, "park_id"].map(park_to_venue)
+
+    return model_spine
+
+
 def build_model_spine(dirs: dict[str, Path], seasons: list[int]) -> Path:
     processed_by_season = dirs["processed_dir"] / "by_season"
     model_spine_path = dirs["processed_dir"] / "model_spine_game.parquet"
@@ -137,8 +193,7 @@ def build_model_spine(dirs: dict[str, Path], seasons: list[int]) -> Path:
     else:
         model_spine = _empty_df(GAMES_COLUMNS)
 
-    if "venue_id" not in model_spine.columns:
-        model_spine["venue_id"] = model_spine["park_id"] if "park_id" in model_spine.columns else pd.NA
+    model_spine = _apply_park_venue_mapping(model_spine, processed_by_season, seasons)
 
     keep_cols = [
         "game_pk",
