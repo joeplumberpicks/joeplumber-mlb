@@ -14,6 +14,7 @@ from scripts.ingest.build_parks_reference import build_parks_reference
 from scripts.ingest.helpers_games import build_games_from_pa
 from scripts.ingest.ingest_statcast_pa import ingest_statcast_pa
 from scripts.ingest.ingest_weather_stub import write_weather_stub_for_games
+from scripts.ingest.run_ingest_parks import _fetch_venues, _venues_to_df
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
 from src.utils.logging import configure_logging, log_header
@@ -53,6 +54,16 @@ def main() -> None:
         force=args.force,
     )
     build_games_from_pa(dirs=dirs, season=args.season)
+    venues = _fetch_venues()
+    parks_df = _venues_to_df(venues, args.season)
+    parks_path = dirs["raw_dir"] / "by_season" / f"parks_{args.season}.parquet"
+    print(f"Row count [parks_{args.season}]: {len(parks_df):,}")
+    print(f"Writing to: {parks_path.resolve()}")
+    from src.utils.io import write_parquet
+
+    write_parquet(parks_df, parks_path)
+    if len(parks_df) == 0:
+        raise RuntimeError("Parks ingest returned 0 rows during season ingest.")
     build_parks_reference(dirs=dirs, season=args.season, repo_root=repo_root)
     write_weather_stub_for_games(dirs=dirs, season=args.season)
 

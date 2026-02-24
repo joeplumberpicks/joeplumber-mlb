@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.parks.park_identity import load_park_overrides, resolve_park_for_game
 from src.utils.checks import print_rowcount, require_columns
 from src.utils.io import read_parquet, write_parquet
+from src.utils.team_normalize import canonical_team_abbr
 
 GAMES_COLUMNS = [
     "game_pk",
@@ -16,11 +18,14 @@ GAMES_COLUMNS = [
     "home_sp_id",
     "away_sp_id",
     "park_id",
+    "venue_id",
+    "park_name",
+    "canonical_park_key",
     "season",
 ]
 PA_COLUMNS = ["game_pk", "pa_id", "batter_id", "pitcher_id", "event_type", "season"]
 WEATHER_COLUMNS = ["game_pk", "temperature_f", "wind_mph", "wind_dir", "season"]
-PARK_COLUMNS = ["park_id", "park_name", "park_factor", "season"]
+PARK_COLUMNS = ["park_id", "venue_id", "park_name", "lat", "lon", "roofType", "tz", "season"]
 
 
 def _empty_df(columns: list[str]) -> pd.DataFrame:
@@ -29,46 +34,36 @@ def _empty_df(columns: list[str]) -> pd.DataFrame:
 
 def _normalize_pa_df(df: pd.DataFrame, season: int) -> pd.DataFrame:
     out = df.copy()
-
     if "batter_id" not in out.columns and "batter" in out.columns:
         out["batter_id"] = out["batter"]
     if "pitcher_id" not in out.columns and "pitcher" in out.columns:
         out["pitcher_id"] = out["pitcher"]
-
     if "pa_id" not in out.columns:
         if "at_bat_number" in out.columns and "game_pk" in out.columns:
             out["pa_id"] = out["game_pk"].astype(str) + "-" + out["at_bat_number"].astype(str)
         else:
             out["pa_id"] = pd.RangeIndex(start=0, stop=len(out), step=1).astype(str)
-
     if "season" not in out.columns:
         out["season"] = season
-
     if "event_type" not in out.columns and "events" in out.columns:
         out["event_type"] = out["events"]
-
     for col in PA_COLUMNS:
         if col not in out.columns:
             out[col] = pd.NA
-
     return out
 
 
 def _normalize_parks_df(df: pd.DataFrame, season: int) -> pd.DataFrame:
     out = df.copy()
-
     if "park_id" not in out.columns and "venue_id" in out.columns:
         out["park_id"] = out["venue_id"]
     if "venue_id" not in out.columns and "park_id" in out.columns:
         out["venue_id"] = out["park_id"]
-
     if "season" not in out.columns:
         out["season"] = season
-
     for col in PARK_COLUMNS:
         if col not in out.columns:
             out[col] = pd.NA
-
     return out
 
 
@@ -84,11 +79,62 @@ def load_or_placeholder(raw_path: Path, columns: list[str], label: str, season: 
         require_columns(df, columns, label)
         print_rowcount(label, df)
         return df
-
     logging.warning("Missing raw input for %s season %s. Creating empty placeholder: %s", label, season, raw_path)
     df = _empty_df(columns)
     print_rowcount(label, df)
     return df
+
+
+def _apply_overrides(games_df: pd.DataFrame, overrides_df: pd.DataFrame, season: int) -> pd.DataFrame:
+    if overrides_df.empty:
+        return games_df
+    out = games_df.copy()
+    for _, rule in overrides_df.iterrows():
+        s0 = int(rule.get("season_start", season))
+        s1 = int(rule.get("season_end", season))
+        if not (s0 <= season <= s1):
+            continue
+        team = canonical_team_abbr(rule.get("team"), season)
+        name_contains = str(rule.get("park_name_contains", "")).lower()
+        mask = out["home_team"].astype(str).map(lambda x: canonical_team_abbr(x, season) == team)
+        if name_contains and "park_name" in out.columns:
+            mask &= out["park_name"].astype(str).str.lower().str.contains(name_contains, na=False)
+        if pd.notna(rule.get("venue_id")):
+            out.loc[mask & out["venue_id"].isna(), "venue_id"] = rule.get("venue_id")
+        if pd.notna(rule.get("park_id_override")):
+            out.loc[mask & out["park_id"].isna(), "park_id"] = rule.get("park_id_override")
+    return out
+
+
+def _enrich_games_with_park_identity(games_df: pd.DataFrame, parks_df: pd.DataFrame, reference_dir: Path, season: int) -> pd.DataFrame:
+    out = games_df.copy()
+    for c in ["park_id", "venue_id", "park_name"]:
+        if c not in out.columns:
+            out[c] = pd.NA
+
+    overrides_df = load_park_overrides(reference_dir / "park_overrides.csv")
+    out = _apply_overrides(out, overrides_df, season)
+
+    parks_map = parks_df.copy()
+    if "venue_id" not in parks_map.columns and "park_id" in parks_map.columns:
+        parks_map["venue_id"] = parks_map["park_id"]
+
+    park_rows = []
+    for _, row in out.iterrows():
+        resolved = resolve_park_for_game(row, parks_map)
+        park_rows.append(resolved)
+    park_resolved = pd.DataFrame(park_rows, index=out.index)
+
+    for c in ["park_id", "venue_id", "park_name", "canonical_park_key"]:
+        if c in park_resolved.columns:
+            out.loc[out[c].isna() if c in out.columns else slice(None), c] = park_resolved[c]
+            if c not in out.columns:
+                out[c] = park_resolved[c]
+
+    if "canonical_park_key" not in out.columns:
+        out["canonical_park_key"] = park_resolved.get("canonical_park_key", pd.NA)
+
+    return out
 
 
 def build_spine_for_season(season: int, dirs: dict[str, Path], force: bool = False) -> dict[str, Path]:
@@ -118,14 +164,19 @@ def build_spine_for_season(season: int, dirs: dict[str, Path], force: bool = Fal
         weather_df = load_or_placeholder(raw_weather, WEATHER_COLUMNS, "weather", season)
         parks_df = load_or_placeholder(raw_parks, PARK_COLUMNS, "parks", season)
 
-        if not games_df.empty and "season" not in games_df:
-            games_df["season"] = season
-
         for df in [games_df, pa_df, weather_df, parks_df]:
-            if "season" in df.columns and df["season"].isna().any():
+            if "season" in df.columns:
                 df["season"] = df["season"].fillna(season)
 
-        pa_df = pa_df[PA_COLUMNS].copy()
+        games_df["home_team"] = games_df.get("home_team", pd.Series(index=games_df.index, dtype="object")).map(
+            lambda x: canonical_team_abbr(x, season)
+        )
+        games_df["away_team"] = games_df.get("away_team", pd.Series(index=games_df.index, dtype="object")).map(
+            lambda x: canonical_team_abbr(x, season)
+        )
+
+        games_df = _enrich_games_with_park_identity(games_df, parks_df, dirs["reference_dir"], season)
+        pa_df = _normalize_pa_df(pa_df, season)
         print_rowcount("plate_appearances_processed", pa_df)
 
         print(f"Writing to: {out_games.resolve()}")
@@ -150,28 +201,20 @@ def _apply_park_venue_mapping(model_spine: pd.DataFrame, processed_by_season: Pa
     for season in seasons:
         parks_path = processed_by_season / f"parks_{season}.parquet"
         if parks_path.exists():
-            parks_df = read_parquet(parks_path)
-            parks_df = _normalize_parks_df(parks_df, season)
+            parks_df = _normalize_parks_df(read_parquet(parks_path), season)
             parks_frames.append(parks_df)
-
     if not parks_frames:
         return model_spine
 
     parks_all = pd.concat(parks_frames, ignore_index=True).drop_duplicates()
-    venue_to_park = {}
-    park_to_venue = {}
-
-    if "venue_id" in parks_all.columns and "park_id" in parks_all.columns:
-        for _, row in parks_all.dropna(subset=["venue_id", "park_id"]).iterrows():
-            venue_to_park[row["venue_id"]] = row["park_id"]
-            park_to_venue[row["park_id"]] = row["venue_id"]
+    venue_to_park = dict(parks_all.dropna(subset=["venue_id", "park_id"])[["venue_id", "park_id"]].values)
+    park_to_venue = dict(parks_all.dropna(subset=["park_id", "venue_id"])[["park_id", "venue_id"]].values)
 
     park_missing = model_spine["park_id"].isna() & model_spine["venue_id"].notna()
     model_spine.loc[park_missing, "park_id"] = model_spine.loc[park_missing, "venue_id"].map(venue_to_park)
 
     venue_missing = model_spine["venue_id"].isna() & model_spine["park_id"].notna()
     model_spine.loc[venue_missing, "venue_id"] = model_spine.loc[venue_missing, "park_id"].map(park_to_venue)
-
     return model_spine
 
 
@@ -188,11 +231,7 @@ def build_model_spine(dirs: dict[str, Path], seasons: list[int]) -> Path:
                 df["season"] = season
             frames.append(df)
 
-    if frames:
-        model_spine = pd.concat(frames, ignore_index=True)
-    else:
-        model_spine = _empty_df(GAMES_COLUMNS)
-
+    model_spine = pd.concat(frames, ignore_index=True) if frames else _empty_df(GAMES_COLUMNS)
     model_spine = _apply_park_venue_mapping(model_spine, processed_by_season, seasons)
 
     keep_cols = [
@@ -204,12 +243,19 @@ def build_model_spine(dirs: dict[str, Path], seasons: list[int]) -> Path:
         "away_sp_id",
         "park_id",
         "venue_id",
+        "park_name",
+        "canonical_park_key",
         "season",
     ]
     for col in keep_cols:
         if col not in model_spine.columns:
             model_spine[col] = pd.NA
     model_spine = model_spine[keep_cols]
+
+    missing = model_spine[model_spine["park_id"].isna()].head(5)
+    if not missing.empty:
+        print("WARNING: sample games with missing park mapping:")
+        print(missing[["game_pk", "game_date", "home_team", "away_team", "park_name"]].to_string(index=False))
 
     print_rowcount("model_spine_game", model_spine)
     print(f"Writing to: {model_spine_path.resolve()}")

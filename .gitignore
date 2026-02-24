@@ -14,3 +14,4 @@ __pycache__/
 .ipynb_checkpoints/
 .env
 !data/reference/parks_master.csv
+!data/reference/park_overrides.csv

@@ -16,7 +16,7 @@ from src.utils.logging import configure_logging, log_header
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build rolling feature scaffolds with shift(1).")
+    parser = argparse.ArgumentParser(description="Build rolling feature tables with shift(1) leakage prevention.")
     parser.add_argument("--config", type=Path, default=Path("configs/project.yaml"))
     return parser.parse_args()
 

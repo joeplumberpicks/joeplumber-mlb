@@ -101,3 +101,17 @@ python scripts/build_marts.py
 - `python scripts/train/train_hitter_props.py`
 - `python scripts/train/train_pitcher_props.py`
 - `python scripts/slate/run_slate.py`
+
+
+## Park Identity + Pitch-Level Feature Pipeline
+
+See `README_PIPELINE.md` for end-to-end commands. Minimal season run:
+
+```bash
+python scripts/ingest/run_ingest_parks.py --season 2024 --force
+python scripts/build_spine.py --season 2024 --force --allow-partial
+python scripts/build_game_logs_from_pitches.py --season 2024 --force
+python scripts/build_features_rolling.py
+python scripts/build_marts.py
+python scripts/validate_season_artifacts.py --season 2024
+```
