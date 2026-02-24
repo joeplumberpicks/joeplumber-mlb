@@ -1,4 +1,6 @@
-data/
+data/*
+!data/reference/
+data/reference/*
 outputs/
 models/
 *.parquet
@@ -11,3 +13,4 @@ models/
 __pycache__/
 .ipynb_checkpoints/
 .env
+!data/reference/parks_master.csv

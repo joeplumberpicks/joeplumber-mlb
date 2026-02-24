@@ -77,8 +77,21 @@ for k, v in dirs.items():
 - `backtests/<engine>/*.json`
 - `outputs/<engine>/*.csv`
 
+
+## Ingest Raw Data
+
+Run the ingest layer first so `raw/by_season` has non-empty inputs for spine building.
+
+```bash
+python scripts/ingest/run_ingest_season.py --season 2024 --chunk-days 7
+python scripts/build_spine.py --season 2024 --force --allow-partial
+python scripts/build_features_rolling.py
+python scripts/build_marts.py
+```
+
 ## Script Entry Points
 
+- `python scripts/ingest/run_ingest_season.py --season 2024 --chunk-days 7`
 - `python scripts/build_spine.py --season 2024`
 - `python scripts/build_features_rolling.py`
 - `python scripts/build_marts.py`
