@@ -27,9 +27,39 @@ def _empty_df(columns: list[str]) -> pd.DataFrame:
     return pd.DataFrame(columns=columns)
 
 
+def _normalize_pa_df(df: pd.DataFrame, season: int) -> pd.DataFrame:
+    out = df.copy()
+
+    if "batter_id" not in out.columns and "batter" in out.columns:
+        out["batter_id"] = out["batter"]
+    if "pitcher_id" not in out.columns and "pitcher" in out.columns:
+        out["pitcher_id"] = out["pitcher"]
+
+    if "pa_id" not in out.columns:
+        if "at_bat_number" in out.columns and "game_pk" in out.columns:
+            out["pa_id"] = out["game_pk"].astype(str) + "-" + out["at_bat_number"].astype(str)
+        else:
+            out["pa_id"] = pd.RangeIndex(start=0, stop=len(out), step=1).astype(str)
+
+    if "season" not in out.columns:
+        out["season"] = season
+
+    if "event_type" not in out.columns and "events" in out.columns:
+        out["event_type"] = out["events"]
+
+    for col in PA_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.NA
+
+    return out
+
+
 def load_or_placeholder(raw_path: Path, columns: list[str], label: str, season: int) -> pd.DataFrame:
     if raw_path.exists():
         df = read_parquet(raw_path)
+        if label == "plate_appearances":
+            df = _normalize_pa_df(df, season)
+            print_rowcount("plate_appearances_normalized", df)
         require_columns(df, columns, label)
         print_rowcount(label, df)
         return df
@@ -73,6 +103,9 @@ def build_spine_for_season(season: int, dirs: dict[str, Path], force: bool = Fal
         for df in [games_df, pa_df, weather_df, parks_df]:
             if "season" in df.columns and df["season"].isna().any():
                 df["season"] = df["season"].fillna(season)
+
+        pa_df = pa_df[PA_COLUMNS].copy()
+        print_rowcount("plate_appearances_processed", pa_df)
 
         print(f"Writing to: {out_games.resolve()}")
         write_parquet(games_df, out_games)
