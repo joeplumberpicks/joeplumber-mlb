@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -11,20 +12,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.features.pitch_rules import (
-    CONTACT_DESCRIPTIONS,
-    SWING_DESCRIPTIONS,
-    WHIFF_DESCRIPTIONS,
-    pitch_group,
-)
+from src.features.pitch_rules import CONTACT_DESCRIPTIONS, SWING_DESCRIPTIONS, WHIFF_DESCRIPTIONS, pitch_group
 from src.utils.checks import print_rowcount, require_files
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
 from src.utils.io import read_parquet, write_parquet
 from src.utils.logging import configure_logging, log_header
 
-
-EVENT_TO_HIT = {"single": 1, "double": 2, "triple": 3, "home_run": 4}
+EVENT_TO_HIT = {"single", "double", "triple", "home_run"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,19 +33,58 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _resolve_pitch_source(dirs: dict[str, Path], season: int) -> tuple[Path, pd.DataFrame]:
+    processed_pitches = dirs["processed_dir"] / "by_season" / f"pitches_{season}.parquet"
+    raw_pa = dirs["raw_dir"] / "by_season" / f"pa_{season}.parquet"
+
+    if processed_pitches.exists():
+        df = read_parquet(processed_pitches)
+        logging.info("Using pitch-level source: %s", processed_pitches.resolve())
+        return processed_pitches, df
+
+    if raw_pa.exists():
+        df = read_parquet(raw_pa)
+        if "pitch_type" in df.columns:
+            logging.info("Using pitch-level source fallback: %s", raw_pa.resolve())
+            return raw_pa, df
+        raise ValueError(
+            f"Raw PA file exists but is not pitch-level (missing 'pitch_type'): {raw_pa.resolve()}"
+        )
+
+    raise FileNotFoundError(
+        "No pitch-level source found. Expected one of: "
+        f"{processed_pitches.resolve()} or {raw_pa.resolve()}"
+    )
+
+
+def _normalize_ids(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "batter_id" not in out.columns and "batter" in out.columns:
+        out["batter_id"] = out["batter"]
+    if "pitcher_id" not in out.columns and "pitcher" in out.columns:
+        out["pitcher_id"] = out["pitcher"]
+
+    for col in ["batter_id", "pitcher_id"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
+    return out
+
+
 def _in_zone(df: pd.DataFrame) -> pd.Series:
-    zone_based = df.get("zone", pd.Series(index=df.index, dtype="float64")).isin(list(range(1, 10)))
+    zone_col = pd.to_numeric(df.get("zone", pd.Series(index=df.index, dtype="float64")), errors="coerce")
+    zone_based = zone_col.isin(list(range(1, 10)))
     if {"plate_x", "plate_z", "sz_top", "sz_bot"}.issubset(df.columns):
-        denom = (df["sz_top"] - df["sz_bot"]).replace(0, np.nan)
-        nz = (df["plate_z"] - df["sz_bot"]) / denom
-        loc_based = df["plate_x"].between(-0.83, 0.83, inclusive="both") & nz.between(0, 1, inclusive="both")
+        denom = (pd.to_numeric(df["sz_top"], errors="coerce") - pd.to_numeric(df["sz_bot"], errors="coerce")).replace(0, np.nan)
+        nz = (pd.to_numeric(df["plate_z"], errors="coerce") - pd.to_numeric(df["sz_bot"], errors="coerce")) / denom
+        loc_based = pd.to_numeric(df["plate_x"], errors="coerce").between(-0.83, 0.83, inclusive="both") & nz.between(
+            0, 1, inclusive="both"
+        )
         return zone_based | loc_based.fillna(False)
     return zone_based
 
 
-def _prepare_pitch_features(pa_df: pd.DataFrame) -> pd.DataFrame:
-    df = pa_df.copy()
-    df["game_date"] = pd.to_datetime(df.get("game_date"), errors="coerce")
+def _prepare_pitch_features(pitches_df: pd.DataFrame) -> pd.DataFrame:
+    df = _normalize_ids(pitches_df)
     df["description"] = df.get("description", pd.Series(index=df.index, dtype="object")).fillna("")
     df["events"] = df.get("events", pd.Series(index=df.index, dtype="object"))
     df["event_type"] = df.get("event_type", df["events"])
@@ -66,54 +100,48 @@ def _prepare_pitch_features(pa_df: pd.DataFrame) -> pd.DataFrame:
     df["is_bb"] = df["events"].isin(["walk", "intent_walk"]).astype(int)
     df["is_hbp"] = df["events"].eq("hit_by_pitch").astype(int)
     df["is_hr"] = df["events"].eq("home_run").astype(int)
-    df["is_hit"] = df["events"].isin(EVENT_TO_HIT.keys()).astype(int)
-
-    if {"plate_z", "sz_bot", "sz_top"}.issubset(df.columns):
-        denom = (df["sz_top"] - df["sz_bot"]).replace(0, np.nan)
-        df["nz"] = (df["plate_z"] - df["sz_bot"]) / denom
-    else:
-        df["nz"] = np.nan
-
-    if "plate_x" in df.columns:
-        df["zone_bucket"] = pd.cut(df["plate_x"], bins=[-99, -0.5, 0.5, 99], labels=["inside", "middle", "outside"])
-    else:
-        df["zone_bucket"] = "unknown"
+    df["is_hit"] = df["events"].isin(EVENT_TO_HIT).astype(int)
 
     return df
 
 
-def _agg_rates(df: pd.DataFrame, grp_cols: list[str], id_col: str) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=grp_cols)
+def _merge_game_context(df: pd.DataFrame, games_df: pd.DataFrame) -> pd.DataFrame:
+    game_cols = [c for c in ["game_pk", "game_date", "home_team", "away_team", "park_id", "park_name", "canonical_park_key"] if c in games_df.columns]
+    game_map = games_df[game_cols].drop_duplicates(subset=["game_pk"]) if "game_pk" in game_cols else pd.DataFrame(columns=game_cols)
+    if game_map.empty:
+        return df
+    out = df.merge(game_map, on="game_pk", how="left", suffixes=("", "_game"))
+    out["game_date"] = pd.to_datetime(out.get("game_date"), errors="coerce")
+    return out
 
-    src = df.copy()
-    if id_col not in src.columns:
-        src[id_col] = 1
-    for col in ["is_swing", "is_whiff", "is_contact", "in_zone", "is_chase", "is_k", "is_bb", "is_hbp", "is_hr", "is_hit"]:
-        if col not in src.columns:
-            src[col] = 0
-    for col in ["release_speed", "release_spin_rate", "launch_speed"]:
-        if col not in src.columns:
-            src[col] = pd.NA
 
-    g = src.groupby(grp_cols, dropna=False)
-    out = g.agg(
-        pitches=(id_col, "count"),
-        swings=("is_swing", "sum"),
-        whiffs=("is_whiff", "sum"),
-        contacts=("is_contact", "sum"),
-        in_zone_pitches=("in_zone", "sum"),
-        chases=("is_chase", "sum"),
-        k=("is_k", "max"),
-        bb=("is_bb", "max"),
-        hbp=("is_hbp", "max"),
-        hr=("is_hr", "max"),
-        h=("is_hit", "max"),
-        release_speed_mean=("release_speed", "mean"),
-        release_spin_rate_mean=("release_spin_rate", "mean"),
-        launch_speed_mean=("launch_speed", "mean"),
-        launch_speed_max=("launch_speed", "max"),
-    ).reset_index()
+def _agg_game(df: pd.DataFrame, id_col: str) -> pd.DataFrame:
+    base_group = ["game_pk", id_col]
+    context = [c for c in ["game_date", "home_team", "away_team", "park_id", "park_name", "canonical_park_key"] if c in df.columns]
+    group_cols = base_group + context
+
+    numeric_for_mean = [c for c in ["release_speed", "release_spin_rate", "launch_speed", "launch_angle"] if c in df.columns]
+    for col in numeric_for_mean:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    agg_spec: dict[str, tuple[str, str]] = {
+        "pitches": ("description", "count"),
+        "swings": ("is_swing", "sum"),
+        "whiffs": ("is_whiff", "sum"),
+        "contacts": ("is_contact", "sum"),
+        "in_zone_pitches": ("in_zone", "sum"),
+        "chases": ("is_chase", "sum"),
+        "k": ("is_k", "max"),
+        "bb": ("is_bb", "max"),
+        "hbp": ("is_hbp", "max"),
+        "hr": ("is_hr", "max"),
+        "h": ("is_hit", "max"),
+    }
+    for col in numeric_for_mean:
+        agg_spec[f"{col}_mean"] = (col, "mean")
+        agg_spec[f"{col}_max"] = (col, "max")
+
+    out = df.groupby(group_cols, dropna=False).agg(**agg_spec).reset_index()
     out["swing_rate"] = out["swings"] / out["pitches"].replace(0, np.nan)
     out["zone_swing_rate"] = out["swings"] / out["in_zone_pitches"].replace(0, np.nan)
     out["chase_rate"] = out["chases"] / out["swings"].replace(0, np.nan)
@@ -132,41 +160,46 @@ def main() -> None:
     configure_logging(dirs["logs_dir"] / "build_game_logs_from_pitches.log")
     log_header("scripts/build_game_logs_from_pitches.py", repo_root, config_path, dirs)
 
-    pa_path = dirs["processed_dir"] / "by_season" / f"pa_{args.season}.parquet"
     games_path = dirs["processed_dir"] / "by_season" / f"games_{args.season}.parquet"
-    require_files([pa_path, games_path], f"build_game_logs_from_pitches_{args.season}")
+    require_files([games_path], f"build_game_logs_from_pitches_{args.season}")
 
-    pa_df = read_parquet(pa_path)
+    src_path, pitches_df = _resolve_pitch_source(dirs, args.season)
+    print(f"Using pitch-level source: {src_path.resolve()}")
     games_df = read_parquet(games_path)
-    df = _prepare_pitch_features(pa_df)
 
-    game_cols = [c for c in ["game_pk", "game_date", "home_team", "away_team", "park_id", "venue_id", "canonical_park_key"] if c in games_df.columns]
-    game_map = games_df[game_cols].drop_duplicates(subset=["game_pk"]) if "game_pk" in games_df.columns else pd.DataFrame(columns=game_cols)
-    if "game_pk" in df.columns and not game_map.empty:
-        df = df.merge(game_map, on="game_pk", how="left", suffixes=("", "_g"))
+    df = _prepare_pitch_features(pitches_df)
+    df = _merge_game_context(df, games_df)
 
     if args.start:
         df = df[df["game_date"] >= pd.to_datetime(args.start)]
     if args.end:
         df = df[df["game_date"] <= pd.to_datetime(args.end)]
 
-    batter_keys = [c for c in ["game_pk", "game_date", "batter", "home_team", "away_team", "park_id", "canonical_park_key"] if c in df.columns]
-    pitcher_keys = [c for c in ["game_pk", "game_date", "pitcher", "home_team", "away_team", "park_id", "canonical_park_key"] if c in df.columns]
+    batter_required = ["game_pk", "batter_id"]
+    pitcher_required = ["game_pk", "pitcher_id"]
+    missing_b = [c for c in batter_required if c not in df.columns]
+    missing_p = [c for c in pitcher_required if c not in df.columns]
+    if missing_b or missing_p:
+        raise ValueError(f"Missing required id columns for game-log build. missing_batter={missing_b}, missing_pitcher={missing_p}")
 
-    batter_game = _agg_rates(df, batter_keys, "pitcher")
-    pitcher_game = _agg_rates(df, pitcher_keys, "batter")
+    batter_df = df.dropna(subset=["game_pk", "batter_id"]).copy()
+    pitcher_df = df.dropna(subset=["game_pk", "pitcher_id"]).copy()
+    batter_game = _agg_game(batter_df, "batter_id")
+    pitcher_game = _agg_game(pitcher_df, "pitcher_id")
 
-    for src, key_col in [(batter_game, "batter"), (pitcher_game, "pitcher")]:
-        if key_col in src.columns:
-            grp = src.groupby([key_col, "game_date"], dropna=False)["pitches"].sum().reset_index(name="_tmp")
-            _ = grp
+    games_rows = len(games_df)
+    if games_rows > 0:
+        if len(batter_game) <= games_rows:
+            raise RuntimeError(
+                f"Unexpected grain: batter_game rows ({len(batter_game)}) should be > games rows ({games_rows})."
+            )
+        if len(pitcher_game) < games_rows:
+            raise RuntimeError(
+                f"Unexpected grain: pitcher_game rows ({len(pitcher_game)}) should be >= games rows ({games_rows})."
+            )
 
-    matchup_cols = [c for c in ["game_pk", "game_date", "batter", "pitcher", "pitch_group", "zone_bucket"] if c in df.columns]
-    matchup = (
-        df.groupby(matchup_cols, dropna=False)
-        .agg(pitches=("description", "count"), swings=("is_swing", "sum"), whiffs=("is_whiff", "sum"))
-        .reset_index()
-    )
+    matchup_cols = [c for c in ["game_pk", "batter_id", "pitcher_id", "pitch_group"] if c in df.columns]
+    matchup = df.groupby(matchup_cols, dropna=False).agg(pitches=("description", "count"), swings=("is_swing", "sum"), whiffs=("is_whiff", "sum")).reset_index()
 
     out_dir = dirs["processed_dir"] / "by_season"
     batter_path = out_dir / f"batter_game_{args.season}.parquet"

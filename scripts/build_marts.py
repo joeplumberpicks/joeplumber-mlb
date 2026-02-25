@@ -16,6 +16,10 @@ from src.utils.logging import configure_logging, log_header
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build feature marts from model spine and rolling tables.")
+    parser.add_argument("--season", type=int, default=None)
+    parser.add_argument("--start", type=str, default=None)
+    parser.add_argument("--end", type=str, default=None)
+    parser.add_argument("--force", action="store_true")
     parser.add_argument("--config", type=Path, default=Path("configs/project.yaml"))
     return parser.parse_args()
 
@@ -29,6 +33,7 @@ def main() -> None:
 
     configure_logging(dirs["logs_dir"] / "build_marts.log")
     log_header("scripts/build_marts.py", repo_root, config_path, dirs)
+    print(f"Args: season={args.season}, start={args.start}, end={args.end}, force={args.force}")
 
     build_marts(dirs)
 

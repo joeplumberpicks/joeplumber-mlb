@@ -17,7 +17,9 @@ def _detect_id_column(df: pd.DataFrame, candidates: list[str], entity: str) -> s
         if col in df.columns:
             logging.info("Selected %s id column: %s", entity, col)
             return col
-    raise ValueError(f"Could not find {entity} id column. Available columns: {list(df.columns)}")
+    raise ValueError(
+        f"Could not find {entity} id column. Candidates: {candidates}. Available columns: {list(df.columns)}"
+    )
 
 
 def _normalize_entity_df(source_df: pd.DataFrame, entity: str) -> tuple[pd.DataFrame, str]:
