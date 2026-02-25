@@ -11,6 +11,8 @@ from src.utils.io import read_parquet, write_parquet
 BATTER_TEAM_CANDIDATES = ["bat_team", "team", "batting_team", "batter_team", "offense_team"]
 BATTER_ID_CANDIDATES = ["batter", "batter_id", "mlbam_batter_id", "player_id"]
 PITCHER_ID_CANDIDATES = ["pitcher", "pitcher_id", "mlbam_pitcher_id", "player_id"]
+HR_CANDIDATES = ["bat_hr", "hr"]
+EVENTS_TEAM_CANDIDATES = ["batting_team", "bat_team", "team", "offense_team"]
 
 
 def _pick_column(df: pd.DataFrame, candidates: list[str], label: str) -> str:
@@ -18,6 +20,57 @@ def _pick_column(df: pd.DataFrame, candidates: list[str], label: str) -> str:
         if col in df.columns:
             return col
     raise ValueError(f"Missing {label} column. Candidates: {candidates}. Available: {list(df.columns)}")
+
+
+def _pick_optional_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _mode(series: pd.Series) -> object:
+    m = series.mode(dropna=True)
+    return m.iloc[0] if not m.empty else pd.NA
+
+
+def _infer_batter_team_from_events(
+    batter_game: pd.DataFrame,
+    processed_dir: Path,
+    batter_id_col: str,
+) -> pd.DataFrame:
+    events_path = processed_dir / "events_pa.parquet"
+    if not events_path.exists():
+        logging.info("events_pa.parquet not found; cannot infer batter_team fallback")
+        batter_game["batter_team"] = pd.NA
+        return batter_game
+
+    events = read_parquet(events_path)
+    events_batter_col = _pick_optional_column(events, BATTER_ID_CANDIDATES)
+    events_team_col = _pick_optional_column(events, EVENTS_TEAM_CANDIDATES)
+    if events_batter_col is None or events_team_col is None or "game_pk" not in events.columns:
+        logging.info(
+            "events_pa missing required columns for batter_team inference. batter_col=%s team_col=%s has_game_pk=%s",
+            events_batter_col,
+            events_team_col,
+            "game_pk" in events.columns,
+        )
+        batter_game["batter_team"] = pd.NA
+        return batter_game
+
+    events_map = events[["game_pk", events_batter_col, events_team_col]].copy()
+    events_map["batter_id"] = pd.to_numeric(events_map[events_batter_col], errors="coerce").astype("Int64")
+    events_map = events_map.dropna(subset=["batter_id"])
+    events_mode = (
+        events_map.groupby(["game_pk", "batter_id"], dropna=False)[events_team_col]
+        .agg(_mode)
+        .reset_index()
+        .rename(columns={events_team_col: "batter_team"})
+    )
+
+    out = batter_game.copy()
+    out = out.merge(events_mode, left_on=["game_pk", batter_id_col], right_on=["game_pk", "batter_id"], how="left")
+    return out
 
 
 def build_hr_batter_features(
@@ -37,16 +90,23 @@ def build_hr_batter_features(
     batter_roll = read_parquet(batter_roll_path)
     pitcher_roll = read_parquet(pitcher_roll_path)
 
-    if "bat_hr" not in batter_game.columns:
-        raise ValueError(f"Expected bat_hr column in batter_game_{season}. Available: {list(batter_game.columns)}")
+    hr_col = _pick_optional_column(batter_game, HR_CANDIDATES)
+    if hr_col is None:
+        raise ValueError(
+            f"Expected one of {HR_CANDIDATES} in batter_game_{season}. Available: {list(batter_game.columns)}"
+        )
 
-    batter_team_col = _pick_column(batter_game, BATTER_TEAM_CANDIDATES, "batter_team")
     batter_id_col = _pick_column(batter_game, BATTER_ID_CANDIDATES, "batter_id")
+    batter_team_col = _pick_optional_column(batter_game, BATTER_TEAM_CANDIDATES)
 
     batter_game = batter_game.copy()
     batter_game["batter_id"] = pd.to_numeric(batter_game[batter_id_col], errors="coerce").astype("Int64")
-    batter_game["batter_team"] = batter_game[batter_team_col]
-    batter_game["target_hr"] = (pd.to_numeric(batter_game["bat_hr"], errors="coerce").fillna(0) > 0).astype("Int64")
+    if batter_team_col is not None:
+        batter_game["batter_team"] = batter_game[batter_team_col]
+    else:
+        batter_game = _infer_batter_team_from_events(batter_game, dirs["processed_dir"], "batter_id")
+
+    batter_game["target_hr"] = (pd.to_numeric(batter_game[hr_col], errors="coerce").fillna(0) > 0).astype("Int64")
     batter_game["game_date"] = pd.to_datetime(batter_game.get("game_date"), errors="coerce")
     batter_game["season"] = pd.to_numeric(batter_game.get("season"), errors="coerce").fillna(season).astype("Int64")
 
@@ -79,6 +139,10 @@ def build_hr_batter_features(
     if "home_sp_id" in hr.columns:
         hr.loc[away_mask, "opp_sp_id"] = hr.loc[away_mask, "home_sp_id"]
     hr["opp_sp_id"] = pd.to_numeric(hr["opp_sp_id"], errors="coerce").astype("Int64")
+
+    null_team = int(hr["batter_team"].isna().sum()) if "batter_team" in hr.columns else len(hr)
+    if null_team:
+        logging.info("hr_batter_features: batter_team null rows=%s", null_team)
 
     unknown_opp = int(hr["opp_sp_id"].isna().sum())
     logging.info("hr_batter_features: opp_sp_id null rows=%s (%.2f%%)", unknown_opp, 100.0 * unknown_opp / max(len(hr), 1))

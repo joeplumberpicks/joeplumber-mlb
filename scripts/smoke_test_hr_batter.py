@@ -28,10 +28,16 @@ def run_smoke() -> None:
             {
                 "game_pk": [1, 1, 2],
                 "batter_id": [101, 102, 103],
-                "batter_team": ["NYY", "NYY", "BOS"],
-                "bat_hr": [0, 1, 0],
+                "hr": [0, 1, 0],
                 "game_date": ["2024-04-01", "2024-04-01", "2024-04-02"],
                 "season": [2024, 2024, 2024],
+            }
+        )
+        events_pa = pd.DataFrame(
+            {
+                "game_pk": [1, 1, 1, 2],
+                "batter": [101, 102, 102, 103],
+                "batting_team": ["NYY", "NYY", "NYY", "BOS"],
             }
         )
         spine = pd.DataFrame(
@@ -50,18 +56,19 @@ def run_smoke() -> None:
             {
                 "game_pk": [1, 1, 2],
                 "batter_id": [101, 102, 103],
-                "bat_recent": [0.1, 0.2, 0.3],
+                "recent": [0.1, 0.2, 0.3],
             }
         )
         pitcher_roll = pd.DataFrame(
             {
                 "game_pk": [1, 2],
                 "pitcher_id": [9101, 9102],
-                "pit_recent": [0.4, 0.5],
+                "recent": [0.4, 0.5],
             }
         )
 
         write_parquet(batter_game, dirs["processed_dir"] / "by_season" / "batter_game_2024.parquet")
+        write_parquet(events_pa, dirs["processed_dir"] / "events_pa.parquet")
         write_parquet(spine, dirs["processed_dir"] / "model_spine_game.parquet")
         write_parquet(batter_roll, dirs["processed_dir"] / "batter_game_rolling.parquet")
         write_parquet(pitcher_roll, dirs["processed_dir"] / "pitcher_game_rolling.parquet")
@@ -72,8 +79,9 @@ def run_smoke() -> None:
         assert "target_hr" in out.columns, "target_hr missing"
         assert len(out) == len(batter_game), "Expected batter-game grain in hr_batter_features"
         assert "opp_sp_id" in out.columns, "opp_sp_id missing"
+        assert out["batter_team"].notna().all(), "Expected batter_team inferred from events_pa"
 
-    print("Smoke test passed: hr batter mart builds with expected grain and target.")
+    print("Smoke test passed: hr batter mart supports unprefixed schema and team inference.")
 
 
 if __name__ == "__main__":
