@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from src.parks.park_identity import load_park_overrides, resolve_park_for_game
@@ -353,31 +354,48 @@ def _populate_starter_ids_from_events(model_spine: pd.DataFrame, processed_dir: 
     pitching_team_col = _pick_optional_column(events, PITCHING_TEAM_CANDIDATES)
     inning_col = _pick_optional_column(events, INNING_CANDIDATES)
     inning_half_col = _pick_optional_column(events, INNING_HALF_CANDIDATES)
+    home_team_col = _pick_optional_column(events, ["home_team"])
+    away_team_col = _pick_optional_column(events, ["away_team"])
 
-    if pitcher_col is None or pitching_team_col is None or inning_col is None or "game_pk" not in events.columns:
+    can_derive_pitching_team = (
+        inning_half_col is not None and home_team_col is not None and away_team_col is not None
+    )
+    has_required = (
+        pitcher_col is not None
+        and inning_col is not None
+        and "game_pk" in events.columns
+        and (pitching_team_col is not None or can_derive_pitching_team)
+    )
+    if not has_required:
         logging.warning(
-            "Cannot populate starters from events_pa due to missing columns. pitcher=%s pitching_team=%s inning=%s has_game_pk=%s",
+            "Cannot populate starters from events_pa due to missing columns. pitcher=%s pitching_team=%s inning=%s inning_topbot=%s home_team=%s away_team=%s has_game_pk=%s",
             pitcher_col,
             pitching_team_col,
             inning_col,
+            inning_half_col,
+            home_team_col,
+            away_team_col,
             "game_pk" in events.columns,
         )
         return model_spine
 
     starter_events = events.copy()
+    if pitching_team_col is None:
+        half = starter_events[inning_half_col].astype(str).str.strip().str.lower()
+        starter_events["__pitching_team"] = np.where(
+            half.str.startswith("top"),
+            starter_events[home_team_col],
+            np.where(half.str.startswith("bot"), starter_events[away_team_col], pd.NA),
+        )
+        pitching_team_col = "__pitching_team"
     starter_events[pitcher_col] = pd.to_numeric(starter_events[pitcher_col], errors="coerce")
     starter_events[inning_col] = pd.to_numeric(starter_events[inning_col], errors="coerce")
     starter_events = starter_events[starter_events[inning_col] == 1]
     starter_events = starter_events.dropna(subset=[pitcher_col, pitching_team_col, "game_pk"])
 
     seq_col = _pick_optional_column(starter_events, PITCH_SEQUENCE_CANDIDATES)
-    sort_cols = ["game_pk", pitching_team_col]
     if seq_col is not None:
-        sort_cols.append(seq_col)
-    elif inning_half_col is not None:
-        sort_cols.append(inning_half_col)
-
-    starter_events = starter_events.sort_values(sort_cols)
+        starter_events = starter_events.sort_values(["game_pk", pitching_team_col, seq_col])
     starter_events["team_match"] = starter_events[pitching_team_col].map(_normalize_team_for_match)
 
     starters = (
