@@ -32,6 +32,104 @@ INNING_CANDIDATES = ["inning"]
 INNING_HALF_CANDIDATES = ["inning_topbot", "topbot", "inning_half"]
 PITCH_SEQUENCE_CANDIDATES = ["pitch_number", "pitch_num", "pitch_seq", "pitch_index"]
 
+_TEAM_ALIAS_TO_ABBR = {
+    "ARI": "ARI",
+    "ARIZONA": "ARI",
+    "ARIZONA DIAMONDBACKS": "ARI",
+    "ATL": "ATL",
+    "ATLANTA": "ATL",
+    "ATLANTA BRAVES": "ATL",
+    "BAL": "BAL",
+    "BALTIMORE": "BAL",
+    "BALTIMORE ORIOLES": "BAL",
+    "BOS": "BOS",
+    "BOSTON": "BOS",
+    "BOSTON RED SOX": "BOS",
+    "CHC": "CHC",
+    "CHICAGO CUBS": "CHC",
+    "CIN": "CIN",
+    "CINCINNATI": "CIN",
+    "CINCINNATI REDS": "CIN",
+    "CLE": "CLE",
+    "CLEVELAND": "CLE",
+    "COLORADO": "COL",
+    "COLORADO ROCKIES": "COL",
+    "COL": "COL",
+    "CWS": "CWS",
+    "CHW": "CWS",
+    "CHICAGO WHITE SOX": "CWS",
+    "DET": "DET",
+    "DETROIT": "DET",
+    "DETROIT TIGERS": "DET",
+    "HOU": "HOU",
+    "HOUSTON": "HOU",
+    "HOUSTON ASTROS": "HOU",
+    "KC": "KC",
+    "KCR": "KC",
+    "KANSAS CITY": "KC",
+    "KANSAS CITY ROYALS": "KC",
+    "LAA": "LAA",
+    "ANA": "LAA",
+    "LOS ANGELES ANGELS": "LAA",
+    "LAD": "LAD",
+    "LOS ANGELES DODGERS": "LAD",
+    "MIA": "MIA",
+    "FLA": "MIA",
+    "MIAMI": "MIA",
+    "MIAMI MARLINS": "MIA",
+    "MIL": "MIL",
+    "MILWAUKEE": "MIL",
+    "MILWAUKEE BREWERS": "MIL",
+    "MIN": "MIN",
+    "MINNESOTA": "MIN",
+    "MINNESOTA TWINS": "MIN",
+    "NYM": "NYM",
+    "NEW YORK METS": "NYM",
+    "NYY": "NYY",
+    "NEW YORK YANKEES": "NYY",
+    "OAK": "OAK",
+    "ATHLETICS": "OAK",
+    "OAKLAND": "OAK",
+    "OAKLAND ATHLETICS": "OAK",
+    "PHI": "PHI",
+    "PHILADELPHIA": "PHI",
+    "PHILADELPHIA PHILLIES": "PHI",
+    "PIT": "PIT",
+    "PITTSBURGH": "PIT",
+    "PITTSBURGH PIRATES": "PIT",
+    "SD": "SD",
+    "SDP": "SD",
+    "SAN DIEGO": "SD",
+    "SAN DIEGO PADRES": "SD",
+    "SEA": "SEA",
+    "SEATTLE": "SEA",
+    "SEATTLE MARINERS": "SEA",
+    "SF": "SF",
+    "SFG": "SF",
+    "SAN FRANCISCO": "SF",
+    "SAN FRANCISCO GIANTS": "SF",
+    "STL": "STL",
+    "STL CARDINALS": "STL",
+    "ST LOUIS": "STL",
+    "ST. LOUIS": "STL",
+    "ST LOUIS CARDINALS": "STL",
+    "ST. LOUIS CARDINALS": "STL",
+    "TB": "TB",
+    "TBR": "TB",
+    "TAMPA BAY": "TB",
+    "TAMPA BAY RAYS": "TB",
+    "TEX": "TEX",
+    "TEXAS": "TEX",
+    "TEXAS RANGERS": "TEX",
+    "TOR": "TOR",
+    "TORONTO": "TOR",
+    "TORONTO BLUE JAYS": "TOR",
+    "WSH": "WSH",
+    "WAS": "WSH",
+    "WASHINGTON": "WSH",
+    "WASHINGTON NATIONALS": "WSH",
+}
+
 
 def _empty_df(columns: list[str]) -> pd.DataFrame:
     return pd.DataFrame(columns=columns)
@@ -234,6 +332,16 @@ def _pick_optional_column(df: pd.DataFrame, candidates: list[str]) -> str | None
     return None
 
 
+def _normalize_team_for_match(val: object) -> str:
+    raw = str(val).strip().upper() if pd.notna(val) else ""
+    if not raw:
+        return "UNK"
+    canon = canonical_team_abbr(raw, None)
+    if canon != "UNK":
+        return canon
+    return _TEAM_ALIAS_TO_ABBR.get(raw, raw)
+
+
 def _populate_starter_ids_from_events(model_spine: pd.DataFrame, processed_dir: Path) -> pd.DataFrame:
     events_path = processed_dir / "events_pa.parquet"
     if not events_path.exists():
@@ -270,12 +378,15 @@ def _populate_starter_ids_from_events(model_spine: pd.DataFrame, processed_dir: 
         sort_cols.append(inning_half_col)
 
     starter_events = starter_events.sort_values(sort_cols)
+    starter_events["team_match"] = starter_events[pitching_team_col].map(_normalize_team_for_match)
+
     starters = (
-        starter_events.groupby(["game_pk", pitching_team_col], dropna=False)[pitcher_col]
+        starter_events.groupby(["game_pk", "team_match"], dropna=False)[pitcher_col]
         .first()
         .reset_index()
-        .rename(columns={pitching_team_col: "pitching_team", pitcher_col: "starter_pitcher_id"})
+        .rename(columns={pitcher_col: "starter_pitcher_id"})
     )
+    team_samples = starter_events[[pitching_team_col, "team_match"]].drop_duplicates().head(5)
 
     out = model_spine.copy()
     if "home_sp_id" not in out.columns:
@@ -283,11 +394,14 @@ def _populate_starter_ids_from_events(model_spine: pd.DataFrame, processed_dir: 
     if "away_sp_id" not in out.columns:
         out["away_sp_id"] = pd.NA
 
-    home_map = out[["game_pk", "home_team"]].merge(
-        starters, left_on=["game_pk", "home_team"], right_on=["game_pk", "pitching_team"], how="left"
+    out["home_team_match"] = out["home_team"].map(_normalize_team_for_match)
+    out["away_team_match"] = out["away_team"].map(_normalize_team_for_match)
+
+    home_map = out[["game_pk", "home_team_match"]].merge(
+        starters, left_on=["game_pk", "home_team_match"], right_on=["game_pk", "team_match"], how="left"
     )
-    away_map = out[["game_pk", "away_team"]].merge(
-        starters, left_on=["game_pk", "away_team"], right_on=["game_pk", "pitching_team"], how="left"
+    away_map = out[["game_pk", "away_team_match"]].merge(
+        starters, left_on=["game_pk", "away_team_match"], right_on=["game_pk", "team_match"], how="left"
     )
 
     home_vals = pd.to_numeric(home_map["starter_pitcher_id"], errors="coerce")
@@ -300,8 +414,16 @@ def _populate_starter_ids_from_events(model_spine: pd.DataFrame, processed_dir: 
 
     home_null_pct = float(out["home_sp_id"].isna().mean() * 100) if len(out) else 0.0
     away_null_pct = float(out["away_sp_id"].isna().mean() * 100) if len(out) else 0.0
+    logging.info("event starter rows found: %s", len(starters))
+    logging.info(
+        "starter mapping team samples events=%s spine=%s",
+        team_samples.to_dict("records"),
+        out[["home_team", "home_team_match", "away_team", "away_team_match"]].head(5).to_dict("records"),
+    )
     logging.info("home_sp_id null %% after events starter mapping: %.2f%%", home_null_pct)
     logging.info("away_sp_id null %% after events starter mapping: %.2f%%", away_null_pct)
+
+    out = out.drop(columns=["home_team_match", "away_team_match"], errors="ignore")
 
     return out
 
