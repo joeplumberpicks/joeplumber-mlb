@@ -8,6 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from src.marts.build_hr_batter_features import build_hr_batter_features
 from src.marts.build_marts import build_marts
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
@@ -36,6 +37,8 @@ def main() -> None:
     print(f"Args: season={args.season}, start={args.start}, end={args.end}, force={args.force}")
 
     build_marts(dirs)
+    if args.season is not None:
+        build_hr_batter_features(dirs=dirs, season=args.season, start=args.start, end=args.end)
 
 
 if __name__ == "__main__":
