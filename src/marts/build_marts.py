@@ -99,7 +99,20 @@ def _merge_moneyline_targets(mart_df: pd.DataFrame, processed_dir: Path) -> pd.D
     if "target_home_win" not in merged.columns and "target_home_win_targets" in merged.columns:
         merged = merged.rename(columns={"target_home_win_targets": "target_home_win"})
     elif "target_home_win_targets" in merged.columns:
-        merged["target_home_win"] = merged["target_home_win"].combine_first(merged["target_home_win_targets"])
+        # --- dtype stabilization before combine_first ---
+        merged["target_home_win"] = pd.to_numeric(
+            merged["target_home_win"], errors="coerce"
+        )
+
+        merged["target_home_win_targets"] = pd.to_numeric(
+            merged["target_home_win_targets"], errors="coerce"
+        )
+
+        merged["target_home_win"] = (
+            merged["target_home_win"]
+                .combine_first(merged["target_home_win_targets"])
+                .astype("Int64")
+        )
         merged = merged.drop(columns=["target_home_win_targets"])
 
     if "target_home_win" not in merged.columns:
