@@ -26,6 +26,11 @@ GAMES_COLUMNS = [
 PA_COLUMNS = ["game_pk", "pa_id", "batter_id", "pitcher_id", "event_type", "season"]
 WEATHER_COLUMNS = ["game_pk", "temperature_f", "wind_mph", "wind_dir", "season"]
 PARK_COLUMNS = ["park_id", "venue_id", "park_name", "lat", "lon", "roofType", "tz", "season"]
+PITCHER_ID_CANDIDATES = ["pitcher", "pitcher_id", "mlbam_pitcher_id", "player_id"]
+PITCHING_TEAM_CANDIDATES = ["pitching_team", "defense_team", "fielding_team"]
+INNING_CANDIDATES = ["inning"]
+INNING_HALF_CANDIDATES = ["inning_topbot", "topbot", "inning_half"]
+PITCH_SEQUENCE_CANDIDATES = ["pitch_number", "pitch_num", "pitch_seq", "pitch_index"]
 
 
 def _empty_df(columns: list[str]) -> pd.DataFrame:
@@ -191,6 +196,85 @@ def build_spine_for_season(season: int, dirs: dict[str, Path], force: bool = Fal
     return {"games": out_games, "pa": out_pa, "weather": out_weather, "parks": out_parks}
 
 
+def _pick_optional_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _populate_starter_ids_from_events(model_spine: pd.DataFrame, processed_dir: Path) -> pd.DataFrame:
+    events_path = processed_dir / "events_pa.parquet"
+    if not events_path.exists():
+        logging.warning("events_pa.parquet not found at %s; starter IDs will remain as-is", events_path)
+        return model_spine
+
+    events = read_parquet(events_path)
+    pitcher_col = _pick_optional_column(events, PITCHER_ID_CANDIDATES)
+    pitching_team_col = _pick_optional_column(events, PITCHING_TEAM_CANDIDATES)
+    inning_col = _pick_optional_column(events, INNING_CANDIDATES)
+    inning_half_col = _pick_optional_column(events, INNING_HALF_CANDIDATES)
+
+    if pitcher_col is None or pitching_team_col is None or inning_col is None or "game_pk" not in events.columns:
+        logging.warning(
+            "Cannot populate starters from events_pa due to missing columns. pitcher=%s pitching_team=%s inning=%s has_game_pk=%s",
+            pitcher_col,
+            pitching_team_col,
+            inning_col,
+            "game_pk" in events.columns,
+        )
+        return model_spine
+
+    starter_events = events.copy()
+    starter_events[pitcher_col] = pd.to_numeric(starter_events[pitcher_col], errors="coerce")
+    starter_events[inning_col] = pd.to_numeric(starter_events[inning_col], errors="coerce")
+    starter_events = starter_events[starter_events[inning_col] == 1]
+    starter_events = starter_events.dropna(subset=[pitcher_col, pitching_team_col, "game_pk"])
+
+    seq_col = _pick_optional_column(starter_events, PITCH_SEQUENCE_CANDIDATES)
+    sort_cols = ["game_pk", pitching_team_col]
+    if seq_col is not None:
+        sort_cols.append(seq_col)
+    elif inning_half_col is not None:
+        sort_cols.append(inning_half_col)
+
+    starter_events = starter_events.sort_values(sort_cols)
+    starters = (
+        starter_events.groupby(["game_pk", pitching_team_col], dropna=False)[pitcher_col]
+        .first()
+        .reset_index()
+        .rename(columns={pitching_team_col: "pitching_team", pitcher_col: "starter_pitcher_id"})
+    )
+
+    out = model_spine.copy()
+    if "home_sp_id" not in out.columns:
+        out["home_sp_id"] = pd.NA
+    if "away_sp_id" not in out.columns:
+        out["away_sp_id"] = pd.NA
+
+    home_map = out[["game_pk", "home_team"]].merge(
+        starters, left_on=["game_pk", "home_team"], right_on=["game_pk", "pitching_team"], how="left"
+    )
+    away_map = out[["game_pk", "away_team"]].merge(
+        starters, left_on=["game_pk", "away_team"], right_on=["game_pk", "pitching_team"], how="left"
+    )
+
+    home_vals = pd.to_numeric(home_map["starter_pitcher_id"], errors="coerce")
+    away_vals = pd.to_numeric(away_map["starter_pitcher_id"], errors="coerce")
+
+    home_missing = out["home_sp_id"].isna()
+    away_missing = out["away_sp_id"].isna()
+    out.loc[home_missing, "home_sp_id"] = home_vals[home_missing].values
+    out.loc[away_missing, "away_sp_id"] = away_vals[away_missing].values
+
+    home_null_pct = float(out["home_sp_id"].isna().mean() * 100) if len(out) else 0.0
+    away_null_pct = float(out["away_sp_id"].isna().mean() * 100) if len(out) else 0.0
+    logging.info("home_sp_id null %% after events starter mapping: %.2f%%", home_null_pct)
+    logging.info("away_sp_id null %% after events starter mapping: %.2f%%", away_null_pct)
+
+    return out
+
+
 def _apply_park_venue_mapping(model_spine: pd.DataFrame, processed_by_season: Path, seasons: list[int]) -> pd.DataFrame:
     if "park_id" not in model_spine.columns:
         model_spine["park_id"] = pd.NA
@@ -233,6 +317,7 @@ def build_model_spine(dirs: dict[str, Path], seasons: list[int]) -> Path:
 
     model_spine = pd.concat(frames, ignore_index=True) if frames else _empty_df(GAMES_COLUMNS)
     model_spine = _apply_park_venue_mapping(model_spine, processed_by_season, seasons)
+    model_spine = _populate_starter_ids_from_events(model_spine, dirs["processed_dir"])
 
     keep_cols = [
         "game_pk",
