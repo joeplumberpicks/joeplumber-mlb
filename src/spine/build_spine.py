@@ -72,9 +72,40 @@ def _normalize_parks_df(df: pd.DataFrame, season: int) -> pd.DataFrame:
     return out
 
 
+
+
+def _normalize_games_df(df: pd.DataFrame, season: int) -> pd.DataFrame:
+    out = df.copy()
+
+    if "season" not in out.columns:
+        out["season"] = season
+
+    # Raw games files may not yet have enriched identity columns.
+    if "park_id" not in out.columns:
+        out["park_id"] = pd.NA
+    if "venue_id" not in out.columns:
+        out["venue_id"] = out["park_id"]
+    if "canonical_park_key" not in out.columns:
+        out["canonical_park_key"] = pd.NA
+    if "park_name" not in out.columns:
+        out["park_name"] = pd.NA
+    if "home_sp_id" not in out.columns:
+        out["home_sp_id"] = pd.NA
+    if "away_sp_id" not in out.columns:
+        out["away_sp_id"] = pd.NA
+
+    for col in GAMES_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.NA
+
+    return out
+
 def load_or_placeholder(raw_path: Path, columns: list[str], label: str, season: int) -> pd.DataFrame:
     if raw_path.exists():
         df = read_parquet(raw_path)
+        if label == "games":
+            df = _normalize_games_df(df, season)
+            print_rowcount("games_normalized", df)
         if label == "plate_appearances":
             df = _normalize_pa_df(df, season)
             print_rowcount("plate_appearances_normalized", df)
