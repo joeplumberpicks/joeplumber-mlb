@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -17,7 +18,6 @@ from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
 from src.utils.io import read_parquet, write_csv
 from src.utils.logging import configure_logging, log_header
-from src.utils.train_scaffold import _prep_X
 
 
 def _latest_model(model_dir: Path) -> Path:
@@ -29,24 +29,42 @@ def _latest_model(model_dir: Path) -> Path:
     return max(files, key=lambda p: (p.stem, p.stat().st_mtime))
 
 
-def _build_scoring_matrix(df: pd.DataFrame, model: object) -> tuple[pd.DataFrame, list[str], list[str]]:
-    feature_cols = [c for c in df.columns if c not in {"target_hr", "game_pk", "game_date"}]
-    X, final_features, dropped_cols, _, _ = _prep_X(df, feature_cols)
 
-    if X.empty:
-        X = pd.DataFrame(index=df.index, data={"baseline_feature": np.zeros(len(df), dtype="float32")})
-        final_features = list(X.columns)
+def _latest_backtest(backtest_dir: Path) -> Path:
+    files = list(backtest_dir.glob("*.json"))
+    if not files:
+        raise FileNotFoundError(f"No hr_batter_ranker backtest metadata found in {backtest_dir.resolve()}")
+    return max(files, key=lambda p: (p.stem, p.stat().st_mtime))
 
-    model_features = list(getattr(model, "feature_names_in_", []))
-    if model_features:
-        for col in model_features:
-            if col not in X.columns:
-                X[col] = 0.0
-        X = X.reindex(columns=model_features, fill_value=0.0)
-        final_features = model_features
+
+def _load_train_features(backtest_dir: Path) -> list[str]:
+    meta_path = _latest_backtest(backtest_dir)
+    with meta_path.open("r", encoding="utf-8") as fp:
+        meta = json.load(fp)
+
+    train_features = meta.get("features")
+    if not isinstance(train_features, list) or not train_features:
+        raise ValueError(f"Invalid or missing 'features' in backtest metadata: {meta_path.resolve()}")
+
+    logging.info("Using backtest metadata: %s", meta_path.resolve())
+    return [str(c) for c in train_features]
+
+
+def _build_scoring_matrix(df: pd.DataFrame, train_features: list[str]) -> tuple[pd.DataFrame, list[str]]:
+    missing_cols: list[str] = []
+    for col in train_features:
+        if col not in df.columns:
+            df[col] = 0.0
+            missing_cols.append(col)
+
+    X = df[train_features].copy()
+
+    for col in train_features:
+        if not pd.api.types.is_numeric_dtype(X[col]):
+            X[col] = pd.to_numeric(X[col], errors="coerce")
 
     X = X.replace([np.inf, -np.inf], np.nan).fillna(0).astype("float32")
-    return X, final_features, dropped_cols
+    return X, missing_cols
 
 
 def _select_export_columns(df: pd.DataFrame) -> list[str]:
@@ -91,6 +109,8 @@ def main() -> None:
     logging.info("Using model: %s", model_path.resolve())
     model = load(model_path)
 
+    train_features = _load_train_features(dirs["backtests_dir"] / "hr_batter_ranker")
+
     mart_path = dirs["marts_dir"] / "hr_batter_features.parquet"
     if not mart_path.exists():
         raise FileNotFoundError(f"Missing hr batter mart: {mart_path.resolve()}")
@@ -115,15 +135,17 @@ def main() -> None:
     if day_df.empty:
         raise RuntimeError(f"No rows found in hr_batter_features for date {target_date}")
 
-    X, used_features, dropped_cols = _build_scoring_matrix(day_df, model)
-    if dropped_cols:
-        logging.info("Dropped non-numeric columns for scoring: %s", dropped_cols)
-    logging.info("Scoring with %s rows and %s features", len(X), len(used_features))
+    X, missing_created = _build_scoring_matrix(day_df, train_features)
+    logging.info("Scoring with %s rows and %s features", len(X), len(train_features))
+    logging.info("Missing training feature columns created: %s", len(missing_created))
+    if missing_created:
+        logging.info("Created missing feature columns: %s", missing_created)
 
     if hasattr(model, "predict_proba"):
         day_df["p_hr"] = model.predict_proba(X)[:, 1]
     else:
         day_df["p_hr"] = model.predict(X)
+    logging.info("Unique p_hr after scoring: %s", int(day_df["p_hr"].nunique(dropna=True)))
 
     day_df = day_df.sort_values("p_hr", ascending=False).reset_index(drop=True)
     day_df["rank"] = np.arange(1, len(day_df) + 1)
