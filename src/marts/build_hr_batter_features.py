@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from src.utils.checks import print_rowcount, require_files
@@ -13,6 +14,9 @@ BATTER_ID_CANDIDATES = ["batter", "batter_id", "mlbam_batter_id", "player_id"]
 PITCHER_ID_CANDIDATES = ["pitcher", "pitcher_id", "mlbam_pitcher_id", "player_id"]
 HR_CANDIDATES = ["bat_hr", "hr"]
 EVENTS_TEAM_CANDIDATES = ["batting_team", "bat_team", "team", "offense_team"]
+INNING_HALF_CANDIDATES = ["inning_topbot", "topbot", "inning_half", "inning_top_bot"]
+HOME_TEAM_CANDIDATES = ["home_team"]
+AWAY_TEAM_CANDIDATES = ["away_team"]
 
 
 def _pick_column(df: pd.DataFrame, candidates: list[str], label: str) -> str:
@@ -41,15 +45,31 @@ def _infer_batter_team_from_events(
 ) -> pd.DataFrame:
     events_path = processed_dir / "events_pa.parquet"
     if not events_path.exists():
-        logging.info("events_pa.parquet not found; cannot infer batter_team fallback")
+        logging.warning("events_pa.parquet not found; cannot infer batter_team fallback")
         batter_game["batter_team"] = pd.NA
         return batter_game
 
     events = read_parquet(events_path)
     events_batter_col = _pick_optional_column(events, BATTER_ID_CANDIDATES)
     events_team_col = _pick_optional_column(events, EVENTS_TEAM_CANDIDATES)
+
+    derived_batting_team_col = None
+    if events_team_col is None:
+        inning_col = _pick_optional_column(events, INNING_HALF_CANDIDATES)
+        home_col = _pick_optional_column(events, HOME_TEAM_CANDIDATES)
+        away_col = _pick_optional_column(events, AWAY_TEAM_CANDIDATES)
+        if inning_col and home_col and away_col:
+            half = events[inning_col].astype(str).str.lower()
+            derived_batting_team_col = "_derived_batting_team"
+            events[derived_batting_team_col] = np.where(
+                half.str.startswith("top"),
+                events[away_col],
+                np.where(half.str.startswith("bot"), events[home_col], pd.NA),
+            )
+            events_team_col = derived_batting_team_col
+
     if events_batter_col is None or events_team_col is None or "game_pk" not in events.columns:
-        logging.info(
+        logging.warning(
             "events_pa missing required columns for batter_team inference. batter_col=%s team_col=%s has_game_pk=%s",
             events_batter_col,
             events_team_col,
@@ -108,7 +128,10 @@ def build_hr_batter_features(
 
     batter_game["target_hr"] = (pd.to_numeric(batter_game[hr_col], errors="coerce").fillna(0) > 0).astype("Int64")
     batter_game["game_date"] = pd.to_datetime(batter_game.get("game_date"), errors="coerce")
-    batter_game["season"] = pd.to_numeric(batter_game.get("season"), errors="coerce").fillna(season).astype("Int64")
+    if "season" in batter_game.columns:
+        batter_game["season"] = pd.to_numeric(batter_game["season"], errors="coerce").fillna(season).astype("Int64")
+    else:
+        batter_game["season"] = pd.Series([season] * len(batter_game), index=batter_game.index, dtype="Int64")
 
     if start:
         batter_game = batter_game[batter_game["game_date"] >= pd.to_datetime(start)]
