@@ -1,0 +1,6 @@
+model_version: "v1.0"
+drive_data_root: "joeplumber-mlb/data"
+seasons_default: [2019, 2020, 2021, 2022, 2023, 2024, 2025]
+rolling_windows: [3, 7, 15, 30]
+leakage_shift: 1
+allow_partial_default: false
