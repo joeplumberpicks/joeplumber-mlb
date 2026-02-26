@@ -33,6 +33,8 @@ _TWO_OUT_EVENTS = {
 }
 _THREE_OUT_EVENTS = {"triple_play"}
 
+_STRIKEOUT_EVENTS = {"strikeout", "strikeout_double_play"}
+
 
 def _outs_from_events(events_series: pd.Series) -> pd.Series:
     lower = events_series.astype(str).str.lower()
@@ -91,47 +93,33 @@ def build_pitcher_game_features(dirs: dict[str, Path], season: int) -> Path:
             target_df["target_outs"] = pd.to_numeric(target_df[outs_col], errors="coerce") if outs_col else pd.NA
             target_df = target_df[["game_pk", "pitcher_id", "target_k", "target_outs"]]
 
-    if (target_df.empty or target_df["target_k"].isna().all()) and events_path.exists():
+    k_agg = pd.DataFrame(columns=["game_pk", "pitcher_id", "target_k_events"])
+    outs_agg = pd.DataFrame(columns=["game_pk", "pitcher_id", "target_outs_events"])
+    if events_path.exists():
         ev = read_parquet(events_path)
-        ev_pitcher_col = _pick_col(ev, _PITCHER_ID_CANDIDATES)
-        if ev_pitcher_col and "game_pk" in ev.columns:
-            ev = ev[["game_pk", ev_pitcher_col] + [c for c in ["events", "event_type", "game_date"] if c in ev.columns]].copy()
+        ev_pitcher_col = "pitcher_id" if "pitcher_id" in ev.columns else ("pitcher" if "pitcher" in ev.columns else None)
+        event_col = "events" if "events" in ev.columns else ("event_type" if "event_type" in ev.columns else None)
+        if ev_pitcher_col is not None and "game_pk" in ev.columns and event_col is not None:
+            cols = ["game_pk", ev_pitcher_col, event_col] + (["game_date"] if "game_date" in ev.columns else [])
+            ev = ev[cols].copy()
             ev["game_pk"] = pd.to_numeric(ev["game_pk"], errors="coerce").astype("Int64")
             ev["pitcher_id"] = pd.to_numeric(ev[ev_pitcher_col], errors="coerce").astype("Int64")
             if "game_date" in ev.columns:
                 ev["game_date"] = pd.to_datetime(ev["game_date"], errors="coerce")
                 ev = ev[ev["game_date"].dt.year == season].copy()
-            event_series = ev.get("events", ev.get("event_type", pd.Series(index=ev.index, dtype="object"))).astype(str).str.lower()
-            ev["k_ev"] = (event_series == "strikeout").astype(int)
-            k_fallback = ev.groupby(["game_pk", "pitcher_id"], dropna=False)["k_ev"].sum().reset_index()
-            k_fallback = k_fallback.rename(columns={"k_ev": "target_k"})
-            if target_df.empty:
-                target_df = k_fallback
-                target_df["target_outs"] = pd.NA
-            else:
-                target_df = target_df.merge(k_fallback, on=["game_pk", "pitcher_id"], how="left", suffixes=("", "_fb"))
-                target_df["target_k"] = pd.to_numeric(target_df["target_k"], errors="coerce").fillna(
-                    pd.to_numeric(target_df.get("target_k_fb"), errors="coerce")
-                )
-                if "target_k_fb" in target_df.columns:
-                    target_df = target_df.drop(columns=["target_k_fb"])
 
-    outs_agg = pd.DataFrame(columns=["game_pk", "pitcher_id", "target_outs_events"])
-    if events_path.exists():
-        ev_outs = read_parquet(events_path)
-        ev_pitcher_col = "pitcher_id" if "pitcher_id" in ev_outs.columns else ("pitcher" if "pitcher" in ev_outs.columns else None)
-        event_col = "events" if "events" in ev_outs.columns else ("event_type" if "event_type" in ev_outs.columns else None)
-        if ev_pitcher_col is not None and "game_pk" in ev_outs.columns and event_col is not None:
-            cols = ["game_pk", ev_pitcher_col, event_col] + (["game_date"] if "game_date" in ev_outs.columns else [])
-            ev_outs = ev_outs[cols].copy()
-            ev_outs["game_pk"] = pd.to_numeric(ev_outs["game_pk"], errors="coerce").astype("Int64")
-            ev_outs["pitcher_id"] = pd.to_numeric(ev_outs[ev_pitcher_col], errors="coerce").astype("Int64")
-            if "game_date" in ev_outs.columns:
-                ev_outs["game_date"] = pd.to_datetime(ev_outs["game_date"], errors="coerce")
-                ev_outs = ev_outs[ev_outs["game_date"].dt.year == season].copy()
-            outs_pa = _outs_from_events(ev_outs[event_col])
+            lower_events = ev[event_col].astype(str).str.lower()
+            k_pa = lower_events.isin(_STRIKEOUT_EVENTS).astype("int16")
+            k_agg = (
+                ev.assign(_k=k_pa)
+                .groupby(["game_pk", "pitcher_id"], as_index=False)["_k"]
+                .sum()
+                .rename(columns={"_k": "target_k_events"})
+            )
+
+            outs_pa = _outs_from_events(lower_events)
             outs_agg = (
-                ev_outs.assign(_outs=outs_pa)
+                ev.assign(_outs=outs_pa)
                 .groupby(["game_pk", "pitcher_id"], as_index=False)["_outs"]
                 .sum()
                 .rename(columns={"_outs": "target_outs_events"})
@@ -141,6 +129,13 @@ def build_pitcher_game_features(dirs: dict[str, Path], season: int) -> Path:
         logging.warning("pitcher_game targets missing outs source; target_outs will be NA")
 
     out = roll.merge(target_df, on=["game_pk", "pitcher_id"], how="left")
+
+    if not k_agg.empty:
+        out = out.merge(k_agg, on=["game_pk", "pitcher_id"], how="left")
+        out["target_k"] = pd.to_numeric(out["target_k_events"], errors="coerce")
+        out = out.drop(columns=["target_k_events"])
+    out["target_k"] = pd.to_numeric(out.get("target_k"), errors="coerce")
+
     if not outs_agg.empty:
         out = out.merge(outs_agg, on=["game_pk", "pitcher_id"], how="left")
         out["target_outs"] = pd.to_numeric(out.get("target_outs"), errors="coerce").fillna(
@@ -152,15 +147,24 @@ def build_pitcher_game_features(dirs: dict[str, Path], season: int) -> Path:
     if "season" not in out.columns:
         out["season"] = season
 
-    k_null = float(out["target_k"].isna().mean()) if len(out) else 0.0
-    k_mean = float(pd.to_numeric(out["target_k"], errors="coerce").mean()) if len(out) else 0.0
+    k_series = pd.to_numeric(out["target_k"], errors="coerce")
+    k_null = float(k_series.isna().mean()) if len(out) else 0.0
+    k_mean = float(k_series.mean()) if len(out) else 0.0
+    k_min = float(k_series.min()) if len(out) else 0.0
+    k_max = float(k_series.max()) if len(out) else 0.0
     outs_series = pd.to_numeric(out["target_outs"], errors="coerce")
     outs_null = float(outs_series.isna().mean()) if len(out) else 0.0
     outs_non_null = 1.0 - outs_null
     outs_mean = float(outs_series.mean()) if len(out) else 0.0
     outs_min = float(outs_series.min()) if len(out) else 0.0
     outs_max = float(outs_series.max()) if len(out) else 0.0
-    logging.info("pitcher_game_features target_k mean=%.4f null_pct=%.4f", k_mean, k_null)
+    logging.info(
+        "pitcher_game_features target_k mean=%.4f min=%.4f max=%.4f null_pct=%.4f",
+        k_mean,
+        k_min,
+        k_max,
+        k_null,
+    )
     logging.info("pitcher_game_features target_outs non_null_pct=%.4f", outs_non_null)
     logging.info("pitcher_game_features target_outs mean=%.4f min=%.4f max=%.4f", outs_mean, outs_min, outs_max)
 
