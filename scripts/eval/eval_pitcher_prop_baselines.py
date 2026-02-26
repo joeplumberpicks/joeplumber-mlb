@@ -105,6 +105,28 @@ def _fit_ladder(train_df: pd.DataFrame, test_df: pd.DataFrame, features: list[st
     y_train = (pd.to_numeric(train_df[source_target], errors="coerce") >= threshold).astype(int)
     y_test = (pd.to_numeric(test_df[source_target], errors="coerce") >= threshold).astype(int)
 
+    train_classes = np.unique(y_train)
+    test_classes = np.unique(y_test)
+    if len(train_classes) < 2:
+        logging.warning(
+            "Skipping ladder %s>=%.1f due to single train class train_classes=%s test_classes=%s",
+            source_target,
+            threshold,
+            train_classes.tolist(),
+            test_classes.tolist(),
+        )
+        metrics = {
+            "skipped": True,
+            "reason": "train_single_class",
+            "train_classes": train_classes.tolist(),
+            "test_classes": test_classes.tolist(),
+            "n_train": int(len(y_train)),
+            "n_test": int(len(y_test)),
+            "positive_rate_test": float(y_test.mean()) if len(y_test) else None,
+            "features_n": int(len(features)),
+        }
+        return metrics, []
+
     model = Pipeline([
         ("scaler", StandardScaler()),
         ("clf", LogisticRegression(max_iter=5000, solver="lbfgs")),
@@ -112,14 +134,16 @@ def _fit_ladder(train_df: pd.DataFrame, test_df: pd.DataFrame, features: list[st
     model.fit(X_train, y_train)
     prob = model.predict_proba(X_test)[:, 1]
 
-    auc = float(roc_auc_score(y_test, prob)) if y_test.nunique() > 1 else None
+    auc = float(roc_auc_score(y_test, prob)) if len(test_classes) > 1 else None
+    brier = float(brier_score_loss(y_test, prob))
+    ll = float(log_loss(y_test, prob, labels=[0, 1]))
     metrics = {
         "auc": auc,
-        "brier": float(brier_score_loss(y_test, prob)),
-        "logloss": float(log_loss(y_test, prob, labels=[0, 1])),
+        "brier": brier,
+        "logloss": ll,
         "n_train": int(len(train_df)),
         "n_test": int(len(test_df)),
-        "positive_rate_test": float(y_test.mean()),
+        "positive_rate_test": float(y_test.mean()) if len(y_test) else None,
         "features_n": int(len(features)),
     }
     cal_bins = _quantile_calibration_bins(y_test.reset_index(drop=True), prob, bins)
@@ -199,10 +223,17 @@ def main() -> None:
         metrics, cal_bins = _fit_ladder(train_df, test_df, feature_cols, source_target, threshold, args.bins)
         per_target[ladder_name] = {"metrics": metrics, "calibration_bins": cal_bins}
         calibration_by_target[ladder_name] = cal_bins
-        print(
-            f"pitcher_baseline {ladder_name} auc={metrics['auc']} brier={metrics['brier']:.6f} "
-            f"logloss={metrics['logloss']:.6f} n_train={metrics['n_train']} n_test={metrics['n_test']}"
-        )
+        if metrics.get("skipped"):
+            print(
+                f"pitcher_baseline {ladder_name} skipped reason={metrics['reason']} "
+                f"train_classes={metrics['train_classes']} test_classes={metrics['test_classes']} "
+                f"n_train={metrics['n_train']} n_test={metrics['n_test']}"
+            )
+        else:
+            print(
+                f"pitcher_baseline {ladder_name} auc={metrics['auc']} brier={metrics['brier']:.6f} "
+                f"logloss={metrics['logloss']:.6f} n_train={metrics['n_train']} n_test={metrics['n_test']}"
+            )
 
     overall = {
         "targets_evaluated": int(len(per_target)),
