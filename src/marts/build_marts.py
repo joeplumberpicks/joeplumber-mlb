@@ -110,7 +110,7 @@ def _merge_moneyline_targets(mart_df: pd.DataFrame, processed_dir: Path) -> pd.D
 
         merged["target_home_win"] = (
             merged["target_home_win"]
-                .combine_first(merged["target_home_win_targets"])
+                .fillna(merged["target_home_win_targets"])
                 .astype("Int64")
         )
         merged = merged.drop(columns=["target_home_win_targets"])
