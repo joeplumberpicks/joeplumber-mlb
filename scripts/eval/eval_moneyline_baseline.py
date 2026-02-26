@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -108,7 +110,10 @@ def main() -> None:
     y_train = train_df["target_home_win"].astype(int)
     y_test = test_df["target_home_win"].astype(int)
 
-    model = LogisticRegression(max_iter=2000)
+    model = Pipeline([
+        ("scaler", StandardScaler()),
+        ("clf", LogisticRegression(max_iter=10000)),
+    ])
     model.fit(X_train, y_train)
 
     y_prob = model.predict_proba(X_test)[:, 1]

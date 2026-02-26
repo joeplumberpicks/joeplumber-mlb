@@ -338,6 +338,16 @@ def build_marts(dirs: dict[str, Path]) -> dict[str, Path]:
                 logging.info("moneyline home_off_k_rate_roll7 non-null pct: %.4f", home_cov)
                 logging.info("moneyline away_off_k_rate_roll7 non-null pct: %.4f", away_cov)
 
+            diff_created = 0
+            for home_col in [c for c in mart_df.columns if c.startswith("home_off_")]:
+                suffix = home_col[len("home_off_"):]
+                away_col = f"away_off_{suffix}"
+                diff_col = f"diff_off_{suffix}"
+                if away_col in mart_df.columns and diff_col not in mart_df.columns:
+                    mart_df[diff_col] = mart_df[home_col] - mart_df[away_col]
+                    diff_created += 1
+            logging.info("moneyline diff_off_ columns created: %s", diff_created)
+
             bat_cols = [c for c in mart_df.columns if c.startswith("bat_") or c in {"batter_id", "bat_batter_id"}]
             if bat_cols:
                 mart_df = mart_df.drop(columns=bat_cols)
