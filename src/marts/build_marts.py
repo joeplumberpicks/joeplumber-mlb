@@ -268,10 +268,17 @@ def build_marts(dirs: dict[str, Path]) -> dict[str, Path]:
                     pa_path,
                     columns=["game_pk", "game_date", "inning_topbot", "events", "home_team", "away_team"],
                 )
-                half = pa["inning_topbot"].astype(str).str.strip().str.lower()
+                half = pa["inning_topbot"].astype(str).str.lower().str.strip()
+                is_top = half.str.startswith("top")
+                is_bot = half.str.startswith("bot") | half.str.startswith("bottom")
                 pa["batting_team"] = pd.NA
-                pa.loc[half == "bottom", "batting_team"] = pa.loc[half == "bottom", "home_team"]
-                pa.loc[half == "top", "batting_team"] = pa.loc[half == "top", "away_team"]
+                pa.loc[is_bot, "batting_team"] = pa.loc[is_bot, "home_team"]
+                pa.loc[is_top, "batting_team"] = pa.loc[is_top, "away_team"]
+                logging.info(
+                    "moneyline inning_topbot sample counts=%s batting_team_null_pct=%.4f",
+                    pa["inning_topbot"].astype(str).value_counts(dropna=False).head(5).to_dict(),
+                    float(pa["batting_team"].isna().mean()) if len(pa) else 0.0,
+                )
 
                 pa["k"] = (pa["events"] == "strikeout").astype(int)
                 pa["bb"] = pa["events"].isin(["walk", "intent_walk"]).astype(int)
