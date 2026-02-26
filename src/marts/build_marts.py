@@ -262,6 +262,75 @@ def build_marts(dirs: dict[str, Path]) -> dict[str, Path]:
 
             mart_df = _merge_moneyline_targets(mart_df, dirs["processed_dir"])
 
+            pa_path = dirs["processed_dir"] / "events_pa.parquet"
+            if pa_path.exists():
+                pa = pd.read_parquet(
+                    pa_path,
+                    columns=["game_pk", "game_date", "inning_topbot", "events", "home_team", "away_team"],
+                )
+                half = pa["inning_topbot"].astype(str).str.strip().str.lower()
+                pa["batting_team"] = pd.NA
+                pa.loc[half == "bottom", "batting_team"] = pa.loc[half == "bottom", "home_team"]
+                pa.loc[half == "top", "batting_team"] = pa.loc[half == "top", "away_team"]
+
+                pa["k"] = (pa["events"] == "strikeout").astype(int)
+                pa["bb"] = pa["events"].isin(["walk", "intent_walk"]).astype(int)
+                pa["hr"] = (pa["events"] == "home_run").astype(int)
+
+                off = (
+                    pa.groupby(["game_pk", "batting_team"], dropna=False)
+                    .agg(pa=("events", "size"), k=("k", "sum"), bb=("bb", "sum"), hr=("hr", "sum"))
+                    .reset_index()
+                )
+                game_dates = pa[["game_pk", "game_date"]].drop_duplicates(subset=["game_pk"])
+                off = off.merge(game_dates, on="game_pk", how="left")
+                off["game_date"] = pd.to_datetime(off["game_date"], errors="coerce")
+
+                off["k_rate"] = off["k"] / off["pa"].replace(0, pd.NA)
+                off["bb_rate"] = off["bb"] / off["pa"].replace(0, pd.NA)
+                off["hr_rate"] = off["hr"] / off["pa"].replace(0, pd.NA)
+
+                off = off.sort_values(["batting_team", "game_date"])
+                for col in ["k_rate", "bb_rate", "hr_rate"]:
+                    for window in [3, 7, 15, 30]:
+                        off[f"{col}_roll{window}"] = (
+                            off.groupby("batting_team")[col]
+                            .transform(lambda s: s.shift(1).rolling(window).mean())
+                        )
+
+                roll_cols = [
+                    c for c in off.columns if c.endswith("_roll3") or c.endswith("_roll7") or c.endswith("_roll15") or c.endswith("_roll30")
+                ]
+
+                home_off = off[["game_pk", "batting_team"] + roll_cols].rename(
+                    columns={c: f"home_off_{c}" for c in roll_cols}
+                )
+                mart_df = mart_df.merge(
+                    home_off,
+                    left_on=["game_pk", "home_team"],
+                    right_on=["game_pk", "batting_team"],
+                    how="left",
+                )
+                if "batting_team" in mart_df.columns:
+                    mart_df = mart_df.drop(columns=["batting_team"])
+
+                away_off = off[["game_pk", "batting_team"] + roll_cols].rename(
+                    columns={c: f"away_off_{c}" for c in roll_cols}
+                )
+                mart_df = mart_df.merge(
+                    away_off,
+                    left_on=["game_pk", "away_team"],
+                    right_on=["game_pk", "batting_team"],
+                    how="left",
+                )
+                if "batting_team" in mart_df.columns:
+                    mart_df = mart_df.drop(columns=["batting_team"])
+
+                home_cov = float(mart_df["home_off_k_rate_roll7"].notna().mean()) if "home_off_k_rate_roll7" in mart_df.columns and len(mart_df) else 0.0
+                away_cov = float(mart_df["away_off_k_rate_roll7"].notna().mean()) if "away_off_k_rate_roll7" in mart_df.columns and len(mart_df) else 0.0
+                logging.info("moneyline home_off_k_rate_roll7 non-null pct: %.4f", home_cov)
+                logging.info("moneyline away_off_k_rate_roll7 non-null pct: %.4f", away_cov)
+
             bat_cols = [c for c in mart_df.columns if c.startswith("bat_") or c in {"batter_id", "bat_batter_id"}]
             if bat_cols:
                 mart_df = mart_df.drop(columns=bat_cols)
