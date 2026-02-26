@@ -11,6 +11,69 @@ _BATTER_ID_CANDIDATES = ["batter_id", "batter", "mlbam_batter_id", "player_id"]
 _HIT_EVENTS = {"single", "double", "triple", "home_run"}
 
 
+
+_LEAKY_SAME_GAME_COLS = {
+    "pitches",
+    "swings",
+    "contacts",
+    "whiffs",
+    "in_zone_pitches",
+    "chases",
+    "k",
+    "bb",
+    "hbp",
+    "hr",
+    "h",
+    "launch_speed_mean",
+    "launch_speed_max",
+    "launch_angle_mean",
+    "launch_angle_max",
+}
+_TARGET_COLS = ["target_hit_1p", "target_tb_2p", "target_rbi_1p", "target_bb_1p"]
+_IDENTIFIER_COLS = {
+    "game_pk",
+    "batter_id",
+    "game_date",
+    "season",
+    "home_team",
+    "away_team",
+    "park_id",
+    "park_name",
+    "canonical_park_key",
+    "batting_team",
+}
+
+
+def _prune_leaky_columns(df: pd.DataFrame) -> pd.DataFrame:
+    keep_cols: list[str] = []
+    for col in df.columns:
+        keep = False
+        if col in _IDENTIFIER_COLS or col in _TARGET_COLS:
+            keep = True
+        elif "_roll" in col:
+            keep = True
+        elif ("_rate_roll" in col) or col.endswith(("_rate", "_pct")):
+            # allow pregame rates derived from rolling (e.g. chase_rate_roll7)
+            keep = "_roll" in col
+
+        if keep:
+            keep_cols.append(col)
+
+    dropped_same_game = [c for c in df.columns if c in _LEAKY_SAME_GAME_COLS]
+    # Hard-exclude known leaky columns even if caught by generic rules
+    keep_cols = [c for c in keep_cols if c not in _LEAKY_SAME_GAME_COLS]
+
+    dropped_cols = [c for c in df.columns if c not in keep_cols]
+    pruned = df[keep_cols].copy()
+    logging.info(
+        "hitter_batter_features dropped_cols=%s dropped_same_game_cols=%s",
+        len(dropped_cols),
+        len(dropped_same_game),
+    )
+    logging.info("hitter_batter_features leaky columns absent check: h=%s bb=%s", "h" in pruned.columns, "bb" in pruned.columns)
+    return pruned
+
+
 def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     for c in candidates:
         if c in df.columns:
@@ -101,6 +164,8 @@ def build_hitter_batter_features(dirs: dict[str, Path], season: int) -> Path:
 
     if "season" not in out.columns:
         out["season"] = season
+
+    out = _prune_leaky_columns(out)
 
     for col in ["target_hit_1p", "target_tb_2p", "target_bb_1p", "target_rbi_1p"]:
         null_rate = float(out[col].isna().mean()) if len(out) else 0.0
