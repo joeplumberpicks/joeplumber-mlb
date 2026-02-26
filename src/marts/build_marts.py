@@ -129,6 +129,58 @@ def _merge_moneyline_targets(mart_df: pd.DataFrame, processed_dir: Path) -> pd.D
     return merged
 
 
+def _moneyline_side_offense_features(batter_roll: pd.DataFrame, spine: pd.DataFrame) -> pd.DataFrame:
+    if batter_roll.empty or "game_pk" not in batter_roll.columns or spine.empty:
+        return pd.DataFrame(columns=["game_pk"])
+
+    team_col = next(
+        (
+            c
+            for c in ["bat_team", "team", "batting_team", "batter_team", "offense_team"]
+            if c in batter_roll.columns
+        ),
+        None,
+    )
+    if team_col is None:
+        logging.warning("moneyline side offense features skipped: no batter team column found in batter rolling")
+        return pd.DataFrame(columns=["game_pk"])
+
+    spine_teams = spine[["game_pk", "home_team", "away_team"]].copy()
+    tmp = batter_roll.merge(spine_teams, on="game_pk", how="left")
+
+    row_team = tmp[team_col].astype(str)
+    tmp["side"] = pd.NA
+    tmp.loc[row_team == tmp["home_team"].astype(str), "side"] = "home"
+    tmp.loc[row_team == tmp["away_team"].astype(str), "side"] = "away"
+    tmp = tmp[tmp["side"].isin(["home", "away"])].copy()
+    if tmp.empty:
+        return pd.DataFrame(columns=["game_pk"])
+
+    exclude_numeric = {
+        "game_pk",
+        "batter",
+        "batter_id",
+        "mlbam_batter_id",
+        "player_id",
+        "pitcher",
+        "pitcher_id",
+        "mlbam_pitcher_id",
+        "season",
+    }
+    num_cols = [
+        c
+        for c in tmp.select_dtypes(include=["number"]).columns
+        if c not in exclude_numeric
+    ]
+    if not num_cols:
+        return pd.DataFrame(columns=["game_pk"])
+
+    agg = tmp.groupby(["game_pk", "side"], dropna=False)[num_cols].mean().reset_index()
+    wide = agg.pivot(index="game_pk", columns="side", values=num_cols)
+    wide.columns = [f"{side}_off_{col}" for col, side in wide.columns]
+    return wide.reset_index()
+
+
 def build_marts(dirs: dict[str, Path]) -> dict[str, Path]:
     spine_path = dirs["processed_dir"] / "model_spine_game.parquet"
     require_files([spine_path], "mart_build_model_spine")
@@ -151,7 +203,18 @@ def build_marts(dirs: dict[str, Path]) -> dict[str, Path]:
             mart_df = mart_df.merge(pitcher_game_rollup, on="game_pk", how="left")
 
         if filename == "moneyline_features.parquet":
+            side_off = _moneyline_side_offense_features(batter_roll, spine)
+            if not side_off.empty:
+                mart_df = mart_df.merge(side_off, on="game_pk", how="left")
+            bat_cols = [c for c in mart_df.columns if c.startswith("bat_") or c in {"batter_id", "bat_batter_id"}]
+            if bat_cols:
+                mart_df = mart_df.drop(columns=bat_cols)
             mart_df = _merge_moneyline_targets(mart_df, dirs["processed_dir"])
+            logging.info(
+                "moneyline mart columns=%s bat_batter_id_absent=%s",
+                len(mart_df.columns),
+                "bat_batter_id" not in mart_df.columns,
+            )
 
         print_rowcount(filename.replace('.parquet', ''), mart_df)
         out_path = dirs["marts_dir"] / filename
