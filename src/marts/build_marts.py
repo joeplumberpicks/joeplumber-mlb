@@ -203,17 +203,71 @@ def build_marts(dirs: dict[str, Path]) -> dict[str, Path]:
             mart_df = mart_df.merge(pitcher_game_rollup, on="game_pk", how="left")
 
         if filename == "moneyline_features.parquet":
-            side_off = _moneyline_side_offense_features(batter_roll, spine)
-            if not side_off.empty:
-                mart_df = mart_df.merge(side_off, on="game_pk", how="left")
+            bat_df = read_parquet(dirs["processed_dir"] / "batter_game_rolling.parquet")
+            team_col = next(
+                (
+                    c
+                    for c in ["bat_team", "team", "batting_team", "batter_team", "offense_team"]
+                    if c in bat_df.columns
+                ),
+                None,
+            )
+            if team_col is None:
+                team_like = [c for c in bat_df.columns if "team" in c.lower()]
+                raise ValueError(f"No batting team column found in batter_game_rolling. Team-like columns: {team_like}")
+
+            exclude_cols = {
+                "game_pk",
+                "batter_id",
+                "bat_batter_id",
+                "pitcher_id",
+                "season",
+                "park_id",
+                "home_team",
+                "away_team",
+                "game_date",
+            }
+            feat_cols = [
+                c
+                for c in bat_df.select_dtypes(include=["number"]).columns
+                if c not in exclude_cols
+            ]
+            bat_team_agg = bat_df.groupby(["game_pk", team_col])[feat_cols].mean().reset_index() if feat_cols else pd.DataFrame(columns=["game_pk", team_col])
+
+            home_agg = bat_team_agg.rename(columns={c: f"home_off_{c}" for c in feat_cols})
+            mart_df = mart_df.merge(
+                home_agg,
+                left_on=["game_pk", "home_team"],
+                right_on=["game_pk", team_col],
+                how="left",
+            )
+            if team_col in mart_df.columns:
+                mart_df = mart_df.drop(columns=[team_col])
+
+            away_agg = bat_team_agg.rename(columns={c: f"away_off_{c}" for c in feat_cols})
+            mart_df = mart_df.merge(
+                away_agg,
+                left_on=["game_pk", "away_team"],
+                right_on=["game_pk", team_col],
+                how="left",
+            )
+            if team_col in mart_df.columns:
+                mart_df = mart_df.drop(columns=[team_col])
+
+            mart_df = _merge_moneyline_targets(mart_df, dirs["processed_dir"])
+
             bat_cols = [c for c in mart_df.columns if c.startswith("bat_") or c in {"batter_id", "bat_batter_id"}]
             if bat_cols:
                 mart_df = mart_df.drop(columns=bat_cols)
-            mart_df = _merge_moneyline_targets(mart_df, dirs["processed_dir"])
+
+            home_off_n = sum(1 for c in mart_df.columns if c.startswith("home_off_"))
+            away_off_n = sum(1 for c in mart_df.columns if c.startswith("away_off_"))
             logging.info(
-                "moneyline mart columns=%s bat_batter_id_absent=%s",
+                "moneyline mart columns=%s bat_batter_id_present=%s home_off_cols=%s away_off_cols=%s",
                 len(mart_df.columns),
-                "bat_batter_id" not in mart_df.columns,
+                "bat_batter_id" in mart_df.columns,
+                home_off_n,
+                away_off_n,
             )
 
         print_rowcount(filename.replace('.parquet', ''), mart_df)
