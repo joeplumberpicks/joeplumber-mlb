@@ -6,6 +6,8 @@ import re
 
 import pandas as pd
 
+from src.marts.build_hitter_batter_features import build_hitter_batter_features
+from src.marts.build_pitcher_game_features import build_pitcher_game_features
 from src.utils.checks import print_rowcount, require_files
 from src.utils.io import read_parquet, write_parquet
 
@@ -181,7 +183,7 @@ def _moneyline_side_offense_features(batter_roll: pd.DataFrame, spine: pd.DataFr
     return wide.reset_index()
 
 
-def build_marts(dirs: dict[str, Path]) -> dict[str, Path]:
+def build_marts(dirs: dict[str, Path], season: int | None = None) -> dict[str, Path]:
     spine_path = dirs["processed_dir"] / "model_spine_game.parquet"
     require_files([spine_path], "mart_build_model_spine")
     spine = read_parquet(spine_path)
@@ -368,4 +370,9 @@ def build_marts(dirs: dict[str, Path]) -> dict[str, Path]:
         print(f"Writing to: {out_path.resolve()}")
         write_parquet(mart_df, out_path)
         outputs[filename] = out_path
+
+    if season is not None:
+        outputs["hitter_batter_features.parquet"] = build_hitter_batter_features(dirs, season)
+        outputs["pitcher_game_features.parquet"] = build_pitcher_game_features(dirs, season)
+
     return outputs
