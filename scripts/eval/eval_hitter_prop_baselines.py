@@ -58,14 +58,15 @@ def _quantile_calibration_bins(y_true: pd.Series, y_prob: np.ndarray, bins: int)
     return rows
 
 
-def _feature_columns(df: pd.DataFrame) -> tuple[list[str], list[str]]:
+def _feature_columns(df: pd.DataFrame) -> tuple[list[str], list[str], list[str]]:
+    target_cols = [c for c in df.columns if c.startswith("target_")]
     excluded_non_numeric = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
     feature_cols = [
         c
         for c in df.columns
-        if pd.api.types.is_numeric_dtype(df[c]) and c != "game_pk" and not c.startswith("target_")
+        if pd.api.types.is_numeric_dtype(df[c]) and c != "game_pk" and c not in target_cols
     ]
-    return feature_cols, excluded_non_numeric
+    return feature_cols, excluded_non_numeric, target_cols
 
 
 def _fit_binary(train_df: pd.DataFrame, test_df: pd.DataFrame, features: list[str], target: str, bins: int) -> tuple[dict, list[dict]]:
@@ -121,7 +122,8 @@ def main() -> None:
     df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
     df = df.dropna(subset=["game_date"]).sort_values("game_date").reset_index(drop=True)
 
-    feature_cols, excluded_non_numeric = _feature_columns(df)
+    feature_cols, excluded_non_numeric, target_cols = _feature_columns(df)
+    logging.info(f"Dropped target columns from features: {target_cols}")
     logging.info("Excluded non-numeric columns: %s", excluded_non_numeric)
     if not feature_cols:
         raise ValueError("No numeric features available for hitter prop baseline evaluation")
