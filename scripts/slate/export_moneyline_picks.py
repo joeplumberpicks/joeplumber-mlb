@@ -27,9 +27,9 @@ def parse_args() -> argparse.Namespace:
 
 def _confidence_tier(p: pd.Series) -> pd.Series:
     return np.where(
-        p >= 0.62,
+        p >= 0.66,
         "A",
-        np.where(p >= 0.58, "B", np.where(p >= 0.54, "C", "D")),
+        np.where(p >= 0.60, "B", np.where(p >= 0.55, "C", "D")),
     )
 
 
@@ -93,10 +93,20 @@ def main() -> None:
     out = out[final_cols]
 
     out_path = dirs["outputs_dir"] / f"moneyline_picks_{args.season}.csv"
+    top5_path = dirs["outputs_dir"] / f"moneyline_card_top5_{args.season}.csv"
+    ab_path = dirs["outputs_dir"] / f"moneyline_card_ab_{args.season}.csv"
+
+    top5 = out[out["rank"] <= 5].copy()
+    ab_only = out[out["confidence_tier"].isin(["A", "B"])].copy()
+
     write_csv(out, out_path)
+    write_csv(top5, top5_path)
+    write_csv(ab_only, ab_path)
 
     tier_counts = out["confidence_tier"].value_counts(dropna=False).to_dict()
     logging.info("Wrote moneyline picks: %s (rows=%s)", out_path.resolve(), len(out))
+    logging.info("Wrote moneyline top5 card: %s (rows=%s)", top5_path.resolve(), len(top5))
+    logging.info("Wrote moneyline A/B card: %s (rows=%s)", ab_path.resolve(), len(ab_only))
     logging.info("confidence_tier counts: %s", tier_counts)
 
 
