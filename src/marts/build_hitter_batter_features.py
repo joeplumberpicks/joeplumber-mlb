@@ -81,6 +81,11 @@ def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 
+def _numeric_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors="coerce")
+    return pd.Series(default, index=df.index, dtype="float64")
+
 def build_hitter_batter_features(dirs: dict[str, Path], season: int) -> Path:
     rolling_path = dirs["processed_dir"] / "batter_game_rolling.parquet"
     events_path = dirs["processed_dir"] / "events_pa.parquet"
@@ -111,7 +116,26 @@ def build_hitter_batter_features(dirs: dict[str, Path], season: int) -> Path:
     if ev_batter_col is None:
         raise ValueError(f"No batter id column in events_pa. Available: {sorted(events.columns.tolist())}")
 
-    needed = [c for c in ["game_pk", "game_date", "inning_topbot", "events", "home_team", "away_team", ev_batter_col, "rbi"] if c in events.columns]
+    needed = [
+        c
+        for c in [
+            "game_pk",
+            "game_date",
+            "inning_topbot",
+            "events",
+            "event_type",
+            "home_team",
+            "away_team",
+            ev_batter_col,
+            "bat_score",
+            "post_bat_score",
+            "home_score",
+            "post_home_score",
+            "away_score",
+            "post_away_score",
+        ]
+        if c in events.columns
+    ]
     events = events[needed].copy()
     events["game_pk"] = pd.to_numeric(events["game_pk"], errors="coerce").astype("Int64")
     events["game_date"] = pd.to_datetime(events.get("game_date"), errors="coerce")
@@ -124,7 +148,7 @@ def build_hitter_batter_features(dirs: dict[str, Path], season: int) -> Path:
     events.loc[half.str.startswith("top"), "batting_team"] = events.get("away_team")
     events.loc[half.str.startswith("bot"), "batting_team"] = events.get("home_team")
 
-    ev = events.get("events", pd.Series(index=events.index, dtype="object")).astype(str).str.lower()
+    ev = events.get("events", events.get("event_type", pd.Series(index=events.index, dtype="object"))).astype(str).str.lower()
     events["is_hit"] = ev.isin(_HIT_EVENTS).astype(int)
     events["tb"] = (
         (ev == "single").astype(int)
@@ -134,27 +158,43 @@ def build_hitter_batter_features(dirs: dict[str, Path], season: int) -> Path:
     )
     events["is_bb"] = ev.isin({"walk", "intent_walk"}).astype(int)
 
+    bat_score = _numeric_series(events, "bat_score")
+    post_bat_score = _numeric_series(events, "post_bat_score")
+    events["rbi_pa"] = (post_bat_score - bat_score).fillna(0).clip(lower=0, upper=4)
+
+    # Optional cross-check using offense-side team score delta from inning half.
+    home_delta = (
+        _numeric_series(events, "post_home_score")
+        - _numeric_series(events, "home_score")
+    ).fillna(0)
+    away_delta = (
+        _numeric_series(events, "post_away_score")
+        - _numeric_series(events, "away_score")
+    ).fillna(0)
+    offense_delta = pd.Series(0, index=events.index, dtype="float64")
+    offense_delta.loc[half.str.startswith("bot")] = home_delta.loc[half.str.startswith("bot")]
+    offense_delta.loc[half.str.startswith("top")] = away_delta.loc[half.str.startswith("top")]
+    offense_delta = offense_delta.fillna(0).clip(lower=0, upper=4)
+    mismatch = (offense_delta - events["rbi_pa"]).abs() > 0
+    logging.info(
+        "hitter_batter_features rbi_pa score-delta mismatch_rate=%.4f mismatch_n=%s",
+        float(mismatch.mean()) if len(events) else 0.0,
+        int(mismatch.sum()),
+    )
+
     agg_map: dict[str, tuple[str, str]] = {
         "hits": ("is_hit", "sum"),
         "tb": ("tb", "sum"),
         "bb": ("is_bb", "sum"),
+        "rbi_game": ("rbi_pa", "sum"),
         "pa": ("events", "size") if "events" in events.columns else ("is_hit", "size"),
     }
-    has_rbi = "rbi" in events.columns
-    if has_rbi:
-        events["rbi"] = pd.to_numeric(events["rbi"], errors="coerce").fillna(0)
-        agg_map["rbi"] = ("rbi", "sum")
-    else:
-        logging.warning("events_pa missing rbi column; target_rbi_1p will be NA")
 
     targets = events.groupby(["game_pk", "batter_id"], dropna=False).agg(**agg_map).reset_index()
     targets["target_hit_1p"] = (targets["hits"] >= 1).astype("Int64")
     targets["target_tb_2p"] = (targets["tb"] >= 2).astype("Int64")
     targets["target_bb_1p"] = (targets["bb"] >= 1).astype("Int64")
-    if has_rbi:
-        targets["target_rbi_1p"] = (targets["rbi"] >= 1).astype("Int64")
-    else:
-        targets["target_rbi_1p"] = pd.Series(pd.NA, index=targets.index, dtype="Int64")
+    targets["target_rbi_1p"] = (pd.to_numeric(targets["rbi_game"], errors="coerce").fillna(0) >= 1).astype("Int64")
 
     out = roll.merge(
         targets[["game_pk", "batter_id", "target_hit_1p", "target_tb_2p", "target_rbi_1p", "target_bb_1p"]],
