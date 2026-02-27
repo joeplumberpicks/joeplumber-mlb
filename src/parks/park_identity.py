@@ -11,7 +11,14 @@ from src.utils.team_normalize import canonical_team_abbr
 
 
 def _normalize_name(value: object) -> str:
-    return str(value or "").strip().lower()
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip().lower()
 
 
 def build_canonical_park_key(team: str, park_name: object, lat: object, lon: object, venue_id: object, park_id: object) -> str:
