@@ -21,6 +21,16 @@ def _normalize_name(value: object) -> str:
     return str(value).strip().lower()
 
 
+def _normalize_team(value: object, season: int | None = None) -> str:
+    if value is None:
+        return "UNK"
+    try:
+        if pd.isna(value):
+            return "UNK"
+    except Exception:
+        pass
+    return canonical_team_abbr(value, season)
+
 def build_canonical_park_key(team: str, park_name: object, lat: object, lon: object, venue_id: object, park_id: object) -> str:
     team_norm = canonical_team_abbr(team)
     name_norm = _normalize_name(park_name)
@@ -51,34 +61,68 @@ def load_park_overrides(overrides_path: Path) -> pd.DataFrame:
 
 def resolve_park_for_game(game_row: pd.Series, parks_master_df: pd.DataFrame) -> dict[str, object]:
     venue_candidates = ["venue_id", "park_id"]
-    team = canonical_team_abbr(game_row.get("home_team"), int(game_row.get("season", 0) or 0))
+    season_raw = pd.to_numeric(game_row.get("season"), errors="coerce")
+    season = int(season_raw) if pd.notna(season_raw) else None
+    team = _normalize_team(game_row.get("home_team"), season)
+
+    def _resolved_row_to_result(row: pd.Series, fallback_val: object | None = None) -> dict[str, object]:
+        park_id = row.get("park_id", fallback_val)
+        venue_id = row.get("venue_id", park_id)
+        park_name = row.get("park_name")
+        return {
+            "park_id": park_id,
+            "venue_id": venue_id,
+            "park_name": park_name,
+            "canonical_park_key": build_canonical_park_key(
+                team,
+                park_name,
+                row.get("lat"),
+                row.get("lon"),
+                venue_id,
+                park_id,
+            ),
+        }
 
     for col in venue_candidates:
         val = game_row.get(col)
         if pd.notna(val) and col in parks_master_df.columns:
             match = parks_master_df[parks_master_df[col] == val]
             if not match.empty:
-                m = match.iloc[0]
-                park_id = m.get("park_id", val)
-                venue_id = m.get("venue_id", park_id)
-                park_name = m.get("park_name")
-                return {
-                    "park_id": park_id,
-                    "venue_id": venue_id,
-                    "park_name": park_name,
-                    "canonical_park_key": build_canonical_park_key(
-                        team,
-                        park_name,
-                        m.get("lat"),
-                        m.get("lon"),
-                        venue_id,
-                        park_id,
-                    ),
-                }
+                if "season" in match.columns and season is not None:
+                    season_match = match[pd.to_numeric(match["season"], errors="coerce") == season]
+                    if not season_match.empty:
+                        match = season_match
+                sort_cols = [c for c in ["team", "venue_id", "park_id"] if c in match.columns]
+                if sort_cols:
+                    match = match.sort_values(by=sort_cols, kind="stable")
+                return _resolved_row_to_result(match.iloc[0], val)
+
+    park_name = game_row.get("park_name")
+    if _normalize_name(park_name) == "" and not parks_master_df.empty:
+        parks_team = parks_master_df.copy()
+        if "team" in parks_team.columns:
+            parks_team["__team_norm"] = parks_team["team"].map(lambda x: _normalize_team(x, season))
+            team_match = parks_team[parks_team["__team_norm"] == team]
+        else:
+            team_match = parks_team.iloc[0:0]
+
+        if not team_match.empty:
+            venue_val = game_row.get("venue_id")
+            if pd.notna(venue_val) and "venue_id" in team_match.columns:
+                venue_match = team_match[team_match["venue_id"] == venue_val]
+                if not venue_match.empty:
+                    team_match = venue_match
+            if "season" in team_match.columns and season is not None:
+                season_match = team_match[pd.to_numeric(team_match["season"], errors="coerce") == season]
+                if not season_match.empty:
+                    team_match = season_match
+            sort_cols = [c for c in ["team", "venue_id", "park_id"] if c in team_match.columns]
+            if sort_cols:
+                team_match = team_match.sort_values(by=sort_cols, kind="stable")
+            return _resolved_row_to_result(team_match.iloc[0])
 
     park_id = game_row.get("park_id")
     venue_id = game_row.get("venue_id", park_id)
-    park_name = game_row.get("park_name")
     return {
         "park_id": park_id,
         "venue_id": venue_id,

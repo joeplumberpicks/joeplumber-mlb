@@ -44,7 +44,7 @@ def main() -> None:
     print(f"Args: season={args.season}, start={args.start}, end={args.end}, force={args.force}, allow_partial={args.allow_partial}")
 
     outputs = build_spine_for_season(args.season, dirs, force=args.force)
-    seasons = sorted(set(config.get("seasons_default", []) + [args.season]))
+    seasons = [args.season]
     model_spine_path = build_model_spine(dirs, seasons)
 
     parks_df = read_parquet(outputs["parks"]) if outputs["parks"].exists() else None

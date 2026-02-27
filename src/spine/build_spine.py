@@ -326,6 +326,26 @@ def build_spine_for_season(season: int, dirs: dict[str, Path], force: bool = Fal
     return {"games": out_games, "pa": out_pa, "weather": out_weather, "parks": out_parks}
 
 
+
+
+def _log_spine_quality_by_season(df: pd.DataFrame) -> None:
+    if df.empty or "season" not in df.columns:
+        return
+    for season_val, grp in df.groupby("season", dropna=False):
+        season_label = "unknown" if pd.isna(season_val) else str(int(season_val) if isinstance(season_val, (int, float, np.integer, np.floating)) else season_val)
+        park_fill = float(grp["park_id"].notna().mean() * 100.0) if "park_id" in grp.columns else 0.0
+        venue_fill = float(grp["venue_id"].notna().mean() * 100.0) if "venue_id" in grp.columns else 0.0
+        home_null = float(grp["home_sp_id"].isna().mean() * 100.0) if "home_sp_id" in grp.columns else 0.0
+        away_null = float(grp["away_sp_id"].isna().mean() * 100.0) if "away_sp_id" in grp.columns else 0.0
+        logging.info(
+            "spine season=%s park_id_filled=%.2f%% venue_id_filled=%.2f%% home_sp_null=%.2f%% away_sp_null=%.2f%%",
+            season_label,
+            park_fill,
+            venue_fill,
+            home_null,
+            away_null,
+        )
+
 def _pick_optional_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
     for col in candidates:
         if col in df.columns:
@@ -489,6 +509,7 @@ def build_model_spine(dirs: dict[str, Path], seasons: list[int]) -> Path:
     model_spine = pd.concat(frames, ignore_index=True) if frames else _empty_df(GAMES_COLUMNS)
     model_spine = _apply_park_venue_mapping(model_spine, processed_by_season, seasons)
     model_spine = _populate_starter_ids_from_events(model_spine, dirs["processed_dir"])
+    _log_spine_quality_by_season(model_spine)
 
     keep_cols = [
         "game_pk",
@@ -516,4 +537,11 @@ def build_model_spine(dirs: dict[str, Path], seasons: list[int]) -> Path:
     print_rowcount("model_spine_game", model_spine)
     print(f"Writing to: {model_spine_path.resolve()}")
     write_parquet(model_spine, model_spine_path)
+
+    if len(seasons) == 1:
+        season = seasons[0]
+        season_spine_path = processed_by_season / f"model_spine_game_{season}.parquet"
+        print(f"Writing to: {season_spine_path.resolve()}")
+        write_parquet(model_spine, season_spine_path)
+
     return model_spine_path
