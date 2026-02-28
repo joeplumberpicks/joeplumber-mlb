@@ -46,6 +46,8 @@ def main() -> None:
         dirs["processed_dir"] / "batter_game_rolling.parquet",
         dirs["processed_dir"] / "pitcher_game_rolling.parquet",
         dirs["processed_dir"] / "model_spine_game.parquet",
+        dirs["processed_dir"] / "by_season" / f"batter_boxscore_{args.season}.parquet",
+        dirs["processed_dir"] / f"targets_hitter_props_{args.season}.parquet",
     ]
     require_files(required, f"season_validation_{args.season}")
 
@@ -63,7 +65,26 @@ def main() -> None:
     print(f"park_id non-null %: {_nonnull_pct(games, 'park_id'):.2f}%")
     print(f"game_date non-null %: {_nonnull_pct(games, 'game_date'):.2f}%")
 
-    if batter_game.empty or pitcher_game.empty or batter_roll.empty or pitcher_roll.empty:
+
+    batter_box = read_parquet(required[7])
+    hitter_targets = read_parquet(required[8])
+
+    print(f"Row count [batter_boxscore_{args.season}]: {len(batter_box):,}")
+    print(f"Row count [targets_hitter_props_{args.season}]: {len(hitter_targets):,}")
+
+    hitter_mart_path = dirs["marts_dir"] / "hitter_props_features.parquet"
+    require_files([hitter_mart_path], f"hitter_mart_validation_{args.season}")
+    hitter_mart = read_parquet(hitter_mart_path)
+    target_cols = ["target_hit1p", "target_tb2p", "target_bb1p", "target_rbi1p"]
+    for col in target_cols:
+        if col not in hitter_mart.columns:
+            raise RuntimeError(f"Validation failed: missing {col} in hitter_props_features.parquet")
+        nonnull = float(hitter_mart[col].notna().mean()) if len(hitter_mart) else 0.0
+        print(f"hitter_props_features {col} non-null %: {nonnull*100:.2f}%")
+        if nonnull <= 0.01:
+            raise RuntimeError(f"Validation failed: {col} non-null rate <= 1% ({nonnull:.4f})")
+
+    if batter_game.empty or pitcher_game.empty or batter_roll.empty or pitcher_roll.empty or batter_box.empty or hitter_targets.empty:
         raise RuntimeError("Validation failed: one or more critical feature tables are empty.")
 
 

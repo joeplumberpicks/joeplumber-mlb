@@ -4,3 +4,4 @@ pyyaml
 numpy
 scikit-learn
 pybaseball
+requests

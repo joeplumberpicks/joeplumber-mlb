@@ -15,7 +15,7 @@ MART_SCHEMAS = {
     "hr_features.parquet": ["game_pk", "game_date", "season", "home_team", "away_team", "park_id", "canonical_park_key", "target_hr"],
     "nrfi_features.parquet": ["game_pk", "game_date", "season", "home_team", "away_team", "park_id", "canonical_park_key", "target_nrfi"],
     "moneyline_features.parquet": ["game_pk", "game_date", "season", "home_team", "away_team", "park_id", "canonical_park_key", "target_home_win"],
-    "hitter_props_features.parquet": ["game_pk", "game_date", "season", "home_team", "away_team", "park_id", "canonical_park_key", "target_hitter_prop"],
+    "hitter_props_features.parquet": ["game_pk", "batter_id", "game_date", "season", "home_team", "away_team", "park_id", "canonical_park_key", "target_hitter_prop", "target_hit1p", "target_tb2p", "target_bb1p", "target_rbi1p"],
     "pitcher_props_features.parquet": ["game_pk", "game_date", "season", "home_team", "away_team", "park_id", "canonical_park_key", "target_pitcher_prop"],
 }
 
@@ -131,6 +131,56 @@ def _merge_moneyline_targets(mart_df: pd.DataFrame, processed_dir: Path) -> pd.D
     return merged
 
 
+
+
+def _load_hitter_prop_targets(processed_dir: Path) -> pd.DataFrame:
+    target_files = sorted(processed_dir.glob("targets_hitter_props_*.parquet"))
+    if not target_files:
+        logging.warning("No targets_hitter_props_{season}.parquet files found under %s", processed_dir.resolve())
+        return pd.DataFrame(columns=["game_pk", "batter_id", "target_hit1p", "target_tb2p", "target_bb1p", "target_rbi1p"])
+
+    frames: list[pd.DataFrame] = []
+    required = ["game_pk", "batter_id", "target_hit1p", "target_tb2p", "target_bb1p", "target_rbi1p"]
+    for path in target_files:
+        df = read_parquet(path)
+        if not all(c in df.columns for c in required):
+            logging.warning("Skipping malformed hitter target file %s", path.resolve())
+            continue
+        slim = df[required].copy()
+        slim["game_pk"] = pd.to_numeric(slim["game_pk"], errors="coerce").astype("Int64")
+        slim["batter_id"] = pd.to_numeric(slim["batter_id"], errors="coerce").astype("Int64")
+        for c in ["target_hit1p", "target_tb2p", "target_bb1p", "target_rbi1p"]:
+            slim[c] = pd.to_numeric(slim[c], errors="coerce").astype("Int64")
+        frames.append(slim)
+
+    if not frames:
+        return pd.DataFrame(columns=["game_pk", "batter_id", "target_hit1p", "target_tb2p", "target_bb1p", "target_rbi1p"])
+
+    out = pd.concat(frames, ignore_index=True)
+    return out.drop_duplicates(subset=["game_pk", "batter_id"], keep="last")
+
+
+def _merge_hitter_prop_targets(mart_df: pd.DataFrame, processed_dir: Path) -> pd.DataFrame:
+    targets = _load_hitter_prop_targets(processed_dir)
+    if targets.empty:
+        logging.warning("hitter prop targets missing; proceeding without merged target columns")
+        return mart_df
+    if "game_pk" not in mart_df.columns or "batter_id" not in mart_df.columns:
+        logging.warning("hitter_props_features missing game_pk/batter_id; cannot merge targets")
+        return mart_df
+
+    out = mart_df.merge(targets, on=["game_pk", "batter_id"], how="left", suffixes=("", "_tgt"))
+    for c in ["target_hit1p", "target_tb2p", "target_bb1p", "target_rbi1p"]:
+        if f"{c}_tgt" in out.columns and c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(pd.to_numeric(out[f"{c}_tgt"], errors="coerce"))
+            out = out.drop(columns=[f"{c}_tgt"])
+        elif f"{c}_tgt" in out.columns:
+            out = out.rename(columns={f"{c}_tgt": c})
+    for c in ["target_hit1p", "target_tb2p", "target_bb1p", "target_rbi1p"]:
+        if c in out.columns:
+            logging.info("hitter_props_features %s non-null pct after merge: %.4f", c, float(out[c].notna().mean()) if len(out) else 0.0)
+    return out
+
 def _moneyline_side_offense_features(batter_roll: pd.DataFrame, spine: pd.DataFrame) -> pd.DataFrame:
     if batter_roll.empty or "game_pk" not in batter_roll.columns or spine.empty:
         return pd.DataFrame(columns=["game_pk"])
@@ -198,11 +248,35 @@ def build_marts(dirs: dict[str, Path], season: int | None = None) -> dict[str, P
 
     outputs: dict[str, Path] = {}
     for filename, schema in MART_SCHEMAS.items():
-        mart_df = _base_mart(spine, schema)
-        if not batter_game_rollup.empty:
-            mart_df = mart_df.merge(batter_game_rollup, on="game_pk", how="left")
-        if not pitcher_game_rollup.empty:
-            mart_df = mart_df.merge(pitcher_game_rollup, on="game_pk", how="left")
+        if filename == "hitter_props_features.parquet" and not batter_roll.empty:
+            br = batter_roll.copy()
+            batter_col = next((c for c in ["batter_id", "batter", "mlbam_batter_id", "player_id"] if c in br.columns), None)
+            if batter_col is None:
+                mart_df = _base_mart(spine, schema)
+            else:
+                br = br.rename(columns={batter_col: "batter_id"})
+                br["game_pk"] = pd.to_numeric(br["game_pk"], errors="coerce").astype("Int64")
+                br["batter_id"] = pd.to_numeric(br["batter_id"], errors="coerce").astype("Int64")
+                context_cols = [c for c in ["game_pk", "game_date", "season", "home_team", "away_team", "park_id", "canonical_park_key"] if c in spine.columns]
+                context = spine[context_cols].drop_duplicates(subset=["game_pk"]) if context_cols else pd.DataFrame(columns=["game_pk"])
+                mart_df = br.merge(context, on="game_pk", how="left")
+                if "target_hitter_prop" not in mart_df.columns:
+                    mart_df["target_hitter_prop"] = pd.NA
+                for c in ["target_hit1p", "target_tb2p", "target_bb1p", "target_rbi1p"]:
+                    if c not in mart_df.columns:
+                        mart_df[c] = pd.NA
+                for col in schema:
+                    if col not in mart_df.columns:
+                        mart_df[col] = pd.NA
+                ordered = list(dict.fromkeys(schema + [c for c in mart_df.columns if c not in schema]))
+                mart_df = mart_df[ordered]
+                mart_df = _merge_hitter_prop_targets(mart_df, dirs["processed_dir"])
+        else:
+            mart_df = _base_mart(spine, schema)
+            if not batter_game_rollup.empty:
+                mart_df = mart_df.merge(batter_game_rollup, on="game_pk", how="left")
+            if not pitcher_game_rollup.empty:
+                mart_df = mart_df.merge(pitcher_game_rollup, on="game_pk", how="left")
 
         if filename == "moneyline_features.parquet":
             bat_df = read_parquet(dirs["processed_dir"] / "batter_game_rolling.parquet")
