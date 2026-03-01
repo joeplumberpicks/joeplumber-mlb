@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from src.targets.paths import target_input_candidates
 from src.utils.checks import print_rowcount, require_files
 from src.utils.io import read_parquet, write_parquet
 
@@ -221,6 +222,25 @@ def build_hr_batter_features(
         how="left",
     )
     hr = hr.drop(columns=["pitcher"], errors="ignore")
+
+
+    if season is not None:
+        target_paths = target_input_candidates(dirs["processed_dir"], "hr_batter", season)
+        tpath = next((tp for tp in target_paths if tp.exists()), None)
+        if tpath is None:
+            logging.warning("Missing HR batter targets. Run: python scripts/build_targets_hr_batter.py --season %s --force", season)
+        else:
+            tgt = read_parquet(tpath)
+            needed = {"game_pk", "batter_id", "target_hr"}
+            if needed.issubset(tgt.columns):
+                tgt = tgt[["game_pk", "batter_id", "target_hr"]].copy()
+                tgt["game_pk"] = pd.to_numeric(tgt["game_pk"], errors="coerce").astype("Int64")
+                tgt["batter_id"] = pd.to_numeric(tgt["batter_id"], errors="coerce").astype("Int64")
+                hr = hr.drop(columns=["target_hr"], errors="ignore").merge(
+                    tgt.drop_duplicates(subset=["game_pk", "batter_id"]), on=["game_pk", "batter_id"], how="left"
+                )
+            else:
+                logging.warning("HR batter target file malformed: %s", tpath.resolve())
 
     stable_cols = [
         "game_pk",

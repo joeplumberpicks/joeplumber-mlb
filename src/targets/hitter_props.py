@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+from src.targets.paths import target_output_path
 from src.utils.io import read_parquet, write_parquet
 
 _BATTER_ID_CANDIDATES = ["batter_id", "batter", "mlbam_batter_id", "player_id"]
@@ -129,7 +130,7 @@ def build_batter_boxscore(dirs: dict[str, Path], season: int, force: bool = Fals
 def build_hitter_prop_targets(dirs: dict[str, Path], season: int, force: bool = False) -> Path:
     pa_path = dirs["processed_dir"] / "by_season" / f"pa_{season}.parquet"
     box_path = dirs["processed_dir"] / "by_season" / f"batter_boxscore_{season}.parquet"
-    out_path = dirs["processed_dir"] / f"targets_hitter_props_{season}.parquet"
+    out_path = target_output_path(dirs["processed_dir"], "hitter_props", season)
 
     if out_path.exists() and not force:
         logging.info("targets_hitter_props exists and force=False: %s", out_path.resolve())
@@ -187,7 +188,11 @@ def build_hitter_prop_targets(dirs: dict[str, Path], season: int, force: bool = 
     tgt["target_bb1p"] = (tgt["bb_bucket"] >= 1).astype("Int64")
     tgt["target_rbi1p"] = (tgt["rbi"] >= 1).astype("Int64")
 
+    meta_cols = [c for c in ["game_pk", "game_date"] if c in pa.columns]
+    meta = pa[meta_cols].drop_duplicates(subset=["game_pk"]) if "game_pk" in meta_cols else pd.DataFrame(columns=["game_pk"])
     out = tgt[["game_pk", "batter_id", "target_hit1p", "target_tb2p", "target_bb1p", "target_rbi1p"]].copy()
+    out = out.merge(meta, on="game_pk", how="left")
+    out = out[["game_pk", "game_date", "batter_id", "target_hit1p", "target_tb2p", "target_bb1p", "target_rbi1p"]]
     write_parquet(out, out_path)
     for col in ["target_hit1p", "target_tb2p", "target_bb1p", "target_rbi1p"]:
         nn = float(out[col].notna().mean()) if len(out) else 0.0
