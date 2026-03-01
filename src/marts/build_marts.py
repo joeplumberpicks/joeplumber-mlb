@@ -188,7 +188,7 @@ def _moneyline_side_offense_features(batter_roll: pd.DataFrame, spine: pd.DataFr
     team_col = next(
         (
             c
-            for c in ["bat_team", "team", "batting_team", "batter_team", "offense_team"]
+            for c in ["batter_team", "batting_team", "bat_team", "team", "offense_team"]
             if c in batter_roll.columns
         ),
         None,
@@ -283,7 +283,7 @@ def build_marts(dirs: dict[str, Path], season: int | None = None) -> dict[str, P
             team_col = next(
                 (
                     c
-                    for c in ["bat_team", "team", "batting_team", "batter_team", "offense_team"]
+                    for c in ["batter_team", "batting_team", "bat_team", "team", "offense_team"]
                     if c in bat_df.columns
                 ),
                 None,

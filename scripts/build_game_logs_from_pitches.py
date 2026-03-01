@@ -22,6 +22,55 @@ from src.utils.logging import configure_logging, log_header
 EVENT_TO_HIT = {"single", "double", "triple", "home_run"}
 
 
+
+
+def _infer_batting_team_from_inning_half(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "inning_topbot" not in out.columns:
+        out["batter_team"] = pd.NA
+        logging.warning("inning_topbot missing; batter_team will be null")
+        return out
+    if "home_team" not in out.columns or "away_team" not in out.columns:
+        out["batter_team"] = pd.NA
+        logging.warning("home_team/away_team missing; batter_team will be null")
+        return out
+
+    half = out["inning_topbot"].astype(str).str.strip().str.lower()
+    is_top = half.str.startswith("top")
+    is_bot = half.str.startswith("bot") | half.str.startswith("bottom")
+    out["batter_team"] = pd.NA
+    out.loc[is_top, "batter_team"] = out.loc[is_top, "away_team"]
+    out.loc[is_bot, "batter_team"] = out.loc[is_bot, "home_team"]
+    return out
+
+
+def _stable_batter_team_by_game(batter_pa: pd.DataFrame) -> pd.DataFrame:
+    required = {"game_pk", "batter_id", "batter_team"}
+    if not required.issubset(set(batter_pa.columns)):
+        return pd.DataFrame(columns=["game_pk", "batter_id", "batter_team"])
+
+    base = batter_pa[["game_pk", "batter_id", "batter_team"]].copy()
+    base = base.dropna(subset=["game_pk", "batter_id", "batter_team"])
+    if base.empty:
+        return pd.DataFrame(columns=["game_pk", "batter_id", "batter_team"])
+
+    counts = (
+        base.groupby(["game_pk", "batter_id", "batter_team"], dropna=False)
+        .size()
+        .reset_index(name="n")
+    )
+    counts = counts.sort_values(["game_pk", "batter_id", "n", "batter_team"], ascending=[True, True, False, True])
+    stable = counts.drop_duplicates(subset=["game_pk", "batter_id"])[["game_pk", "batter_id", "batter_team"]]
+
+    conflicts = counts.groupby(["game_pk", "batter_id"], dropna=False).size().reset_index(name="team_count")
+    conflicts = conflicts[conflicts["team_count"] > 1]
+    if not conflicts.empty:
+        logging.warning(
+            "batter_team had multiple values within game_pk+batter_id for %s groups; using mode",
+            len(conflicts),
+        )
+
+    return stable
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build batter/pitcher game logs from pitch-level Statcast data.")
     p.add_argument("--season", type=int, required=True)
@@ -169,6 +218,7 @@ def main() -> None:
 
     df = _prepare_pitch_features(pitches_df)
     df = _merge_game_context(df, games_df)
+    df = _infer_batting_team_from_inning_half(df)
 
     if args.start:
         df = df[df["game_date"] >= pd.to_datetime(args.start)]
@@ -185,6 +235,11 @@ def main() -> None:
     batter_df = df.dropna(subset=["game_pk", "batter_id"]).copy()
     pitcher_df = df.dropna(subset=["game_pk", "pitcher_id"]).copy()
     batter_game = _agg_game(batter_df, "batter_id")
+    batter_team_map = _stable_batter_team_by_game(batter_df)
+    if not batter_team_map.empty:
+        batter_game = batter_game.merge(batter_team_map, on=["game_pk", "batter_id"], how="left")
+    else:
+        batter_game["batter_team"] = pd.NA
     pitcher_game = _agg_game(pitcher_df, "pitcher_id")
 
     games_rows = len(games_df)

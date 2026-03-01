@@ -33,6 +33,7 @@ def run_smoke() -> None:
             {
                 "game_pk": [1, 1, 2, 2],
                 "batter_id": [101, 102, 101, 103],
+                "batter_team": ["C", "C", "B", "D"],
                 "game_date": ["2024-04-01", "2024-04-01", "2024-04-02", "2024-04-02"],
                 "sample_stat": [1.0, 2.0, 3.0, 4.0],
             }
@@ -61,6 +62,7 @@ def run_smoke() -> None:
         assert not batter_roll.empty, "Expected non-empty batter rolling output"
         assert not pitcher_roll.empty, "Expected non-empty pitcher rolling output"
         assert "batter" in batter_roll.columns, "Expected canonical batter column in rolling output"
+        assert "batter_team" in batter_roll.columns, "Expected batter_team to be preserved in rolling output"
         assert "pitcher" in pitcher_roll.columns, "Expected canonical pitcher column in rolling output"
 
     print("Smoke test passed: rolling pipeline grain/date/id expectations satisfied.")
