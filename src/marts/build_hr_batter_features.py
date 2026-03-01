@@ -43,9 +43,11 @@ def _infer_batter_team_from_events(
     processed_dir: Path,
     batter_id_col: str,
 ) -> pd.DataFrame:
-    events_path = processed_dir / "events_pa.parquet"
+    events_dir = processed_dir / "events_pa"
+    events_file = processed_dir / "events_pa.parquet"
+    events_path = events_dir if events_dir.exists() else events_file
     if not events_path.exists():
-        logging.warning("events_pa.parquet not found; cannot infer batter_team fallback")
+        logging.warning("events_pa dataset not found; cannot infer batter_team fallback")
         batter_game["batter_team"] = pd.NA
         return batter_game
 

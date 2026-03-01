@@ -88,12 +88,17 @@ def _numeric_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Seri
 
 def build_hitter_batter_features(dirs: dict[str, Path], season: int) -> Path:
     rolling_path = dirs["processed_dir"] / "batter_game_rolling.parquet"
-    events_path = dirs["processed_dir"] / "events_pa.parquet"
+    events_dir = dirs["processed_dir"] / "events_pa"
+    events_file = dirs["processed_dir"] / "events_pa.parquet"
 
     if not rolling_path.exists():
         raise FileNotFoundError(f"Missing batter rolling features: {rolling_path.resolve()}")
-    if not events_path.exists():
-        raise FileNotFoundError(f"Missing events_pa for targets: {events_path.resolve()}")
+    if events_dir.exists():
+        events_path = events_dir
+    elif events_file.exists():
+        events_path = events_file
+    else:
+        raise FileNotFoundError(f"Missing events_pa dataset: {events_file.resolve()}")
 
     roll = read_parquet(rolling_path)
     if "game_date" in roll.columns:

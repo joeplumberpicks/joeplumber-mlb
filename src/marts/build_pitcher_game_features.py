@@ -55,7 +55,9 @@ def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
 def build_pitcher_game_features(dirs: dict[str, Path], season: int) -> Path:
     rolling_path = dirs["processed_dir"] / "pitcher_game_rolling.parquet"
     pg_path = dirs["processed_dir"] / "by_season" / f"pitcher_game_{season}.parquet"
-    events_path = dirs["processed_dir"] / "events_pa.parquet"
+    events_dir = dirs["processed_dir"] / "events_pa"
+    events_file = dirs["processed_dir"] / "events_pa.parquet"
+    events_path = events_dir if events_dir.exists() else events_file
 
     if not rolling_path.exists():
         raise FileNotFoundError(f"Missing pitcher rolling features: {rolling_path.resolve()}")
