@@ -88,17 +88,12 @@ def _numeric_series(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Seri
 
 def build_hitter_batter_features(dirs: dict[str, Path], season: int) -> Path:
     rolling_path = dirs["processed_dir"] / "batter_game_rolling.parquet"
-    events_dir = dirs["processed_dir"] / "events_pa"
-    events_file = dirs["processed_dir"] / "events_pa.parquet"
+    pa_path = dirs["processed_dir"] / "by_season" / f"pa_{season}.parquet"
 
     if not rolling_path.exists():
         raise FileNotFoundError(f"Missing batter rolling features: {rolling_path.resolve()}")
-    if events_dir.exists():
-        events_path = events_dir
-    elif events_file.exists():
-        events_path = events_file
-    else:
-        raise FileNotFoundError(f"Missing events_pa dataset: {events_file.resolve()}")
+    if not pa_path.exists():
+        raise FileNotFoundError(f"Missing season PA parquet for targets: {pa_path.resolve()}")
 
     roll = read_parquet(rolling_path)
     if "game_date" in roll.columns:
@@ -116,7 +111,13 @@ def build_hitter_batter_features(dirs: dict[str, Path], season: int) -> Path:
     roll["batter_id"] = pd.to_numeric(roll["batter_id"], errors="coerce").astype("Int64")
     roll["game_pk"] = pd.to_numeric(roll["game_pk"], errors="coerce").astype("Int64")
 
-    events = read_parquet(events_path)
+    pa_cols = [
+        "game_pk", "game_date", "inning", "inning_topbot", "home_team", "away_team",
+        "batter", "batter_id", "mlbam_batter_id", "player_id", "pitcher",
+        "events", "event_type", "stand", "p_throws", "on_1b", "on_2b", "on_3b", "outs_when_up",
+        "bat_score", "post_bat_score", "home_score", "post_home_score", "away_score", "post_away_score",
+    ]
+    events = read_parquet(pa_path, columns=pa_cols)
     ev_batter_col = _pick_col(events, _BATTER_ID_CANDIDATES)
     if ev_batter_col is None:
         raise ValueError(f"No batter id column in events_pa. Available: {sorted(events.columns.tolist())}")

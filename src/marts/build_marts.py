@@ -338,95 +338,97 @@ def build_marts(dirs: dict[str, Path], season: int | None = None) -> dict[str, P
 
             mart_df = _merge_moneyline_targets(mart_df, dirs["processed_dir"])
 
-            events_dir = dirs["processed_dir"] / "events_pa"
-            events_file = dirs["processed_dir"] / "events_pa.parquet"
-            pa_path = events_dir if events_dir.exists() else events_file
-            if pa_path.exists():
-                pa = read_parquet(pa_path)
-                keep_cols = [
-                    c
-                    for c in ["game_pk", "game_date", "inning_topbot", "events", "home_team", "away_team"]
-                    if c in pa.columns
-                ]
-                pa = pa[keep_cols].copy() if keep_cols else pd.DataFrame()
-                required_pa = {"game_pk", "inning_topbot", "events", "home_team", "away_team"}
-                if pa.empty or not required_pa.issubset(set(pa.columns)):
-                    logging.warning(
-                        "moneyline offense enrichment skipped: events_pa missing required columns after load from %s",
-                        pa_path,
-                    )
-                else:
-                    half = pa["inning_topbot"].astype(str).str.lower().str.strip()
-                    is_top = half.str.startswith("top")
-                    is_bot = half.str.startswith("bot") | half.str.startswith("bottom")
-                    pa["batting_team"] = pd.NA
-                    pa.loc[is_bot, "batting_team"] = pa.loc[is_bot, "home_team"]
-                    pa.loc[is_top, "batting_team"] = pa.loc[is_top, "away_team"]
-                    logging.info(
-                        "moneyline inning_topbot sample counts=%s batting_team_null_pct=%.4f",
-                        pa["inning_topbot"].astype(str).value_counts(dropna=False).head(5).to_dict(),
-                        float(pa["batting_team"].isna().mean()) if len(pa) else 0.0,
-                    )
-
-                    pa["k"] = (pa["events"] == "strikeout").astype(int)
-                    pa["bb"] = pa["events"].isin(["walk", "intent_walk"]).astype(int)
-                    pa["hr"] = (pa["events"] == "home_run").astype(int)
-
-                    off = (
-                        pa.groupby(["game_pk", "batting_team"], dropna=False)
-                        .agg(pa=("events", "size"), k=("k", "sum"), bb=("bb", "sum"), hr=("hr", "sum"))
-                        .reset_index()
-                    )
-                    game_dates = pa[["game_pk", "game_date"]].drop_duplicates(subset=["game_pk"])
-                    off = off.merge(game_dates, on="game_pk", how="left")
-                    off["game_date"] = pd.to_datetime(off["game_date"], errors="coerce")
-
-                    off["k_rate"] = off["k"] / off["pa"].replace(0, pd.NA)
-                    off["bb_rate"] = off["bb"] / off["pa"].replace(0, pd.NA)
-                    off["hr_rate"] = off["hr"] / off["pa"].replace(0, pd.NA)
-
-                    off = off.sort_values(["batting_team", "game_date"])
-                    for col in ["k_rate", "bb_rate", "hr_rate"]:
-                        for window in [3, 7, 15, 30]:
-                            off[f"{col}_roll{window}"] = (
-                                off.groupby("batting_team")[col]
-                                .transform(lambda s: s.shift(1).rolling(window).mean())
-                            )
-
-                    roll_cols = [
-                        c
-                        for c in off.columns
-                        if c.endswith("_roll3") or c.endswith("_roll7") or c.endswith("_roll15") or c.endswith("_roll30")
+            if season is None:
+                logging.warning("moneyline offense enrichment skipped: season is None; use --season for season-scoped PA loads")
+            else:
+                pa_path = dirs["processed_dir"] / "by_season" / f"pa_{season}.parquet"
+                if pa_path.exists():
+                    pa_cols = [
+                        "game_pk", "game_date", "inning", "inning_topbot", "home_team", "away_team",
+                        "batter", "pitcher", "events", "event_type", "stand", "p_throws",
+                        "on_1b", "on_2b", "on_3b", "outs_when_up",
                     ]
+                    pa = read_parquet(pa_path, columns=pa_cols)
+                    keep_cols = [c for c in ["game_pk", "game_date", "inning_topbot", "events", "home_team", "away_team"] if c in pa.columns]
+                    pa = pa[keep_cols].copy() if keep_cols else pd.DataFrame()
+                    required_pa = {"game_pk", "inning_topbot", "events", "home_team", "away_team"}
+                    if pa.empty or not required_pa.issubset(set(pa.columns)):
+                        logging.warning(
+                            "moneyline offense enrichment skipped: season PA missing required columns after load from %s",
+                            pa_path,
+                        )
+                    else:
+                        half = pa["inning_topbot"].astype(str).str.lower().str.strip()
+                        is_top = half.str.startswith("top")
+                        is_bot = half.str.startswith("bot") | half.str.startswith("bottom")
+                        pa["batting_team"] = pd.NA
+                        pa.loc[is_bot, "batting_team"] = pa.loc[is_bot, "home_team"]
+                        pa.loc[is_top, "batting_team"] = pa.loc[is_top, "away_team"]
+                        logging.info(
+                            "moneyline inning_topbot sample counts=%s batting_team_null_pct=%.4f",
+                            pa["inning_topbot"].astype(str).value_counts(dropna=False).head(5).to_dict(),
+                            float(pa["batting_team"].isna().mean()) if len(pa) else 0.0,
+                        )
 
-                    home_off = off[["game_pk", "batting_team"] + roll_cols].rename(
-                        columns={c: f"home_off_{c}" for c in roll_cols}
-                    )
-                    mart_df = mart_df.merge(
-                        home_off,
-                        left_on=["game_pk", "home_team"],
-                        right_on=["game_pk", "batting_team"],
-                        how="left",
-                    )
-                    if "batting_team" in mart_df.columns:
-                        mart_df = mart_df.drop(columns=["batting_team"])
+                        pa["k"] = (pa["events"] == "strikeout").astype(int)
+                        pa["bb"] = pa["events"].isin(["walk", "intent_walk"]).astype(int)
+                        pa["hr"] = (pa["events"] == "home_run").astype(int)
 
-                    away_off = off[["game_pk", "batting_team"] + roll_cols].rename(
-                        columns={c: f"away_off_{c}" for c in roll_cols}
-                    )
-                    mart_df = mart_df.merge(
-                        away_off,
-                        left_on=["game_pk", "away_team"],
-                        right_on=["game_pk", "batting_team"],
-                        how="left",
-                    )
-                    if "batting_team" in mart_df.columns:
-                        mart_df = mart_df.drop(columns=["batting_team"])
+                        off = (
+                            pa.groupby(["game_pk", "batting_team"], dropna=False)
+                            .agg(pa=("events", "size"), k=("k", "sum"), bb=("bb", "sum"), hr=("hr", "sum"))
+                            .reset_index()
+                        )
+                        game_dates = pa[["game_pk", "game_date"]].drop_duplicates(subset=["game_pk"])
+                        off = off.merge(game_dates, on="game_pk", how="left")
+                        off["game_date"] = pd.to_datetime(off["game_date"], errors="coerce")
 
-                    home_cov = float(mart_df["home_off_k_rate_roll7"].notna().mean()) if "home_off_k_rate_roll7" in mart_df.columns and len(mart_df) else 0.0
-                    away_cov = float(mart_df["away_off_k_rate_roll7"].notna().mean()) if "away_off_k_rate_roll7" in mart_df.columns and len(mart_df) else 0.0
-                    logging.info("moneyline home_off_k_rate_roll7 non-null pct: %.4f", home_cov)
-                    logging.info("moneyline away_off_k_rate_roll7 non-null pct: %.4f", away_cov)
+                        off["k_rate"] = off["k"] / off["pa"].replace(0, pd.NA)
+                        off["bb_rate"] = off["bb"] / off["pa"].replace(0, pd.NA)
+                        off["hr_rate"] = off["hr"] / off["pa"].replace(0, pd.NA)
+
+                        off = off.sort_values(["batting_team", "game_date"])
+                        for col in ["k_rate", "bb_rate", "hr_rate"]:
+                            for window in [3, 7, 15, 30]:
+                                off[f"{col}_roll{window}"] = (
+                                    off.groupby("batting_team")[col]
+                                    .transform(lambda s: s.shift(1).rolling(window).mean())
+                                )
+
+                        roll_cols = [
+                            c
+                            for c in off.columns
+                            if c.endswith("_roll3") or c.endswith("_roll7") or c.endswith("_roll15") or c.endswith("_roll30")
+                        ]
+
+                        home_off = off[["game_pk", "batting_team"] + roll_cols].rename(
+                            columns={c: f"home_off_{c}" for c in roll_cols}
+                        )
+                        mart_df = mart_df.merge(
+                            home_off,
+                            left_on=["game_pk", "home_team"],
+                            right_on=["game_pk", "batting_team"],
+                            how="left",
+                        )
+                        if "batting_team" in mart_df.columns:
+                            mart_df = mart_df.drop(columns=["batting_team"])
+
+                        away_off = off[["game_pk", "batting_team"] + roll_cols].rename(
+                            columns={c: f"away_off_{c}" for c in roll_cols}
+                        )
+                        mart_df = mart_df.merge(
+                            away_off,
+                            left_on=["game_pk", "away_team"],
+                            right_on=["game_pk", "batting_team"],
+                            how="left",
+                        )
+                        if "batting_team" in mart_df.columns:
+                            mart_df = mart_df.drop(columns=["batting_team"])
+
+                        home_cov = float(mart_df["home_off_k_rate_roll7"].notna().mean()) if "home_off_k_rate_roll7" in mart_df.columns and len(mart_df) else 0.0
+                        away_cov = float(mart_df["away_off_k_rate_roll7"].notna().mean()) if "away_off_k_rate_roll7" in mart_df.columns and len(mart_df) else 0.0
+                        logging.info("moneyline home_off_k_rate_roll7 non-null pct: %.4f", home_cov)
+                        logging.info("moneyline away_off_k_rate_roll7 non-null pct: %.4f", away_cov)
 
 
             diff_created = 0

@@ -14,11 +14,55 @@ def safe_mkdir(path: str | Path) -> Path:
     return path_obj
 
 
-def _read_parquet_parts(parquet_path: Path) -> pd.DataFrame:
+def _extract_hive_partition_value(path: Path, key: str) -> str | None:
+    needle_prefix = f"{key}="
+    for part in path.parts:
+        if part.startswith(needle_prefix):
+            return part[len(needle_prefix):]
+    return None
+
+
+def _apply_filters_to_part_files(
+    dataset_dir: Path,
+    part_files: list[Path],
+    filters: list[tuple[str, str, Any]] | None,
+) -> list[Path]:
+    if not filters:
+        return part_files
+
+    keep = part_files
+    for col, op, val in filters:
+        if op != "=":
+            continue
+
+        partition_dir = dataset_dir / f"{col}={val}"
+        if partition_dir.exists() and partition_dir.is_dir():
+            keep = [p for p in keep if f"{col}={val}" in str(p)]
+        else:
+            sval = str(val)
+            keep2: list[Path] = []
+            for p in keep:
+                pv = _extract_hive_partition_value(p, col)
+                if pv is None or pv == sval:
+                    keep2.append(p)
+            keep = keep2
+    return keep
+
+
+def _read_parquet_parts(
+    parquet_path: Path,
+    columns: list[str] | None = None,
+    filters: list[tuple[str, str, Any]] | None = None,
+) -> pd.DataFrame:
     part_files = sorted(p for p in parquet_path.rglob("*.parquet") if p.is_file())
     if not part_files:
         raise FileNotFoundError(f"No parquet part files found under dataset directory: {parquet_path.resolve()}")
-    frames = [pd.read_parquet(part_path) for part_path in part_files]
+
+    part_files = _apply_filters_to_part_files(parquet_path, part_files, filters)
+    if not part_files:
+        return pd.DataFrame()
+
+    frames = [pd.read_parquet(part_path, columns=columns) for part_path in part_files]
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True, sort=False)
@@ -29,38 +73,47 @@ def _is_arrow_invalid(exc: Exception) -> bool:
     return exc_type.__name__ == "ArrowInvalid" or "pyarrow.lib" in exc_type.__module__
 
 
-def read_parquet(path: str | Path) -> pd.DataFrame:
+def read_parquet(
+    path: str | Path,
+    columns: list[str] | None = None,
+    filters: list[tuple[str, str, Any]] | None = None,
+) -> pd.DataFrame:
     parquet_path = Path(path)
     if not parquet_path.exists():
         raise FileNotFoundError(f"Parquet file does not exist: {parquet_path.resolve()}")
 
     if parquet_path.is_dir():
-        logging.warning("read_parquet fallback: reading parquet dataset directory via parts concat: %s", parquet_path.resolve())
-        return _read_parquet_parts(parquet_path)
+        logging.warning(
+            "read_parquet fallback: reading parquet dataset directory via parts concat: %s (filters=%s columns=%s)",
+            parquet_path.resolve(),
+            filters,
+            columns,
+        )
+        return _read_parquet_parts(parquet_path, columns=columns, filters=filters)
 
     try:
-        return pd.read_parquet(parquet_path)
+        return pd.read_parquet(parquet_path, columns=columns)
     except Exception as exc:  # noqa: BLE001
         if _is_arrow_invalid(exc):
-            dataset_dir = parquet_path if parquet_path.is_dir() else (parquet_path if parquet_path.suffix == ".parquet" and parquet_path.is_dir() else None)
-            if dataset_dir is None and parquet_path.suffix == ".parquet":
-                possible_dir = parquet_path
-                if possible_dir.exists() and possible_dir.is_dir():
-                    dataset_dir = possible_dir
-            if dataset_dir is not None and dataset_dir.exists() and dataset_dir.is_dir():
-                logging.warning(
-                    "read_parquet ArrowInvalid fallback: reading dataset parts from %s", dataset_dir.resolve()
-                )
-                return _read_parquet_parts(dataset_dir)
-
             parent = parquet_path.parent
-            if parent.exists() and parent.is_dir() and parquet_path.name.endswith(".parquet"):
-                candidate_dir = parent / parquet_path.name
-                if candidate_dir.exists() and candidate_dir.is_dir():
-                    logging.warning(
-                        "read_parquet ArrowInvalid fallback: reading dataset parts from %s", candidate_dir.resolve()
-                    )
-                    return _read_parquet_parts(candidate_dir)
+            candidate_dirs: list[Path] = []
+            if parquet_path.exists() and parquet_path.is_dir():
+                candidate_dirs.append(parquet_path)
+            stem_dir = parent / parquet_path.stem
+            if stem_dir.exists() and stem_dir.is_dir():
+                candidate_dirs.append(stem_dir)
+            file_named_dir = parent / parquet_path.name
+            if file_named_dir.exists() and file_named_dir.is_dir():
+                candidate_dirs.append(file_named_dir)
+
+            for d in candidate_dirs:
+                logging.warning(
+                    "read_parquet ArrowInvalid fallback: reading dataset parts from %s (filters=%s columns=%s)",
+                    d.resolve(),
+                    filters,
+                    columns,
+                )
+                return _read_parquet_parts(d, columns=columns, filters=filters)
         raise
 
 
