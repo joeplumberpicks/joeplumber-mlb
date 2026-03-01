@@ -7,7 +7,7 @@ import pandas as pd
 
 from src.utils.io import read_parquet, write_parquet
 
-_BATTER_ID_CANDIDATES = ["batter_id", "batter", "mlbam_batter_id", "player_id"]
+_BATTER_ID_CANDIDATES = ["batter_id", "mlbam_batter_id", "batter", "player_id"]
 _PITCHER_ID_CANDIDATES = ["pitcher_id", "pitcher", "mlbam_pitcher_id", "player_id"]
 _HIT_EVENTS = {"single", "double", "triple", "home_run"}
 
@@ -114,7 +114,7 @@ def build_hitter_batter_features(dirs: dict[str, Path], season: int) -> Path:
 
     pa_cols = [
         "game_pk", "game_date", "inning", "inning_topbot", "home_team", "away_team",
-        "batter_id", "batter", "pitcher_id", "pitcher",
+        "batter_id", "mlbam_batter_id", "batter", "pitcher_id", "pitcher",
         "events", "event_type", "stand", "p_throws", "on_1b", "on_2b", "on_3b", "outs_when_up",
         "bat_score", "post_bat_score", "home_score", "post_home_score", "away_score", "post_away_score",
     ]

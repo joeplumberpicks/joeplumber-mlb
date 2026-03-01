@@ -10,7 +10,7 @@ from src.utils.checks import print_rowcount, require_files
 from src.utils.io import read_parquet, write_parquet
 
 BATTER_TEAM_CANDIDATES = ["bat_team", "team", "batting_team", "batter_team", "offense_team"]
-BATTER_ID_CANDIDATES = ["batter", "batter_id", "mlbam_batter_id", "player_id"]
+BATTER_ID_CANDIDATES = ["batter_id", "mlbam_batter_id", "batter", "player_id"]
 PITCHER_ID_CANDIDATES = ["pitcher", "pitcher_id", "mlbam_pitcher_id", "player_id"]
 HR_CANDIDATES = ["bat_hr", "hr"]
 EVENTS_TEAM_CANDIDATES = ["batting_team", "bat_team", "team", "offense_team"]
@@ -51,6 +51,7 @@ def _infer_batter_team_from_events(
     pa_cols = [
         "game_pk",
         "batter_id",
+        "mlbam_batter_id",
         "batter",
         "batting_team",
         "bat_team",
