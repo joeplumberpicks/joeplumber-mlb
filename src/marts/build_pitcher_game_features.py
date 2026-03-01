@@ -55,9 +55,9 @@ def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
 def build_pitcher_game_features(dirs: dict[str, Path], season: int) -> Path:
     rolling_path = dirs["processed_dir"] / "pitcher_game_rolling.parquet"
     pg_path = dirs["processed_dir"] / "by_season" / f"pitcher_game_{season}.parquet"
+    season_pa_path = dirs["processed_dir"] / "by_season" / f"pa_{season}.parquet"
     events_dir = dirs["processed_dir"] / "events_pa"
     events_file = dirs["processed_dir"] / "events_pa.parquet"
-    events_path = events_dir if events_dir.exists() else events_file
 
     if not rolling_path.exists():
         raise FileNotFoundError(f"Missing pitcher rolling features: {rolling_path.resolve()}")
@@ -97,8 +97,20 @@ def build_pitcher_game_features(dirs: dict[str, Path], season: int) -> Path:
 
     k_agg = pd.DataFrame(columns=["game_pk", "pitcher_id", "target_k_events"])
     outs_agg = pd.DataFrame(columns=["game_pk", "pitcher_id", "target_outs_events"])
-    if events_path.exists():
-        ev = read_parquet(events_path)
+
+    ev: pd.DataFrame | None = None
+    if season_pa_path.exists():
+        pa_cols = ["game_pk", "pitcher_id", "pitcher", "events", "event_type", "outs_when_up"]
+        logging.info("pitcher_game targets loading PA from by_season file: %s", season_pa_path.resolve())
+        ev = read_parquet(season_pa_path, columns=pa_cols)
+    else:
+        fallback_path = events_dir if events_dir.exists() else events_file
+        if fallback_path.exists():
+            pa_cols = ["game_pk", "pitcher_id", "pitcher", "events", "event_type", "game_date", "outs_when_up"]
+            logging.info("pitcher_game targets loading PA from fallback path: %s", fallback_path.resolve())
+            ev = read_parquet(fallback_path, columns=pa_cols, filters=[("season", "=", season)])
+
+    if ev is not None and not ev.empty:
         ev_pitcher_col = "pitcher_id" if "pitcher_id" in ev.columns else ("pitcher" if "pitcher" in ev.columns else None)
         event_col = "events" if "events" in ev.columns else ("event_type" if "event_type" in ev.columns else None)
         if ev_pitcher_col is not None and "game_pk" in ev.columns and event_col is not None:
