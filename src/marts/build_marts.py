@@ -229,6 +229,14 @@ def build_marts(
         if filename == "moneyline_features.parquet":
             mart_df = _moneyline_side_offense_features(batter_roll, mart_df)
             mart_df = _merge_moneyline_targets(mart_df, dirs["processed_dir"], season)
+            if "target_home_win" in mart_df.columns:
+                mart_df = mart_df[mart_df["target_home_win"].notna()].copy()
+                logging.info(
+                    "moneyline labeled rows=%s unique_games=%s null_rate=%.4f",
+                    len(mart_df),
+                    int(mart_df["game_pk"].nunique()) if "game_pk" in mart_df.columns else 0,
+                    float(mart_df["target_home_win"].isna().mean()) if len(mart_df) else 0.0,
+                )
         elif filename == "nrfi_features.parquet":
             nrfi_t = _read_target_file(dirs["processed_dir"], "nrfi", season, ["game_pk", "target_nrfi", "target_yrfi"])
             if not nrfi_t.empty:

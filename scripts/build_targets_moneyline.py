@@ -132,11 +132,20 @@ def main() -> None:
     out.loc[hs < aw, "target_home_win"] = 0
     out["target_home_win"] = pd.to_numeric(out["target_home_win"], errors="coerce").astype("Int64")
 
-    tie_count = int(((hs == aw) & hs.notna() & aw.notna()).sum())
-    missing_topbot_games = int(out["home_score"].isna().sum() + out["away_score"].isna().sum())
+    tie_mask = (hs == aw) & hs.notna() & aw.notna()
+    tie_count = int(tie_mask.sum())
+    missing_score_count = int((hs.isna() | aw.isna()).sum())
 
     out = out[["game_pk", "game_date", "home_team", "away_team", "home_score", "away_score", "target_home_win"]]
     out = out.drop_duplicates(subset=["game_pk"])
+    before_drop = len(out)
+    out = out[~tie_mask.reindex(out.index, fill_value=False)].copy()
+    out = out.dropna(subset=["target_home_win"]).copy()
+    out["target_home_win"] = pd.to_numeric(out["target_home_win"], errors="coerce").astype("Int64")
+
+    remaining_ties = int(((pd.to_numeric(out["home_score"], errors="coerce") == pd.to_numeric(out["away_score"], errors="coerce")) & out["home_score"].notna() & out["away_score"].notna()).sum())
+    if remaining_ties > 0:
+        raise RuntimeError(f"Moneyline target build invariant failed: ties remain after filtering ({remaining_ties})")
 
     out_path = target_output_path(dirs["processed_dir"], "moneyline", args.season)
     if out_path.exists() and not args.force:
@@ -145,14 +154,15 @@ def main() -> None:
         write_parquet(out, out_path)
 
     logging.info(
-        "targets_moneyline method=%s rows=%s unique_games=%s date_min=%s date_max=%s tie_count=%s missing_score_cells=%s null_rate=%.4f pos_rate=%.4f path=%s",
+        "targets_moneyline method=%s rows=%s unique_games=%s date_min=%s date_max=%s tie_count=%s dropped_tie_or_unlabeled=%s missing_score_rows=%s null_rate=%.4f pos_rate=%.4f path=%s",
         method_used,
         len(out),
         int(out["game_pk"].nunique()) if "game_pk" in out.columns else 0,
         pd.to_datetime(out.get("game_date"), errors="coerce").min() if len(out) else pd.NaT,
         pd.to_datetime(out.get("game_date"), errors="coerce").max() if len(out) else pd.NaT,
         tie_count,
-        missing_topbot_games,
+        before_drop - len(out),
+        missing_score_count,
         float(out["target_home_win"].isna().mean()) if len(out) else 0.0,
         float(pd.to_numeric(out["target_home_win"], errors="coerce").fillna(0).mean()) if len(out) else 0.0,
         out_path.resolve(),
