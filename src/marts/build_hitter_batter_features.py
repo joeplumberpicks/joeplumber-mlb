@@ -8,6 +8,7 @@ import pandas as pd
 from src.utils.io import read_parquet, write_parquet
 
 _BATTER_ID_CANDIDATES = ["batter_id", "batter", "mlbam_batter_id", "player_id"]
+_PITCHER_ID_CANDIDATES = ["pitcher_id", "pitcher", "mlbam_pitcher_id", "player_id"]
 _HIT_EVENTS = {"single", "double", "triple", "home_run"}
 
 
@@ -113,14 +114,16 @@ def build_hitter_batter_features(dirs: dict[str, Path], season: int) -> Path:
 
     pa_cols = [
         "game_pk", "game_date", "inning", "inning_topbot", "home_team", "away_team",
-        "batter", "batter_id", "mlbam_batter_id", "player_id", "pitcher",
+        "batter_id", "batter", "pitcher_id", "pitcher",
         "events", "event_type", "stand", "p_throws", "on_1b", "on_2b", "on_3b", "outs_when_up",
         "bat_score", "post_bat_score", "home_score", "post_home_score", "away_score", "post_away_score",
     ]
     events = read_parquet(pa_path, columns=pa_cols)
+
     ev_batter_col = _pick_col(events, _BATTER_ID_CANDIDATES)
     if ev_batter_col is None:
         raise ValueError(f"No batter id column in events_pa. Available: {sorted(events.columns.tolist())}")
+    ev_pitcher_col = _pick_col(events, _PITCHER_ID_CANDIDATES)
 
     needed = [
         c
@@ -133,6 +136,7 @@ def build_hitter_batter_features(dirs: dict[str, Path], season: int) -> Path:
             "home_team",
             "away_team",
             ev_batter_col,
+            ev_pitcher_col,
             "bat_score",
             "post_bat_score",
             "home_score",
@@ -146,8 +150,13 @@ def build_hitter_batter_features(dirs: dict[str, Path], season: int) -> Path:
     events["game_pk"] = pd.to_numeric(events["game_pk"], errors="coerce").astype("Int64")
     events["game_date"] = pd.to_datetime(events.get("game_date"), errors="coerce")
     events = events[events["game_date"].dt.year == season].copy()
-    events = events.rename(columns={ev_batter_col: "batter_id"})
+    rename_map = {ev_batter_col: "batter_id"}
+    if ev_pitcher_col is not None:
+        rename_map[ev_pitcher_col] = "pitcher_id"
+    events = events.rename(columns=rename_map)
     events["batter_id"] = pd.to_numeric(events["batter_id"], errors="coerce").astype("Int64")
+    if "pitcher_id" in events.columns:
+        events["pitcher_id"] = pd.to_numeric(events["pitcher_id"], errors="coerce").astype("Int64")
 
     half = events.get("inning_topbot", pd.Series(index=events.index, dtype="object")).astype(str).str.lower().str.strip()
     events["batting_team"] = pd.NA
