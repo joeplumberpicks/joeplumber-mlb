@@ -227,7 +227,9 @@ def build_hitter_batter_features(dirs: dict[str, Path], season: int) -> Path:
         pos_rate = float(pd.to_numeric(out[col], errors="coerce").fillna(0).mean()) if len(out) else 0.0
         logging.info("hitter_batter_features %s null_rate=%.4f pos_rate=%.4f", col, null_rate, pos_rate)
 
-    out_path = dirs["marts_dir"] / "hitter_batter_features.parquet"
+    marts_by_season_dir = dirs["marts_dir"] / "by_season"
+    marts_by_season_dir.mkdir(parents=True, exist_ok=True)
+    out_path = marts_by_season_dir / f"hitter_batter_features_{season}.parquet"
     write_parquet(out, out_path)
     logging.info("hitter_batter_features rows=%s path=%s", len(out), out_path.resolve())
     return out_path

@@ -242,7 +242,9 @@ def build_hr_batter_features(
     tail = [c for c in hr.columns if c not in front]
     hr = hr[front + tail]
 
-    out_path = dirs["marts_dir"] / "hr_batter_features.parquet"
+    marts_by_season_dir = dirs["marts_dir"] / "by_season"
+    marts_by_season_dir.mkdir(parents=True, exist_ok=True)
+    out_path = marts_by_season_dir / f"hr_batter_features_{season}.parquet"
     print_rowcount("hr_batter_features", hr)
     print(f"opp_sp_id null rate: {hr['opp_sp_id'].isna().mean():.2%}")
     print(f"Writing to: {out_path.resolve()}")

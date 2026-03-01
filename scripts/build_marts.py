@@ -36,7 +36,7 @@ def main() -> None:
     log_header("scripts/build_marts.py", repo_root, config_path, dirs)
     print(f"Args: season={args.season}, start={args.start}, end={args.end}, force={args.force}")
 
-    build_marts(dirs, season=args.season)
+    build_marts(dirs, season=args.season, start=args.start, end=args.end)
     if args.season is not None:
         build_hr_batter_features(dirs=dirs, season=args.season, start=args.start, end=args.end)
 

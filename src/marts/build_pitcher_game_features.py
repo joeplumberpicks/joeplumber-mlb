@@ -182,7 +182,9 @@ def build_pitcher_game_features(dirs: dict[str, Path], season: int) -> Path:
     logging.info("pitcher_game_features target_outs non_null_pct=%.4f", outs_non_null)
     logging.info("pitcher_game_features target_outs mean=%.4f min=%.4f max=%.4f", outs_mean, outs_min, outs_max)
 
-    out_path = dirs["marts_dir"] / "pitcher_game_features.parquet"
+    marts_by_season_dir = dirs["marts_dir"] / "by_season"
+    marts_by_season_dir.mkdir(parents=True, exist_ok=True)
+    out_path = marts_by_season_dir / f"pitcher_game_features_{season}.parquet"
     write_parquet(out, out_path)
     logging.info("pitcher_game_features rows=%s path=%s", len(out), out_path.resolve())
     return out_path
