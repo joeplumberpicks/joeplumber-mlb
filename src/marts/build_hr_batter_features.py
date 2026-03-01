@@ -42,16 +42,39 @@ def _infer_batter_team_from_events(
     batter_game: pd.DataFrame,
     processed_dir: Path,
     batter_id_col: str,
+    season: int,
 ) -> pd.DataFrame:
+    season_pa_path = processed_dir / "by_season" / f"pa_{season}.parquet"
     events_dir = processed_dir / "events_pa"
     events_file = processed_dir / "events_pa.parquet"
-    events_path = events_dir if events_dir.exists() else events_file
-    if not events_path.exists():
-        logging.warning("events_pa dataset not found; cannot infer batter_team fallback")
-        batter_game["batter_team"] = pd.NA
-        return batter_game
 
-    events = read_parquet(events_path)
+    pa_cols = [
+        "game_pk",
+        "batter_id",
+        "batter",
+        "batting_team",
+        "bat_team",
+        "team",
+        "offense_team",
+        "inning_topbot",
+        "topbot",
+        "inning_half",
+        "inning_top_bot",
+        "home_team",
+        "away_team",
+    ]
+
+    if season_pa_path.exists():
+        logging.info("hr_batter_features loading PA for batter_team from by_season file: %s", season_pa_path.resolve())
+        events = read_parquet(season_pa_path, columns=pa_cols)
+    else:
+        fallback_path = events_dir if events_dir.exists() else events_file
+        if not fallback_path.exists():
+            logging.warning("events_pa dataset not found; cannot infer batter_team fallback")
+            batter_game["batter_team"] = pd.NA
+            return batter_game
+        logging.info("hr_batter_features loading PA for batter_team from fallback path: %s", fallback_path.resolve())
+        events = read_parquet(fallback_path, columns=pa_cols, filters=[("season", "=", season)])
     events_batter_col = _pick_optional_column(events, BATTER_ID_CANDIDATES)
     events_team_col = _pick_optional_column(events, EVENTS_TEAM_CANDIDATES)
 
@@ -126,7 +149,7 @@ def build_hr_batter_features(
     if batter_team_col is not None:
         batter_game["batter_team"] = batter_game[batter_team_col]
     else:
-        batter_game = _infer_batter_team_from_events(batter_game, dirs["processed_dir"], "batter_id")
+        batter_game = _infer_batter_team_from_events(batter_game, dirs["processed_dir"], "batter_id", season)
 
     batter_game["target_hr"] = (pd.to_numeric(batter_game[hr_col], errors="coerce").fillna(0) > 0).astype("Int64")
     batter_game["game_date"] = pd.to_datetime(batter_game.get("game_date"), errors="coerce")

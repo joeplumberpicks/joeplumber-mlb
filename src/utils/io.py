@@ -129,6 +129,11 @@ def read_parquet(
         raise FileNotFoundError(f"Parquet file does not exist: {parquet_path.resolve()}")
 
     if parquet_path.is_dir():
+        if columns is None:
+            raise ValueError(
+                "read_parquet requires columns=... for dataset directories to avoid OOM reads: "
+                f"{parquet_path.resolve()}"
+            )
         logging.warning(
             "read_parquet fallback: reading parquet dataset directory via parts concat: %s (filters=%s columns=%s)",
             parquet_path.resolve(),
