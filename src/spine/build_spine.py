@@ -247,6 +247,9 @@ def _enrich_games_with_park_identity(games_df: pd.DataFrame, parks_df: pd.DataFr
         if c not in out.columns:
             out[c] = pd.NA
 
+    before_park_fill = float(out["park_id"].notna().mean() * 100.0) if len(out) else 0.0
+    before_venue_fill = float(out["venue_id"].notna().mean() * 100.0) if len(out) else 0.0
+
     overrides_df = load_park_overrides(reference_dir / "park_overrides.csv")
     out = _apply_overrides(out, overrides_df, season)
 
@@ -266,8 +269,46 @@ def _enrich_games_with_park_identity(games_df: pd.DataFrame, parks_df: pd.DataFr
             if c not in out.columns:
                 out[c] = park_resolved[c]
 
+    # Fallback map by home team for seasons where games often miss park metadata.
+    team_map_path = reference_dir / "parks" / "team_home_park_map_from_2024.parquet"
+    if team_map_path.exists():
+        team_map = read_parquet(team_map_path)
+        map_cols = [c for c in ["home_team", "venue_id", "park_id", "park_name"] if c in team_map.columns]
+        if "home_team" in map_cols:
+            team_map = team_map[map_cols].copy().drop_duplicates(subset=["home_team"], keep="first")
+            out = out.merge(team_map, on="home_team", how="left", suffixes=("", "_map"))
+
+            def _missing_id(series: pd.Series) -> pd.Series:
+                numeric = pd.to_numeric(series, errors="coerce")
+                return series.isna() | numeric.eq(0)
+
+            for c in ["venue_id", "park_id", "park_name"]:
+                map_col = f"{c}_map"
+                if map_col in out.columns:
+                    if c in ["venue_id", "park_id"]:
+                        missing_mask = _missing_id(out[c])
+                    else:
+                        missing_mask = out[c].isna() | out[c].astype(str).str.strip().eq("")
+                    out.loc[missing_mask, c] = out.loc[missing_mask, map_col]
+                    out = out.drop(columns=[map_col])
+        else:
+            logging.warning("team_home_park_map_from_2024.parquet missing home_team; fallback skipped")
+    else:
+        logging.info("team home park fallback map not found at %s", team_map_path.resolve())
+
     if "canonical_park_key" not in out.columns:
         out["canonical_park_key"] = park_resolved.get("canonical_park_key", pd.NA)
+
+    after_park_fill = float(out["park_id"].notna().mean() * 100.0) if len(out) else 0.0
+    after_venue_fill = float(out["venue_id"].notna().mean() * 100.0) if len(out) else 0.0
+    logging.info(
+        "park mapping fill rates season=%s park_id %.2f%%->%.2f%% venue_id %.2f%%->%.2f%%",
+        season,
+        before_park_fill,
+        after_park_fill,
+        before_venue_fill,
+        after_venue_fill,
+    )
 
     return out
 
@@ -364,12 +405,77 @@ def _normalize_team_for_match(val: object) -> str:
 
 
 def _populate_starter_ids_from_events(model_spine: pd.DataFrame, processed_dir: Path) -> pd.DataFrame:
-    events_path = processed_dir / "events_pa.parquet"
-    if not events_path.exists():
-        logging.warning("events_pa.parquet not found at %s; starter IDs will remain as-is", events_path)
+    events_file = processed_dir / "events_pa.parquet"
+    events_dir = processed_dir / "events_pa"
+
+    source_path: Path | None = None
+    if events_file.exists():
+        source_path = events_file
+    elif events_dir.exists():
+        source_path = events_dir
+    else:
+        logging.warning("events_pa source not found at %s or %s; starter IDs will remain as-is", events_file, events_dir)
         return model_spine
 
-    events = read_parquet(events_path)
+    needed_cols = [
+        "game_pk",
+        "season",
+        "game_date",
+        "game_year",
+        "pitcher",
+        "pitcher_id",
+        "mlbam_pitcher_id",
+        "player_id",
+        "pitching_team",
+        "defense_team",
+        "fielding_team",
+        "inning",
+        "inning_topbot",
+        "topbot",
+        "inning_half",
+        "home_team",
+        "away_team",
+        "pitch_number",
+        "pitch_num",
+        "pitch_seq",
+        "pitch_index",
+    ]
+    try:
+        events = pd.read_parquet(source_path, columns=needed_cols)
+    except Exception:
+        events = pd.read_parquet(source_path)
+        keep = [c for c in needed_cols if c in events.columns]
+        events = events[keep].copy() if keep else events
+
+    logging.info("starter mapping events source=%s rows_loaded=%s", source_path.resolve(), len(events))
+
+    if "game_pk" in events.columns and "game_pk" in model_spine.columns:
+        game_pk_set = set(pd.to_numeric(model_spine["game_pk"], errors="coerce").dropna().astype("Int64").tolist())
+        if game_pk_set:
+            events["game_pk"] = pd.to_numeric(events["game_pk"], errors="coerce").astype("Int64")
+            before_filter = len(events)
+            events = events[events["game_pk"].isin(game_pk_set)].copy()
+            logging.info("starter mapping rows after game_pk filter: %s (before=%s)", len(events), before_filter)
+
+    if "season" in model_spine.columns and len(model_spine):
+        spine_seasons = set(pd.to_numeric(model_spine["season"], errors="coerce").dropna().astype(int).tolist())
+        if spine_seasons:
+            before_filter = len(events)
+            if "season" in events.columns:
+                events_season = pd.to_numeric(events["season"], errors="coerce")
+                events = events[events_season.isin(spine_seasons)].copy()
+            elif "game_date" in events.columns:
+                gd = pd.to_datetime(events["game_date"], errors="coerce")
+                events = events[gd.dt.year.isin(spine_seasons)].copy()
+            elif "game_year" in events.columns:
+                gy = pd.to_numeric(events["game_year"], errors="coerce")
+                events = events[gy.isin(spine_seasons)].copy()
+            logging.info("starter mapping rows after season filter: %s (before=%s seasons=%s)", len(events), before_filter, sorted(spine_seasons))
+
+    if events.empty:
+        logging.warning("starter mapping events empty after filtering; starter IDs will remain as-is")
+        return model_spine
+
     pitcher_col = _pick_optional_column(events, PITCHER_ID_CANDIDATES)
     pitching_team_col = _pick_optional_column(events, PITCHING_TEAM_CANDIDATES)
     inning_col = _pick_optional_column(events, INNING_CANDIDATES)
@@ -460,6 +566,8 @@ def _populate_starter_ids_from_events(model_spine: pd.DataFrame, processed_dir: 
     )
     logging.info("home_sp_id null %% after events starter mapping: %.2f%%", home_null_pct)
     logging.info("away_sp_id null %% after events starter mapping: %.2f%%", away_null_pct)
+    if home_null_pct >= 99.9 and away_null_pct >= 99.9:
+        logging.warning("starter mapping produced ~100%% null starter IDs; verify events_pa coverage and columns")
 
     out = out.drop(columns=["home_team_match", "away_team_match"], errors="ignore")
 
