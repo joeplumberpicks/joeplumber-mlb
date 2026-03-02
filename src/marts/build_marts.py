@@ -173,57 +173,67 @@ def _resolve_batter_id(hitter: pd.DataFrame) -> tuple[pd.DataFrame, str, float]:
     candidate_cols = _candidate_id_columns(out)
     logging.info("hitter_props id-like columns: %s", candidate_cols)
 
-    preferred = ["batter_id", "batter", "mlbam_batter_id", "mlbam_id", "player_id", "hitter_id", "bat_id", "id"]
-    score: list[tuple[float, str, pd.Series]] = []
-
-    def _append_score(col: str) -> None:
-        if col not in out.columns:
-            return
-        s = pd.to_numeric(out[col], errors="coerce")
-        nn = float(s.notna().mean()) if len(s) else 0.0
-        score.append((nn, col, s))
-
-    for c in preferred:
-        _append_score(c)
-
-    regex_cols = [
-        c for c in out.columns
-        if re.search(r"(^|_)batter(_|$)", c, flags=re.IGNORECASE)
-        or re.search(r"(^|_)hitter(_|$)", c, flags=re.IGNORECASE)
-        or re.search(r"(^|_)player(_|$)", c, flags=re.IGNORECASE)
-    ]
-    for c in regex_cols:
-        if c not in preferred:
-            _append_score(c)
-
-    if not score:
-        raise ValueError("hitter_props_features missing batter identifier; check upstream feature build to include batter/player id")
-
-    # priority first, then non-null rate; treat all-null batter_id as missing by >=1% threshold check
-    preferred_rank = {c: i for i, c in enumerate(preferred)}
-    score.sort(key=lambda t: (preferred_rank.get(t[1], 10_000), -t[0]))
-    chosen_non_null = 0.0
+    priority_cols = ["bat_batter_id", "batter_id", "batter_id_x", "batter_id_y", "bat_batter"]
     chosen_col = ""
-    chosen_series = pd.Series(pd.NA, index=out.index, dtype="float64")
-    for nn, col, series in score:
-        if nn >= 0.01:
-            chosen_non_null = nn
-            chosen_col = col
-            chosen_series = series
-            break
+    chosen_non_null = 0.0
+    source_series: pd.Series | None = None
 
-    if not chosen_col:
+    if {"batter_id_x", "batter_id_y"}.issubset(out.columns):
+        coalesced = out["batter_id_x"].combine_first(out["batter_id_y"])
+        coalesced_num = pd.to_numeric(coalesced, errors="coerce")
+        coalesced_nn = float(coalesced_num.notna().mean()) if len(coalesced_num) else 0.0
+        if coalesced_nn > 0.05:
+            chosen_col = "batter_id_x|batter_id_y"
+            chosen_non_null = coalesced_nn
+            source_series = coalesced
+
+    if source_series is None:
+        for col in priority_cols:
+            if col not in out.columns:
+                continue
+            numeric = pd.to_numeric(out[col], errors="coerce")
+            nn = float(numeric.notna().mean()) if len(numeric) else 0.0
+            if nn > 0.05:
+                chosen_col = col
+                chosen_non_null = nn
+                source_series = out[col]
+                break
+
+    if source_series is None:
+        regex_cols = [
+            c for c in out.columns
+            if re.search(r"(^|_)batter(_|$)", c, flags=re.IGNORECASE)
+            or re.search(r"(^|_)hitter(_|$)", c, flags=re.IGNORECASE)
+        ]
+        for col in regex_cols:
+            numeric = pd.to_numeric(out[col], errors="coerce")
+            nn = float(numeric.notna().mean()) if len(numeric) else 0.0
+            if nn > 0.05:
+                chosen_col = col
+                chosen_non_null = nn
+                source_series = out[col]
+                break
+
+    if source_series is None:
         raise ValueError("hitter_props_features missing batter identifier; check upstream feature build to include batter/player id")
 
-    out["batter_id"] = chosen_series.astype("Int64")
+    out["batter_id"] = pd.to_numeric(source_series, errors="coerce").astype("Int64")
     out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
+    batter_null_rate = float(out["batter_id"].isna().mean()) if len(out) else 1.0
     logging.info(
         "hitter_props batter_id source_col=%s source_non_null_pct=%.4f batter_id_null_rate=%.4f sample=%s",
         chosen_col,
         chosen_non_null,
-        float(out["batter_id"].isna().mean()) if len(out) else 1.0,
-        out[["game_pk", chosen_col, "batter_id"]].head(10).to_dict("records") if chosen_col in out.columns else [],
+        batter_null_rate,
+        out[["game_pk", "batter_id"]].assign(source_value=source_series).head(5).to_dict("records"),
     )
+
+    if batter_null_rate > 0.05:
+        raise ValueError(
+            "hitter_props batter_id resolution left too many nulls. "
+            f"source_col={chosen_col} source_non_null_pct={chosen_non_null:.4f} batter_id_null_rate={batter_null_rate:.4f}"
+        )
+
     return out, chosen_col, chosen_non_null
 
 
