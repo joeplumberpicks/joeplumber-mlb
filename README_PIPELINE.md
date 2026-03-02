@@ -32,3 +32,22 @@ python scripts/build_marts.py
 - `processed/batter_game_rolling.parquet`
 - `processed/pitcher_game_rolling.parquet`
 - `processed/model_spine_game.parquet`
+
+## No-HR Engine v1 (2021-2024 smoke flow)
+
+```bash
+for s in 2021 2022 2023 2024; do
+  python scripts/build_targets_no_hr_game.py --season "$s" --force
+  python scripts/build_mart_no_hr_game.py --season "$s" --force
+done
+python scripts/train_no_hr.py --train-seasons 2021,2022,2023 --test-seasons 2024
+# replace MODEL_PATH with the model artifact printed by train_no_hr.py
+python scripts/predict_no_hr.py --season 2024 --model-path MODEL_PATH --force
+python scripts/validate_no_hr_artifacts.py --season 2024
+```
+
+Artifacts:
+- `data/processed/targets/game/targets_no_hr_game_<season>.parquet`
+- `data/processed/marts/no_hr/no_hr_game_features_<season>.parquet`
+- `data/models/no_hr/no_hr_model_<signature>.pkl`
+- `data/outputs/no_hr/no_hr_predictions_<season>.parquet`
