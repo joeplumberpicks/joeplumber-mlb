@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from pathlib import Path
 
 import pandas as pd
@@ -169,72 +168,44 @@ def _candidate_id_columns(df: pd.DataFrame) -> list[str]:
 
 
 def _resolve_batter_id(hitter: pd.DataFrame) -> tuple[pd.DataFrame, str, float]:
+    """
+    Ensure a canonical batter_id column exists and is usable.
+    Accepts a range of legacy/merged column names and coerces to nullable Int64.
+    Returns: (df, source_col, source_non_null_rate)
+    """
     out = hitter.copy()
     candidate_cols = _candidate_id_columns(out)
     logging.info("hitter_props id-like columns: %s", candidate_cols)
 
-    priority_cols = ["bat_batter_id", "batter_id", "batter_id_x", "batter_id_y", "bat_batter"]
-    chosen_col = ""
-    chosen_non_null = 0.0
-    source_series: pd.Series | None = None
+    candidates = [
+        "batter_id",
+        "mlbam_batter_id",
+        "batter",
+        "batter_mlbam_id",
+        "player_id",
+        "batter_id_x",
+        "batter_id_y",
+        "batter_x",
+        "batter_y",
+    ]
 
-    if {"batter_id_x", "batter_id_y"}.issubset(out.columns):
-        coalesced = out["batter_id_x"].combine_first(out["batter_id_y"])
-        coalesced_num = pd.to_numeric(coalesced, errors="coerce")
-        coalesced_nn = float(coalesced_num.notna().mean()) if len(coalesced_num) else 0.0
-        if coalesced_nn > 0.05:
-            chosen_col = "batter_id_x|batter_id_y"
-            chosen_non_null = coalesced_nn
-            source_series = coalesced
+    n = len(out)
+    for c in candidates:
+        if c not in out.columns:
+            continue
+        ser = pd.to_numeric(out[c], errors="coerce")
+        non_null = int(ser.notna().sum())
+        if non_null == 0:
+            continue
 
-    if source_series is None:
-        for col in priority_cols:
-            if col not in out.columns:
-                continue
-            numeric = pd.to_numeric(out[col], errors="coerce")
-            nn = float(numeric.notna().mean()) if len(numeric) else 0.0
-            if nn > 0.05:
-                chosen_col = col
-                chosen_non_null = nn
-                source_series = out[col]
-                break
+        out["batter_id"] = ser.round(0).astype("Int64")
+        if "game_pk" in out.columns:
+            out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
+        return out, c, non_null / max(1, n)
 
-    if source_series is None:
-        regex_cols = [
-            c for c in out.columns
-            if re.search(r"(^|_)batter(_|$)", c, flags=re.IGNORECASE)
-            or re.search(r"(^|_)hitter(_|$)", c, flags=re.IGNORECASE)
-        ]
-        for col in regex_cols:
-            numeric = pd.to_numeric(out[col], errors="coerce")
-            nn = float(numeric.notna().mean()) if len(numeric) else 0.0
-            if nn > 0.05:
-                chosen_col = col
-                chosen_non_null = nn
-                source_series = out[col]
-                break
-
-    if source_series is None:
-        raise ValueError("hitter_props_features missing batter identifier; check upstream feature build to include batter/player id")
-
-    out["batter_id"] = pd.to_numeric(source_series, errors="coerce").astype("Int64")
-    out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
-    batter_null_rate = float(out["batter_id"].isna().mean()) if len(out) else 1.0
-    logging.info(
-        "hitter_props batter_id source_col=%s source_non_null_pct=%.4f batter_id_null_rate=%.4f sample=%s",
-        chosen_col,
-        chosen_non_null,
-        batter_null_rate,
-        out[["game_pk", "batter_id"]].assign(source_value=source_series).head(5).to_dict("records"),
+    raise ValueError(
+        "hitter_props_features missing batter identifier; expected one of: %s" % candidates
     )
-
-    if batter_null_rate > 0.05:
-        raise ValueError(
-            "hitter_props batter_id resolution left too many nulls. "
-            f"source_col={chosen_col} source_non_null_pct={chosen_non_null:.4f} batter_id_null_rate={batter_null_rate:.4f}"
-        )
-
-    return out, chosen_col, chosen_non_null
 
 
 def _moneyline_side_offense_features(batter_roll: pd.DataFrame, spine: pd.DataFrame) -> pd.DataFrame:
