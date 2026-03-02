@@ -257,12 +257,22 @@ def build_marts(
                 mart_df = mart_df.merge(batter_ids.drop_duplicates(), on="game_pk", how="left")
             targets = _load_hitter_targets(dirs["processed_dir"], season)
             if not targets.empty and {"game_pk", "batter_id"}.issubset(mart_df.columns):
-                mart_df = mart_df.merge(targets, on=["game_pk", "batter_id"], how="left", suffixes=("", "_t"))
+                join_keys = ["game_pk", "batter_id"]
+                if "game_date" in targets.columns and "game_date" in mart_df.columns:
+                    join_keys.append("game_date")
+                mart_df = mart_df.merge(targets, on=join_keys, how="left", suffixes=("", "_t"))
                 for c in ["target_hit1p", "target_tb2p", "target_bb1p", "target_rbi1p"]:
                     tc = f"{c}_t"
                     if tc in mart_df.columns:
                         mart_df[c] = pd.to_numeric(mart_df.get(c), errors="coerce").fillna(pd.to_numeric(mart_df[tc], errors="coerce")).astype("Int64")
                         mart_df = mart_df.drop(columns=[tc])
+                logging.info(
+                    "hitter_props target null rates hit=%.4f tb=%.4f rbi=%.4f bb=%.4f",
+                    float(mart_df["target_hit1p"].isna().mean()) if "target_hit1p" in mart_df.columns and len(mart_df) else 0.0,
+                    float(mart_df["target_tb2p"].isna().mean()) if "target_tb2p" in mart_df.columns and len(mart_df) else 0.0,
+                    float(mart_df["target_rbi1p"].isna().mean()) if "target_rbi1p" in mart_df.columns and len(mart_df) else 0.0,
+                    float(mart_df["target_bb1p"].isna().mean()) if "target_bb1p" in mart_df.columns and len(mart_df) else 0.0,
+                )
 
         elif filename == "pitcher_props_features.parquet":
             pt = _read_target_file(dirs["processed_dir"], "pitcher_props", season, ["game_pk", "pitcher_id", "target_k", "target_outs", "target_er", "target_bb"])
