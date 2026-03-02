@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.dataset as ds
 
 from src.parks.park_identity import load_park_overrides, resolve_park_for_game
 from src.utils.checks import print_rowcount, require_columns
@@ -440,12 +441,21 @@ def _populate_starter_ids_from_events(model_spine: pd.DataFrame, processed_dir: 
         "pitch_seq",
         "pitch_index",
     ]
-    try:
-        events = pd.read_parquet(source_path, columns=needed_cols)
-    except Exception:
-        events = pd.read_parquet(source_path)
-        keep = [c for c in needed_cols if c in events.columns]
-        events = events[keep].copy() if keep else events
+    dataset = ds.dataset(source_path, format="parquet")
+    available_cols = set(dataset.schema.names)
+    keep = [c for c in needed_cols if c in available_cols]
+    events = dataset.to_table(columns=keep).to_pandas() if keep else pd.DataFrame()
+
+    if "mlbam_pitcher_id" not in events.columns:
+        if "pitcher_id" in events.columns:
+            events["mlbam_pitcher_id"] = events["pitcher_id"]
+        elif "pitcher" in events.columns:
+            events["mlbam_pitcher_id"] = events["pitcher"]
+    if "mlbam_batter_id" not in events.columns:
+        if "batter_id" in events.columns:
+            events["mlbam_batter_id"] = events["batter_id"]
+        elif "batter" in events.columns:
+            events["mlbam_batter_id"] = events["batter"]
 
     logging.info("starter mapping events source=%s rows_loaded=%s", source_path.resolve(), len(events))
 
