@@ -305,52 +305,25 @@ def build_marts(
 
             mart_df["game_pk"] = pd.to_numeric(mart_df["game_pk"], errors="coerce").astype("Int64")
 
-            # Ensure hitter_props mart is batter-game grain using batter rolling IDs when needed.
-            hitter_key_df = pd.DataFrame()
-            for candidate in ["batter_id", "batter", "mlbam_batter_id", "player_id", "hitter_id", "id"]:
-                if candidate in batter_roll.columns:
-                    hitter_key_df = batter_roll[["game_pk", candidate]].rename(columns={candidate: "batter_id"}).copy()
-                    break
+            # Hitter props mart MUST be batter-game grain.
+            # Use targets as the authoritative key set (game_pk, batter_id).
+            targets = _load_hitter_targets(dirs["processed_dir"], season)
+            if targets.empty:
+                raise ValueError(f"hitter_props targets empty for season={season}")
 
-            if not hitter_key_df.empty:
-                hitter_key_df["game_pk"] = pd.to_numeric(hitter_key_df["game_pk"], errors="coerce").astype("Int64")
-                hitter_key_df["batter_id"] = pd.to_numeric(hitter_key_df["batter_id"], errors="coerce").astype("Int64")
-                hitter_key_df = hitter_key_df[hitter_key_df["batter_id"].notna()].drop_duplicates()
-                if len(hitter_key_df):
-                    mart_df = mart_df.merge(hitter_key_df, on="game_pk", how="left")
+            targets = targets.copy()
+            targets["game_pk"] = pd.to_numeric(targets["game_pk"], errors="coerce").astype("Int64")
+            targets["batter_id"] = pd.to_numeric(targets["batter_id"], errors="coerce").astype("Int64")
+            targets_keys = targets[["game_pk", "batter_id"]].drop_duplicates()
 
-            # --- DEBUG: batter id presence before resolve ---
-            cols = list(mart_df.columns)
-            cand = [
-                c for c in cols
-                if any(k in c.lower() for k in ["batter", "player", "mlbam", "hitter"])
-                and ("id" in c.lower() or "batter" in c.lower())
-            ]
-            cand = sorted(set(cand))
-            print("DEBUG[hitter_props] candidate id cols:", cand[:50])
-            for c in cand[:50]:
-                try:
-                    nn = int(pd.to_numeric(mart_df[c], errors="coerce").notna().sum())
-                except Exception:
-                    nn = int(mart_df[c].notna().sum())
-                print(f"DEBUG[hitter_props] {c}: non_null={nn} dtype={mart_df[c].dtype}")
-
-            # --- COALESCE: if batter_id exists but is empty, try to fill from common merge artifacts ---
+            # Prevent any feature-side batter_id column from overwriting the target key.
             if "batter_id" in mart_df.columns:
-                bid_nn = int(pd.to_numeric(mart_df["batter_id"], errors="coerce").notna().sum())
-            else:
-                bid_nn = 0
+                mart_df = mart_df.drop(columns=["batter_id"])
 
-            if bid_nn == 0:
-                for alt in ["batter_id_x", "batter_id_y", "mlbam_batter_id", "batter", "player_id"]:
-                    if alt in mart_df.columns:
-                        ser = pd.to_numeric(mart_df[alt], errors="coerce")
-                        if int(ser.notna().sum()) > 0:
-                            mart_df["batter_id"] = ser.round(0).astype("Int64")
-                            print(f"DEBUG[hitter_props] filled batter_id from {alt}")
-                            break
-
-            mart_df, source_col, source_non_null = _resolve_batter_id(mart_df)
+            # If the feature frame is only game-grain, broadcast onto all batters in that game.
+            # If it already has batter_id elsewhere, you can later tighten this to a 2-key merge.
+            mart_df = targets_keys.merge(mart_df, on=["game_pk"], how="left")
+            source_col, source_non_null = "targets:batter_id", 1.0
 
             logging.info(
                 "hitter_props mart keys before target merge: game_pk dtype=%s batter dtype=%s batter_id dtype=%s mlbam_batter_id dtype=%s",
