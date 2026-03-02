@@ -52,12 +52,22 @@ def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 
+def _load_pitcher_prop_targets(processed_dir: Path, season: int) -> pd.DataFrame:
+    """Authoritative pitcher-game targets built by scripts/build_targets_pitcher_props.py."""
+    t_path = processed_dir / "targets" / "pitcher_props" / f"targets_pitcher_props_{season}.parquet"
+    t = read_parquet(
+        t_path,
+        columns=["game_pk", "pitcher_id", "target_k", "target_outs", "target_er", "target_bb"],
+    ).copy()
+    t["game_pk"] = pd.to_numeric(t["game_pk"], errors="coerce").astype("Int64")
+    t["pitcher_id"] = pd.to_numeric(t["pitcher_id"], errors="coerce").astype("Int64")
+    t = t.dropna(subset=["game_pk", "pitcher_id"]).drop_duplicates(subset=["game_pk", "pitcher_id"])
+    return t
+
+
 def build_pitcher_game_features(dirs: dict[str, Path], season: int) -> Path:
     rolling_path = dirs["processed_dir"] / "pitcher_game_rolling.parquet"
     pg_path = dirs["processed_dir"] / "by_season" / f"pitcher_game_{season}.parquet"
-    season_pa_path = dirs["processed_dir"] / "by_season" / f"pa_{season}.parquet"
-    events_dir = dirs["processed_dir"] / "events_pa"
-    events_file = dirs["processed_dir"] / "events_pa.parquet"
 
     if not rolling_path.exists():
         raise FileNotFoundError(f"Missing pitcher rolling features: {rolling_path.resolve()}")
@@ -78,103 +88,26 @@ def build_pitcher_game_features(dirs: dict[str, Path], season: int) -> Path:
     roll["pitcher_id"] = pd.to_numeric(roll["pitcher_id"], errors="coerce").astype("Int64")
     roll["game_pk"] = pd.to_numeric(roll["game_pk"], errors="coerce").astype("Int64")
 
-    target_df = pd.DataFrame(columns=["game_pk", "pitcher_id", "target_k", "target_outs"])
-
-    if pg_path.exists():
-        pg = read_parquet(pg_path)
-        pg_pitcher_col = _pick_col(pg, _PITCHER_ID_CANDIDATES)
-        if pg_pitcher_col is not None and "game_pk" in pg.columns:
-            k_col = _pick_col(pg, _K_CANDIDATES)
-            outs_col = _pick_col(pg, _OUTS_CANDIDATES)
-            logging.info("pitcher_game target source cols: k=%s outs=%s", k_col, outs_col)
-            target_df = pg[["game_pk", pg_pitcher_col] + [c for c in [k_col, outs_col] if c is not None]].copy()
-            target_df = target_df.rename(columns={pg_pitcher_col: "pitcher_id"})
-            target_df["game_pk"] = pd.to_numeric(target_df["game_pk"], errors="coerce").astype("Int64")
-            target_df["pitcher_id"] = pd.to_numeric(target_df["pitcher_id"], errors="coerce").astype("Int64")
-            target_df["target_k"] = pd.to_numeric(target_df[k_col], errors="coerce") if k_col else pd.NA
-            target_df["target_outs"] = pd.to_numeric(target_df[outs_col], errors="coerce") if outs_col else pd.NA
-            target_df = target_df[["game_pk", "pitcher_id", "target_k", "target_outs"]]
-
-    k_agg = pd.DataFrame(columns=["game_pk", "pitcher_id", "target_k_events"])
-    outs_agg = pd.DataFrame(columns=["game_pk", "pitcher_id", "target_outs_events"])
-
-    ev: pd.DataFrame | None = None
-    if season_pa_path.exists():
-        pa_cols = ["game_pk", "pitcher_id", "pitcher", "events", "event_type", "outs_when_up"]
-        logging.info("pitcher_game targets loading PA from by_season file: %s", season_pa_path.resolve())
-        ev = read_parquet(season_pa_path, columns=pa_cols)
-    else:
-        fallback_path = events_dir if events_dir.exists() else events_file
-        if fallback_path.exists():
-            pa_cols = ["game_pk", "pitcher_id", "pitcher", "events", "event_type", "game_date", "outs_when_up"]
-            logging.info("pitcher_game targets loading PA from fallback path: %s", fallback_path.resolve())
-            ev = read_parquet(fallback_path, columns=pa_cols, filters=[("season", "=", season)])
-
-    if ev is not None and not ev.empty:
-        ev_pitcher_col = "pitcher_id" if "pitcher_id" in ev.columns else ("pitcher" if "pitcher" in ev.columns else None)
-        event_col = "events" if "events" in ev.columns else ("event_type" if "event_type" in ev.columns else None)
-        if ev_pitcher_col is not None and "game_pk" in ev.columns and event_col is not None:
-            cols = ["game_pk", ev_pitcher_col, event_col] + (["game_date"] if "game_date" in ev.columns else [])
-            ev = ev[cols].copy()
-            ev["game_pk"] = pd.to_numeric(ev["game_pk"], errors="coerce").astype("Int64")
-            ev["pitcher_id"] = pd.to_numeric(ev[ev_pitcher_col], errors="coerce").astype("Int64")
-            if "game_date" in ev.columns:
-                ev["game_date"] = pd.to_datetime(ev["game_date"], errors="coerce")
-                ev = ev[ev["game_date"].dt.year == season].copy()
-
-            lower_events = ev[event_col].astype(str).str.lower()
-            k_pa = lower_events.isin(_STRIKEOUT_EVENTS).astype("int16")
-            k_agg = (
-                ev.assign(_k=k_pa)
-                .groupby(["game_pk", "pitcher_id"], as_index=False)["_k"]
-                .sum()
-                .rename(columns={"_k": "target_k_events"})
-            )
-
-            outs_pa = _outs_from_events(lower_events)
-            outs_agg = (
-                ev.assign(_outs=outs_pa)
-                .groupby(["game_pk", "pitcher_id"], as_index=False)["_outs"]
-                .sum()
-                .rename(columns={"_outs": "target_outs_events"})
-            )
-
-    if "target_outs" in target_df.columns and target_df["target_outs"].isna().all() and outs_agg.empty:
-        logging.warning("pitcher_game targets missing outs source; target_outs will be NA")
-
-    out = roll.merge(target_df, on=["game_pk", "pitcher_id"], how="left")
-
-    if not k_agg.empty:
-        out = out.merge(k_agg, on=["game_pk", "pitcher_id"], how="left")
-        out["target_k"] = pd.to_numeric(out["target_k_events"], errors="coerce")
-        out = out.drop(columns=["target_k_events"])
-    out["target_k"] = pd.to_numeric(out.get("target_k"), errors="coerce")
-
-    if not outs_agg.empty:
-        out = out.merge(outs_agg, on=["game_pk", "pitcher_id"], how="left")
-        out["target_outs"] = pd.to_numeric(out.get("target_outs"), errors="coerce").fillna(
-            pd.to_numeric(out["target_outs_events"], errors="coerce")
-        )
-        out = out.drop(columns=["target_outs_events"])
-    out["target_outs"] = pd.to_numeric(out["target_outs"], errors="coerce")
+    out = roll.copy()
 
     out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
     out["pitcher_id"] = pd.to_numeric(out["pitcher_id"], errors="coerce").astype("Int64")
     out["season"] = int(season)
 
-    t_path = Path(dirs["processed_dir"]) / "targets" / "pitcher_props" / f"targets_pitcher_props_{season}.parquet"
-    if t_path.exists():
-        t = read_parquet(
-            t_path,
-            columns=["game_pk", "pitcher_id", "target_k", "target_outs", "target_er", "target_bb"],
-        )
-        t["game_pk"] = pd.to_numeric(t["game_pk"], errors="coerce").astype("Int64")
-        t["pitcher_id"] = pd.to_numeric(t["pitcher_id"], errors="coerce").astype("Int64")
-        out = out.drop(columns=[c for c in ["target_k", "target_outs", "target_er", "target_bb"] if c in out.columns])
-        out = out.merge(t, on=["game_pk", "pitcher_id"], how="left")
-        out = out[out["target_k"].notna()].copy()
-    else:
-        logging.warning("Missing pitcher props targets for season=%s at %s", season, t_path.resolve())
+    targets = _load_pitcher_prop_targets(Path(dirs["processed_dir"]), season)
+    before = len(out)
+    out = out.merge(targets, on=["game_pk", "pitcher_id"], how="left")
+    labeled = int(out["target_k"].notna().sum()) if "target_k" in out.columns else 0
+    logging.info(
+        "pitcher_game_features target merge: rows_before=%s rows_after=%s labeled=%s labeled_pct=%.4f target_k_mean=%.4f",
+        before,
+        len(out),
+        labeled,
+        (labeled / len(out)) if len(out) else 0.0,
+        float(pd.to_numeric(out["target_k"], errors="coerce").mean()) if "target_k" in out.columns and len(out) else 0.0,
+    )
+    out = out[out["target_k"].notna()].copy()
+    out = out.dropna(subset=["game_pk", "pitcher_id"]).copy()
 
     k_series = pd.to_numeric(out["target_k"], errors="coerce")
     k_null = float(k_series.isna().mean()) if len(out) else 0.0
