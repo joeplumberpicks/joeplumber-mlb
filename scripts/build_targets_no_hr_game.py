@@ -43,10 +43,22 @@ def main() -> None:
     log_header("scripts/build_targets_no_hr_game.py", repo_root, config_path, dirs)
 
     spine = read_parquet(dirs["processed_dir"] / "model_spine_game.parquet")
-    events = read_parquet(dirs["processed_dir"] / "events_pa.parquet")
+    pa_path_primary = dirs["processed_dir"] / "by_season" / f"pa_{args.season}.parquet"
+    pa_path_fallback = dirs["processed_dir"] / "events_pa.parquet"
+    if pa_path_primary.exists():
+        pa_path = pa_path_primary
+    elif pa_path_fallback.is_file():
+        pa_path = pa_path_fallback
+    else:
+        raise FileNotFoundError(
+            "No PA source found for no-HR target build. "
+            f"Tried: {pa_path_primary.resolve()} and {pa_path_fallback.resolve()}"
+        )
+
+    events = read_parquet(pa_path)
 
     if "game_pk" not in spine.columns or "game_pk" not in events.columns:
-        raise ValueError("game_pk required in both spine and events_pa")
+        raise ValueError(f"game_pk required in both spine and PA source ({pa_path.resolve()})")
 
     spine = spine.copy()
     spine["game_pk"] = pd.to_numeric(spine["game_pk"], errors="coerce").astype("Int64")
@@ -60,12 +72,16 @@ def main() -> None:
     events["game_pk"] = pd.to_numeric(events["game_pk"], errors="coerce").astype("Int64")
     ev_col = _pick(events, ["events", "event_type"])
     if ev_col is None:
-        raise ValueError(f"events_pa missing events/event_type column. cols={sorted(events.columns)}")
+        raise ValueError(f"PA source missing events/event_type column. cols={sorted(events.columns)} file={pa_path.resolve()}")
 
     ev = events[ev_col].astype(str).str.lower()
-    hr = events.loc[ev == "home_run", ["game_pk"]].copy()
-    hr["_hr"] = 1
-    total_hr = hr.groupby("game_pk", dropna=False)["_hr"].sum().reset_index(name="total_hr")
+    hr_mask = ev.isin(["home_run", "home run", "hr"])
+    total_hr = (
+        hr_mask.astype(int)
+        .groupby(events["game_pk"], dropna=False)
+        .sum()
+        .reset_index(name="total_hr")
+    )
 
     out = spine[[c for c in ["game_pk", "game_date"] if c in spine.columns]].drop_duplicates(subset=["game_pk"]).copy()
     out = out.merge(total_hr, on="game_pk", how="left")
@@ -81,13 +97,14 @@ def main() -> None:
         write_parquet(out, out_path)
 
     logging.info(
-        "targets_no_hr_game rows=%s unique_games=%s date_min=%s date_max=%s no_hr_rate=%.4f null_rate=%.4f path=%s",
+        "targets_no_hr_game rows=%s unique_games=%s date_min=%s date_max=%s no_hr_rate=%.4f null_rate=%.4f pa_path=%s path=%s",
         len(out),
         int(out["game_pk"].nunique()) if "game_pk" in out.columns else 0,
         pd.to_datetime(out.get("game_date"), errors="coerce").min() if len(out) else pd.NaT,
         pd.to_datetime(out.get("game_date"), errors="coerce").max() if len(out) else pd.NaT,
         float(pd.to_numeric(out["no_hr_game"], errors="coerce").mean()) if len(out) else 0.0,
         float(out["no_hr_game"].isna().mean()) if len(out) else 0.0,
+        pa_path.resolve(),
         out_path.resolve(),
     )
     print(f"targets_no_hr_game -> {out_path.resolve()}")
