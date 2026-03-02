@@ -399,22 +399,39 @@ def build_marts(
                         f"target_key_head={target_keys.head(5).to_dict('records')}"
                     )
         elif filename == "pitcher_props_features.parquet":
-            pt = _read_target_file(dirs["processed_dir"], "pitcher_props", season, ["game_pk", "pitcher_id", "target_k", "target_outs", "target_er", "target_bb"])
-            if not pt.empty:
-                if "pitcher_id" in pitcher_roll.columns:
-                    pid = pitcher_roll[["game_pk", "pitcher_id"]].drop_duplicates()
-                elif "pitcher" in pitcher_roll.columns:
-                    pid = pitcher_roll[["game_pk", "pitcher"]].rename(columns={"pitcher": "pitcher_id"}).drop_duplicates()
-                else:
-                    pid = pd.DataFrame(columns=["game_pk", "pitcher_id"])
-                if not pid.empty:
-                    mart_df = mart_df.merge(pid, on="game_pk", how="left")
-                    mart_df = mart_df.merge(pt, on=["game_pk", "pitcher_id"], how="left", suffixes=("", "_t"))
-                    for c in ["target_k", "target_outs", "target_er", "target_bb"]:
-                        tc=f"{c}_t"
-                        if tc in mart_df.columns:
-                            mart_df[c]=pd.to_numeric(mart_df.get(c), errors="coerce").fillna(pd.to_numeric(mart_df[tc], errors="coerce"))
-                            mart_df = mart_df.drop(columns=[tc])
+            # Pitcher props mart MUST be pitcher-game grain.
+            # Use targets as the authoritative key set (game_pk, pitcher_id).
+            pt = _read_target_file(
+                dirs["processed_dir"],
+                "pitcher_props",
+                season,
+                ["game_pk", "pitcher_id", "target_k", "target_outs", "target_er", "target_bb"],
+            )
+            if pt.empty:
+                raise ValueError(f"pitcher_props targets empty for season={season}")
+
+            pt = pt.copy()
+            pt["game_pk"] = pd.to_numeric(pt["game_pk"], errors="coerce").astype("Int64")
+            pt["pitcher_id"] = pd.to_numeric(pt["pitcher_id"], errors="coerce").astype("Int64")
+            pt_keys = pt[["game_pk", "pitcher_id"]].drop_duplicates()
+
+            # Prevent any feature-side pitcher_id from overwriting the target key.
+            if "pitcher_id" in mart_df.columns:
+                mart_df = mart_df.drop(columns=["pitcher_id"])
+
+            # Broadcast game-level pitcher features onto all pitchers for that game,
+            # then attach pitcher-game targets.
+            mart_df = pt_keys.merge(mart_df, on=["game_pk"], how="left")
+            mart_df = mart_df.merge(
+                pt[["game_pk", "pitcher_id", "target_k", "target_outs", "target_er", "target_bb"]],
+                on=["game_pk", "pitcher_id"],
+                how="left",
+            )
+
+            # Ensure consistent dtypes (validator expects these columns to exist)
+            for c in ["target_k", "target_outs", "target_er", "target_bb"]:
+                if c in mart_df.columns:
+                    mart_df[c] = pd.to_numeric(mart_df[c], errors="coerce").astype("Int64")
 
         mart_df = _filter_to_season(mart_df, season)
         mart_df = _apply_date_range(mart_df, start, end)
