@@ -64,18 +64,37 @@ def main() -> None:
     pa.loc[ev.isin(three), "_outs"] = 3
 
     er_col = _pick(pa, ["earned_runs", "er", "pitcher_er"])
-    if er_col is None:
-        pa["_er"] = pd.NA
-        logging.warning("ER column missing in PA; target_er will be null")
-    else:
+    target_er_mode = "er_col"
+    if er_col is not None:
         pa["_er"] = pd.to_numeric(pa[er_col], errors="coerce")
+    else:
+        pa["_er"] = pd.NA
 
-    agg = pa.groupby(["game_pk", "pitcher_id"], dropna=False).agg(
+    # Fallback: if ER missing (or effectively all null), derive runs-allowed proxy from score delta
+    if er_col is None or float(pa["_er"].isna().mean()) >= 0.999:
+        bat_score_col = _pick(pa, ["bat_score"])
+        post_bat_score_col = _pick(pa, ["post_bat_score"])
+        if bat_score_col is None or post_bat_score_col is None:
+            logging.warning("ER column missing in PA AND bat_score/post_bat_score missing; target_er will be null")
+        else:
+            bat = pd.to_numeric(pa[bat_score_col], errors="coerce")
+            post = pd.to_numeric(pa[post_bat_score_col], errors="coerce")
+            pa["_runs_on_play"] = (post - bat).clip(lower=0).fillna(0)
+            target_er_mode = "score_delta_runs_allowed_proxy"
+
+    gb = pa.groupby(["game_pk", "pitcher_id"], dropna=False)
+    agg = gb.agg(
         target_k=("_k", "sum"),
         target_outs=("_outs", "sum"),
         target_bb=("_bb", "sum"),
-        target_er=("_er", "max"),
     ).reset_index()
+
+    if target_er_mode == "score_delta_runs_allowed_proxy":
+        er_df = gb["_runs_on_play"].sum().reset_index().rename(columns={"_runs_on_play": "target_er"})
+        agg = agg.merge(er_df, on=["game_pk", "pitcher_id"], how="left")
+    else:
+        er_df = gb["_er"].max().reset_index().rename(columns={"_er": "target_er"})
+        agg = agg.merge(er_df, on=["game_pk", "pitcher_id"], how="left")
 
     meta_cols = [c for c in ["game_pk", "game_date"] if c in pa.columns]
     meta = pa[meta_cols].drop_duplicates(subset=["game_pk"]) if "game_pk" in meta_cols else pd.DataFrame(columns=["game_pk"])
@@ -97,6 +116,7 @@ def main() -> None:
         float(out["target_bb"].isna().mean()) if len(out) else 0.0,
         out_path.resolve(),
     )
+    logging.info("target_er_mode=%s", target_er_mode)
     print(f"targets_pitcher_props -> {out_path.resolve()}")
 
 
