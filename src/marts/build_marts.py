@@ -319,6 +319,37 @@ def build_marts(
                 if len(hitter_key_df):
                     mart_df = mart_df.merge(hitter_key_df, on="game_pk", how="left")
 
+            # --- DEBUG: batter id presence before resolve ---
+            cols = list(mart_df.columns)
+            cand = [
+                c for c in cols
+                if any(k in c.lower() for k in ["batter", "player", "mlbam", "hitter"])
+                and ("id" in c.lower() or "batter" in c.lower())
+            ]
+            cand = sorted(set(cand))
+            print("DEBUG[hitter_props] candidate id cols:", cand[:50])
+            for c in cand[:50]:
+                try:
+                    nn = int(pd.to_numeric(mart_df[c], errors="coerce").notna().sum())
+                except Exception:
+                    nn = int(mart_df[c].notna().sum())
+                print(f"DEBUG[hitter_props] {c}: non_null={nn} dtype={mart_df[c].dtype}")
+
+            # --- COALESCE: if batter_id exists but is empty, try to fill from common merge artifacts ---
+            if "batter_id" in mart_df.columns:
+                bid_nn = int(pd.to_numeric(mart_df["batter_id"], errors="coerce").notna().sum())
+            else:
+                bid_nn = 0
+
+            if bid_nn == 0:
+                for alt in ["batter_id_x", "batter_id_y", "mlbam_batter_id", "batter", "player_id"]:
+                    if alt in mart_df.columns:
+                        ser = pd.to_numeric(mart_df[alt], errors="coerce")
+                        if int(ser.notna().sum()) > 0:
+                            mart_df["batter_id"] = ser.round(0).astype("Int64")
+                            print(f"DEBUG[hitter_props] filled batter_id from {alt}")
+                            break
+
             mart_df, source_col, source_non_null = _resolve_batter_id(mart_df)
 
             logging.info(
