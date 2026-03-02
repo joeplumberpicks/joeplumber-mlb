@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -155,6 +156,77 @@ def _load_hitter_targets(processed_dir: Path, season: int | None) -> pd.DataFram
     return df[need].copy()
 
 
+def _candidate_id_columns(df: pd.DataFrame) -> list[str]:
+    cols: list[str] = []
+    for c in df.columns:
+        cl = c.lower()
+        if (
+            any(k in cl for k in ["batter", "hitter", "player", "mlbam"])
+            or cl.endswith("_id")
+        ):
+            cols.append(c)
+    return cols
+
+
+def _resolve_batter_id(hitter: pd.DataFrame) -> tuple[pd.DataFrame, str, float]:
+    out = hitter.copy()
+    candidate_cols = _candidate_id_columns(out)
+    logging.info("hitter_props id-like columns: %s", candidate_cols)
+
+    preferred = ["batter_id", "batter", "mlbam_batter_id", "mlbam_id", "player_id", "hitter_id", "bat_id", "id"]
+    score: list[tuple[float, str, pd.Series]] = []
+
+    def _append_score(col: str) -> None:
+        if col not in out.columns:
+            return
+        s = pd.to_numeric(out[col], errors="coerce")
+        nn = float(s.notna().mean()) if len(s) else 0.0
+        score.append((nn, col, s))
+
+    for c in preferred:
+        _append_score(c)
+
+    regex_cols = [
+        c for c in out.columns
+        if re.search(r"(^|_)batter(_|$)", c, flags=re.IGNORECASE)
+        or re.search(r"(^|_)hitter(_|$)", c, flags=re.IGNORECASE)
+        or re.search(r"(^|_)player(_|$)", c, flags=re.IGNORECASE)
+    ]
+    for c in regex_cols:
+        if c not in preferred:
+            _append_score(c)
+
+    if not score:
+        raise ValueError("hitter_props_features missing batter identifier; check upstream feature build to include batter/player id")
+
+    # priority first, then non-null rate; treat all-null batter_id as missing by >=1% threshold check
+    preferred_rank = {c: i for i, c in enumerate(preferred)}
+    score.sort(key=lambda t: (preferred_rank.get(t[1], 10_000), -t[0]))
+    chosen_non_null = 0.0
+    chosen_col = ""
+    chosen_series = pd.Series(pd.NA, index=out.index, dtype="float64")
+    for nn, col, series in score:
+        if nn >= 0.01:
+            chosen_non_null = nn
+            chosen_col = col
+            chosen_series = series
+            break
+
+    if not chosen_col:
+        raise ValueError("hitter_props_features missing batter identifier; check upstream feature build to include batter/player id")
+
+    out["batter_id"] = chosen_series.astype("Int64")
+    out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
+    logging.info(
+        "hitter_props batter_id source_col=%s source_non_null_pct=%.4f batter_id_null_rate=%.4f sample=%s",
+        chosen_col,
+        chosen_non_null,
+        float(out["batter_id"].isna().mean()) if len(out) else 1.0,
+        out[["game_pk", chosen_col, "batter_id"]].head(10).to_dict("records") if chosen_col in out.columns else [],
+    )
+    return out, chosen_col, chosen_non_null
+
+
 def _moneyline_side_offense_features(batter_roll: pd.DataFrame, spine: pd.DataFrame) -> pd.DataFrame:
     if batter_roll.empty or spine.empty:
         return spine
@@ -247,31 +319,26 @@ def build_marts(
                         mart_df[c] = pd.to_numeric(mart_df.get(c), errors="coerce").fillna(pd.to_numeric(mart_df[tc], errors="coerce")).astype("Int64")
                         mart_df = mart_df.drop(columns=[tc])
         elif filename == "hitter_props_features.parquet":
-            # Ensure mart-side batter key exists as batter_id with consistent dtype.
-            if "batter_id" not in mart_df.columns:
-                if "batter" in mart_df.columns:
-                    mart_df["batter_id"] = mart_df["batter"]
-                elif "mlbam_batter_id" in mart_df.columns:
-                    mart_df["batter_id"] = mart_df["mlbam_batter_id"]
+            if "game_pk" not in mart_df.columns:
+                raise ValueError("hitter_props_features missing game_pk")
 
-            if "batter_id" not in mart_df.columns:
-                if "batter_id" in batter_roll.columns:
-                    batter_ids = batter_roll[["game_pk", "batter_id"]].copy()
-                elif "batter" in batter_roll.columns:
-                    batter_ids = batter_roll[["game_pk", "batter"]].rename(columns={"batter": "batter_id"})
-                else:
-                    batter_ids = pd.DataFrame(columns=["game_pk", "batter_id"])
+            mart_df["game_pk"] = pd.to_numeric(mart_df["game_pk"], errors="coerce").astype("Int64")
 
-                if not batter_ids.empty:
-                    batter_ids["game_pk"] = pd.to_numeric(batter_ids["game_pk"], errors="coerce").astype("Int64")
-                    batter_ids["batter_id"] = pd.to_numeric(batter_ids["batter_id"], errors="coerce").astype("Int64")
-                    mart_df["game_pk"] = pd.to_numeric(mart_df["game_pk"], errors="coerce").astype("Int64")
-                    mart_df = mart_df.merge(batter_ids.drop_duplicates(), on="game_pk", how="left")
+            # Ensure hitter_props mart is batter-game grain using batter rolling IDs when needed.
+            hitter_key_df = pd.DataFrame()
+            for candidate in ["batter_id", "batter", "mlbam_batter_id", "player_id", "hitter_id", "id"]:
+                if candidate in batter_roll.columns:
+                    hitter_key_df = batter_roll[["game_pk", candidate]].rename(columns={candidate: "batter_id"}).copy()
+                    break
 
-            if "batter_id" in mart_df.columns:
-                mart_df["batter_id"] = pd.to_numeric(mart_df["batter_id"], errors="coerce").astype("Int64")
-            if "game_pk" in mart_df.columns:
-                mart_df["game_pk"] = pd.to_numeric(mart_df["game_pk"], errors="coerce").astype("Int64")
+            if not hitter_key_df.empty:
+                hitter_key_df["game_pk"] = pd.to_numeric(hitter_key_df["game_pk"], errors="coerce").astype("Int64")
+                hitter_key_df["batter_id"] = pd.to_numeric(hitter_key_df["batter_id"], errors="coerce").astype("Int64")
+                hitter_key_df = hitter_key_df[hitter_key_df["batter_id"].notna()].drop_duplicates()
+                if len(hitter_key_df):
+                    mart_df = mart_df.merge(hitter_key_df, on="game_pk", how="left")
+
+            mart_df, source_col, source_non_null = _resolve_batter_id(mart_df)
 
             logging.info(
                 "hitter_props mart keys before target merge: game_pk dtype=%s batter dtype=%s batter_id dtype=%s mlbam_batter_id dtype=%s",
@@ -331,10 +398,18 @@ def build_marts(
                 if match_rate < 0.90:
                     raise ValueError(
                         "hitter_props target merge low match rate. "
+                        f"chosen_source_col={source_col} source_non_null_pct={source_non_null:.4f} "
                         f"hitter_game_pk_dtype={mart_df['game_pk'].dtype if 'game_pk' in mart_df.columns else 'missing'} "
                         f"hitter_batter_key=batter_id dtype={mart_df['batter_id'].dtype if 'batter_id' in mart_df.columns else 'missing'} "
                         f"target_game_pk_dtype={targets['game_pk'].dtype if 'game_pk' in targets.columns else 'missing'} "
                         f"target_batter_key=batter_id dtype={targets['batter_id'].dtype if 'batter_id' in targets.columns else 'missing'} "
+                        f"hitter_key_head={hitter_keys.head(5).to_dict('records')} "
+                        f"target_key_head={target_keys.head(5).to_dict('records')}"
+                    )
+                if overlap_n == 0:
+                    raise ValueError(
+                        "hitter_props target merge has zero overlapping keys. "
+                        f"chosen_source_col={source_col} source_non_null_pct={source_non_null:.4f} "
                         f"hitter_key_head={hitter_keys.head(5).to_dict('records')} "
                         f"target_key_head={target_keys.head(5).to_dict('records')}"
                     )
