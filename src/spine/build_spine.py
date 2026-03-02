@@ -406,180 +406,116 @@ def _normalize_team_for_match(val: object) -> str:
 
 
 def _populate_starter_ids_from_events(model_spine: pd.DataFrame, processed_dir: Path) -> pd.DataFrame:
-    events_file = processed_dir / "events_pa.parquet"
-    events_dir = processed_dir / "events_pa"
-
-    source_path: Path | None = None
-    if events_file.exists():
-        source_path = events_file
-    elif events_dir.exists():
-        source_path = events_dir
-    else:
-        logging.warning("events_pa source not found at %s or %s; starter IDs will remain as-is", events_file, events_dir)
-        return model_spine
-
-    needed_cols = [
-        "game_pk",
-        "season",
-        "game_date",
-        "game_year",
-        "pitcher",
-        "pitcher_id",
-        "mlbam_pitcher_id",
-        "player_id",
-        "pitching_team",
-        "defense_team",
-        "fielding_team",
-        "inning",
-        "inning_topbot",
-        "topbot",
-        "inning_half",
-        "home_team",
-        "away_team",
-        "pitch_number",
-        "pitch_num",
-        "pitch_seq",
-        "pitch_index",
-    ]
-    dataset = ds.dataset(source_path, format="parquet")
-    available_cols = set(dataset.schema.names)
-    keep = [c for c in needed_cols if c in available_cols]
-    events = dataset.to_table(columns=keep).to_pandas() if keep else pd.DataFrame()
-
-    if "mlbam_pitcher_id" not in events.columns:
-        if "pitcher_id" in events.columns:
-            events["mlbam_pitcher_id"] = events["pitcher_id"]
-        elif "pitcher" in events.columns:
-            events["mlbam_pitcher_id"] = events["pitcher"]
-    if "mlbam_batter_id" not in events.columns:
-        if "batter_id" in events.columns:
-            events["mlbam_batter_id"] = events["batter_id"]
-        elif "batter" in events.columns:
-            events["mlbam_batter_id"] = events["batter"]
-
-    logging.info("starter mapping events source=%s rows_loaded=%s", source_path.resolve(), len(events))
-
-    if "game_pk" in events.columns and "game_pk" in model_spine.columns:
-        game_pk_set = set(pd.to_numeric(model_spine["game_pk"], errors="coerce").dropna().astype("Int64").tolist())
-        if game_pk_set:
-            events["game_pk"] = pd.to_numeric(events["game_pk"], errors="coerce").astype("Int64")
-            before_filter = len(events)
-            events = events[events["game_pk"].isin(game_pk_set)].copy()
-            logging.info("starter mapping rows after game_pk filter: %s (before=%s)", len(events), before_filter)
-
-    if "season" in model_spine.columns and len(model_spine):
-        spine_seasons = set(pd.to_numeric(model_spine["season"], errors="coerce").dropna().astype(int).tolist())
-        if spine_seasons:
-            before_filter = len(events)
-            if "season" in events.columns:
-                events_season = pd.to_numeric(events["season"], errors="coerce")
-                events = events[events_season.isin(spine_seasons)].copy()
-            elif "game_date" in events.columns:
-                gd = pd.to_datetime(events["game_date"], errors="coerce")
-                events = events[gd.dt.year.isin(spine_seasons)].copy()
-            elif "game_year" in events.columns:
-                gy = pd.to_numeric(events["game_year"], errors="coerce")
-                events = events[gy.isin(spine_seasons)].copy()
-            logging.info("starter mapping rows after season filter: %s (before=%s seasons=%s)", len(events), before_filter, sorted(spine_seasons))
-
-    if events.empty:
-        logging.warning("starter mapping events empty after filtering; starter IDs will remain as-is")
-        return model_spine
-
-    pitcher_col = _pick_optional_column(events, PITCHER_ID_CANDIDATES)
-    pitching_team_col = _pick_optional_column(events, PITCHING_TEAM_CANDIDATES)
-    inning_col = _pick_optional_column(events, INNING_CANDIDATES)
-    inning_half_col = _pick_optional_column(events, INNING_HALF_CANDIDATES)
-    home_team_col = _pick_optional_column(events, ["home_team"])
-    away_team_col = _pick_optional_column(events, ["away_team"])
-
-    can_derive_pitching_team = (
-        inning_half_col is not None and home_team_col is not None and away_team_col is not None
-    )
-    has_required = (
-        pitcher_col is not None
-        and inning_col is not None
-        and "game_pk" in events.columns
-        and (pitching_team_col is not None or can_derive_pitching_team)
-    )
-    if not has_required:
-        logging.warning(
-            "Cannot populate starters from events_pa due to missing columns. pitcher=%s pitching_team=%s inning=%s inning_topbot=%s home_team=%s away_team=%s has_game_pk=%s",
-            pitcher_col,
-            pitching_team_col,
-            inning_col,
-            inning_half_col,
-            home_team_col,
-            away_team_col,
-            "game_pk" in events.columns,
-        )
-        return model_spine
-
-    starter_events = events.copy()
-    if pitching_team_col is None:
-        half = starter_events[inning_half_col].astype(str).str.strip().str.lower()
-        starter_events["__pitching_team"] = np.where(
-            half.str.startswith("top"),
-            starter_events[home_team_col],
-            np.where(half.str.startswith("bot"), starter_events[away_team_col], pd.NA),
-        )
-        pitching_team_col = "__pitching_team"
-    starter_events[pitcher_col] = pd.to_numeric(starter_events[pitcher_col], errors="coerce")
-    starter_events[inning_col] = pd.to_numeric(starter_events[inning_col], errors="coerce")
-    starter_events = starter_events[starter_events[inning_col] == 1]
-    starter_events = starter_events.dropna(subset=[pitcher_col, pitching_team_col, "game_pk"])
-
-    seq_col = _pick_optional_column(starter_events, PITCH_SEQUENCE_CANDIDATES)
-    if seq_col is not None:
-        starter_events = starter_events.sort_values(["game_pk", pitching_team_col, seq_col])
-    starter_events["team_match"] = starter_events[pitching_team_col].map(_normalize_team_for_match)
-
-    starters = (
-        starter_events.groupby(["game_pk", "team_match"], dropna=False)[pitcher_col]
-        .first()
-        .reset_index()
-        .rename(columns={pitcher_col: "starter_pitcher_id"})
-    )
-    team_samples = starter_events[[pitching_team_col, "team_match"]].drop_duplicates().head(5)
+    def _pick_first_pitcher(df: pd.DataFrame) -> pd.Series:
+        sort_cols = [c for c in ["inning", "at_bat_number", "pitch_number"] if c in df.columns]
+        if sort_cols:
+            df = df.sort_values(sort_cols, kind="mergesort")
+        return df.iloc[0]
 
     out = model_spine.copy()
+    if "game_pk" not in out.columns:
+        return out
+
+    out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
     if "home_sp_id" not in out.columns:
         out["home_sp_id"] = pd.NA
     if "away_sp_id" not in out.columns:
         out["away_sp_id"] = pd.NA
 
-    out["home_team_match"] = out["home_team"].map(_normalize_team_for_match)
-    out["away_team_match"] = out["away_team"].map(_normalize_team_for_match)
+    seasons: list[int] = []
+    if "season" in out.columns:
+        seasons = sorted(set(pd.to_numeric(out["season"], errors="coerce").dropna().astype(int).tolist()))
 
-    home_map = out[["game_pk", "home_team_match"]].merge(
-        starters, left_on=["game_pk", "home_team_match"], right_on=["game_pk", "team_match"], how="left"
-    )
-    away_map = out[["game_pk", "away_team_match"]].merge(
-        starters, left_on=["game_pk", "away_team_match"], right_on=["game_pk", "team_match"], how="left"
-    )
+    def _resolve_pa_path(season: int) -> Path | None:
+        p1 = processed_dir / "events_pa.parquet"
+        if p1.exists():
+            return p1
+        p2 = processed_dir / "by_season" / f"pa_{season}.parquet"
+        if p2.exists():
+            return p2
+        p3 = processed_dir.parent / "raw" / "by_season" / f"pa_{season}.parquet"
+        if p3.exists():
+            return p3
+        return None
 
-    home_vals = pd.to_numeric(home_map["starter_pitcher_id"], errors="coerce")
-    away_vals = pd.to_numeric(away_map["starter_pitcher_id"], errors="coerce")
+    if not seasons:
+        logging.warning("starter mapping skipped: no seasons found in model_spine")
+        return out
 
-    home_missing = out["home_sp_id"].isna()
-    away_missing = out["away_sp_id"].isna()
-    out.loc[home_missing, "home_sp_id"] = home_vals[home_missing].values
-    out.loc[away_missing, "away_sp_id"] = away_vals[away_missing].values
+    for season in seasons:
+        pa_path = _resolve_pa_path(int(season))
+        if pa_path is None:
+            logging.warning("starter mapping no PA source for season=%s; tried processed/events_pa.parquet, processed/by_season/pa_%s.parquet, raw/by_season/pa_%s.parquet", season, season, season)
+            continue
 
-    home_null_pct = float(out["home_sp_id"].isna().mean() * 100) if len(out) else 0.0
-    away_null_pct = float(out["away_sp_id"].isna().mean() * 100) if len(out) else 0.0
-    logging.info("event starter rows found: %s", len(starters))
-    logging.info(
-        "starter mapping team samples events=%s spine=%s",
-        team_samples.to_dict("records"),
-        out[["home_team", "home_team_match", "away_team", "away_team_match"]].head(5).to_dict("records"),
-    )
-    logging.info("home_sp_id null %% after events starter mapping: %.2f%%", home_null_pct)
-    logging.info("away_sp_id null %% after events starter mapping: %.2f%%", away_null_pct)
-    if home_null_pct >= 99.9 and away_null_pct >= 99.9:
-        logging.warning("starter mapping produced ~100%% null starter IDs; verify events_pa coverage and columns")
+        dataset = ds.dataset(pa_path, format="parquet")
+        avail = set(dataset.schema.names)
+        keep = [c for c in ["game_pk", "inning_topbot", "inning", "pitcher_id", "pitcher", "at_bat_number", "pitch_number"] if c in avail]
+        if "game_pk" not in keep or "inning_topbot" not in keep:
+            logging.warning("starter mapping PA missing required columns game_pk/inning_topbot source=%s", pa_path.resolve())
+            continue
 
-    out = out.drop(columns=["home_team_match", "away_team_match"], errors="ignore")
+        pa = dataset.to_table(columns=keep).to_pandas()
+        pa["game_pk"] = pd.to_numeric(pa["game_pk"], errors="coerce").astype("Int64")
+
+        if "pitcher_id" in pa.columns:
+            pa["pitcher_id"] = pd.to_numeric(pa["pitcher_id"], errors="coerce").astype("Int64")
+        elif "pitcher" in pa.columns:
+            pa["pitcher_id"] = pd.to_numeric(pa["pitcher"], errors="coerce").astype("Int64")
+        else:
+            logging.warning("starter mapping PA missing pitcher identifier source=%s", pa_path.resolve())
+            continue
+
+        season_games = out.loc[pd.to_numeric(out["season"], errors="coerce") == int(season), "game_pk"].dropna().unique() if "season" in out.columns else out["game_pk"].dropna().unique()
+        if len(season_games):
+            pa = pa[pa["game_pk"].isin(season_games)]
+
+        if "inning" in pa.columns:
+            pa["inning"] = pd.to_numeric(pa["inning"], errors="coerce").astype("Int64")
+            pa1 = pa[pa["inning"] == 1].copy()
+            if len(pa1):
+                pa = pa1
+
+        if pa.empty:
+            continue
+
+        half = pa["inning_topbot"].astype(str).str.lower().str.strip()
+        home_df = pa[half.str.startswith("top")].copy()  # away batting -> home pitching
+        away_df = pa[half.str.startswith("bot")].copy()  # home batting -> away pitching
+
+        if not home_df.empty:
+            home_first = (
+                home_df.groupby("game_pk", as_index=False)
+                .apply(_pick_first_pitcher, include_groups=False)
+                .reset_index(drop=True)[["game_pk", "pitcher_id"]]
+                .rename(columns={"pitcher_id": "home_sp_id_s"})
+            )
+        else:
+            home_first = pd.DataFrame(columns=["game_pk", "home_sp_id_s"])
+
+        if not away_df.empty:
+            away_first = (
+                away_df.groupby("game_pk", as_index=False)
+                .apply(_pick_first_pitcher, include_groups=False)
+                .reset_index(drop=True)[["game_pk", "pitcher_id"]]
+                .rename(columns={"pitcher_id": "away_sp_id_s"})
+            )
+        else:
+            away_first = pd.DataFrame(columns=["game_pk", "away_sp_id_s"])
+
+        starters = home_first.merge(away_first, on="game_pk", how="outer")
+        if starters.empty:
+            continue
+        starters["game_pk"] = pd.to_numeric(starters["game_pk"], errors="coerce").astype("Int64")
+        starters["home_sp_id_s"] = pd.to_numeric(starters.get("home_sp_id_s"), errors="coerce").astype("Int64")
+        starters["away_sp_id_s"] = pd.to_numeric(starters.get("away_sp_id_s"), errors="coerce").astype("Int64")
+
+        out = out.merge(starters, on="game_pk", how="left")
+        out["home_sp_id"] = pd.to_numeric(out["home_sp_id"], errors="coerce").fillna(pd.to_numeric(out.get("home_sp_id_s"), errors="coerce")).astype("Int64")
+        out["away_sp_id"] = pd.to_numeric(out["away_sp_id"], errors="coerce").fillna(pd.to_numeric(out.get("away_sp_id_s"), errors="coerce")).astype("Int64")
+        out = out.drop(columns=["home_sp_id_s", "away_sp_id_s"], errors="ignore")
+
+        logging.info("starter mapping source=%s season=%s starters_rows=%s", pa_path.resolve(), season, len(starters))
 
     return out
 
