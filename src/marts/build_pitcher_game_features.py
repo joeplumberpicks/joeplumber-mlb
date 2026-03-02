@@ -158,8 +158,23 @@ def build_pitcher_game_features(dirs: dict[str, Path], season: int) -> Path:
         out = out.drop(columns=["target_outs_events"])
     out["target_outs"] = pd.to_numeric(out["target_outs"], errors="coerce")
 
-    if "season" not in out.columns:
-        out["season"] = season
+    out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
+    out["pitcher_id"] = pd.to_numeric(out["pitcher_id"], errors="coerce").astype("Int64")
+    out["season"] = int(season)
+
+    t_path = Path(dirs["processed_dir"]) / "targets" / "pitcher_props" / f"targets_pitcher_props_{season}.parquet"
+    if t_path.exists():
+        t = read_parquet(
+            t_path,
+            columns=["game_pk", "pitcher_id", "target_k", "target_outs", "target_er", "target_bb"],
+        )
+        t["game_pk"] = pd.to_numeric(t["game_pk"], errors="coerce").astype("Int64")
+        t["pitcher_id"] = pd.to_numeric(t["pitcher_id"], errors="coerce").astype("Int64")
+        out = out.drop(columns=[c for c in ["target_k", "target_outs", "target_er", "target_bb"] if c in out.columns])
+        out = out.merge(t, on=["game_pk", "pitcher_id"], how="left")
+        out = out[out["target_k"].notna()].copy()
+    else:
+        logging.warning("Missing pitcher props targets for season=%s at %s", season, t_path.resolve())
 
     k_series = pd.to_numeric(out["target_k"], errors="coerce")
     k_null = float(k_series.isna().mean()) if len(out) else 0.0

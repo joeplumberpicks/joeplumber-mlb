@@ -30,7 +30,16 @@ _LEAKY_SAME_GAME_COLS = {
     "launch_angle_mean",
     "launch_angle_max",
 }
-_TARGET_COLS = ["target_hit_1p", "target_tb_2p", "target_rbi_1p", "target_bb_1p"]
+_TARGET_COLS = [
+    "target_hit_1p",
+    "target_tb_2p",
+    "target_rbi_1p",
+    "target_bb_1p",
+    "target_hit1p",
+    "target_tb2p",
+    "target_rbi1p",
+    "target_bb1p",
+]
 _IDENTIFIER_COLS = {
     "game_pk",
     "batter_id",
@@ -217,15 +226,32 @@ def build_hitter_batter_features(dirs: dict[str, Path], season: int) -> Path:
         how="left",
     )
 
-    if "season" not in out.columns:
-        out["season"] = season
+    # --- ensure keys + season ---
+    out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
+    out["batter_id"] = pd.to_numeric(out["batter_id"], errors="coerce").astype("Int64")
+    out["season"] = int(season)
+
+    # --- merge hitter targets (authoritative) ---
+    t_path = Path(dirs["processed_dir"]) / "targets" / "hitter_props" / f"targets_hitter_props_{season}.parquet"
+    if t_path.exists():
+        t = read_parquet(
+            t_path,
+            columns=["game_pk", "batter_id", "target_hit1p", "target_tb2p", "target_bb1p", "target_rbi1p"],
+        )
+        t["game_pk"] = pd.to_numeric(t["game_pk"], errors="coerce").astype("Int64")
+        t["batter_id"] = pd.to_numeric(t["batter_id"], errors="coerce").astype("Int64")
+        out = out.merge(t, on=["game_pk", "batter_id"], how="left")
+        out = out[out["target_hit1p"].notna()].copy()
+    else:
+        logging.warning("Missing hitter props targets for season=%s at %s", season, t_path.resolve())
 
     out = _prune_leaky_columns(out)
 
-    for col in ["target_hit_1p", "target_tb_2p", "target_bb_1p", "target_rbi_1p"]:
-        null_rate = float(out[col].isna().mean()) if len(out) else 0.0
-        pos_rate = float(pd.to_numeric(out[col], errors="coerce").fillna(0).mean()) if len(out) else 0.0
-        logging.info("hitter_batter_features %s null_rate=%.4f pos_rate=%.4f", col, null_rate, pos_rate)
+    for col in ["target_hit1p", "target_tb2p", "target_bb1p", "target_rbi1p"]:
+        if col in out.columns:
+            null_rate = float(out[col].isna().mean()) if len(out) else 0.0
+            pos_rate = float(pd.to_numeric(out[col], errors="coerce").fillna(0).mean()) if len(out) else 0.0
+            logging.info("hitter_batter_features %s null_rate=%.4f pos_rate=%.4f", col, null_rate, pos_rate)
 
     marts_by_season_dir = dirs["marts_dir"] / "by_season"
     marts_by_season_dir.mkdir(parents=True, exist_ok=True)
