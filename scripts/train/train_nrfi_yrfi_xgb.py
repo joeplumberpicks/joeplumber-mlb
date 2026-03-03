@@ -326,17 +326,41 @@ def main() -> None:
     for col in feature_cols:
         train_df[col] = X_train[col]
 
+    X_train = train_df[feature_cols]
     if test_df_raw is not None and not test_df_raw.empty:
-        test_features_frame = pd.DataFrame(index=test_df_raw.index)
-        for col in feature_cols:
-            if col in test_df_raw.columns:
-                test_features_frame[col] = pd.to_numeric(test_df_raw[col], errors="coerce")
-            else:
-                test_features_frame[col] = np.nan
-        test_features_frame = test_features_frame.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         test_df = test_df_raw.copy()
+        X_test = test_df.reindex(columns=feature_cols)
+        overlap_count = sum(1 for c in feature_cols if c in test_df.columns)
+        missing_count = len(feature_cols) - overlap_count
+        total_cells = max(X_test.shape[0] * max(X_test.shape[1], 1), 1)
+        nonnull_ratio = 1.0 - (float(X_test.isna().sum().sum()) / float(total_cells))
+        all_null_cols = [c for c in X_test.columns if X_test[c].isna().all()]
+
+        logging.info(
+            "Test feature alignment | overlap_count=%s missing_count=%s nonnull_ratio=%.6f all_null_cols=%s first20_all_null=%s",
+            overlap_count,
+            missing_count,
+            nonnull_ratio,
+            len(all_null_cols),
+            all_null_cols[:20],
+        )
+
+        if overlap_count == 0:
+            raise ValueError(
+                "No overlapping test features after reindex. "
+                f"train_seasons={train_seasons} test_seasons={test_seasons}. "
+                "Hint: features may not be built for 2025 or column names differ between train/test marts."
+            )
+
+        if nonnull_ratio < 0.05 or (len(all_null_cols) / max(len(feature_cols), 1)) > 0.95:
+            raise ValueError(
+                "Test features are effectively empty; this can cause near-constant predictions. "
+                f"nonnull_ratio={nonnull_ratio:.6f}, all_null_cols={len(all_null_cols)}, feature_count={len(feature_cols)}"
+            )
+
+        X_test = X_test.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         for col in feature_cols:
-            test_df[col] = test_features_frame[col]
+            test_df[col] = X_test[col]
     else:
         test_df = None
 
