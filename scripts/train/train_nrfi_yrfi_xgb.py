@@ -34,6 +34,15 @@ DEFAULT_DROP_COLUMNS = {
     "canonical_park_key",
     "season",
 }
+DEFAULT_XGB_PARAMS: dict[str, Any] = {
+    "n_estimators": 300,
+    "max_depth": 3,
+    "learning_rate": 0.05,
+    "subsample": 0.85,
+    "colsample_bytree": 0.85,
+    "reg_lambda": 2.5,
+    "min_child_weight": 3,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,10 +79,25 @@ def _load_marts_for_seasons(marts_dir: Path, seasons: list[int]) -> pd.DataFrame
     return combined
 
 
+def _identity_leakage_columns(columns: list[str]) -> list[str]:
+    drop_cols: list[str] = []
+    for col in columns:
+        c = col.lower()
+        if (
+            "_id" in c
+            or "game_pk" in c
+            or c.startswith("bat_batter")
+            or c.startswith("pit_pitcher")
+        ):
+            drop_cols.append(col)
+    return drop_cols
+
+
 def _build_numeric_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     X = df.copy()
     drop_cols = set(DEFAULT_DROP_COLUMNS)
     drop_cols.update(TARGETS)
+    drop_cols.update(_identity_leakage_columns(list(X.columns)))
     present_drop_cols = [c for c in X.columns if c in drop_cols]
     if present_drop_cols:
         X = X.drop(columns=present_drop_cols)
@@ -92,7 +116,11 @@ def _build_numeric_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[
     X = X.replace([np.inf, -np.inf], np.nan)
     X = X.fillna(0.0)
 
-    return X, list(X.columns)
+    feature_cols = list(X.columns)
+    logging.info("Feature count after leakage/ID drop: %s", len(feature_cols))
+    print(f"feature_count={len(feature_cols)}")
+
+    return X, feature_cols
 
 
 def _safe_auc(y_true: pd.Series, y_prob: np.ndarray) -> float | None:
@@ -166,10 +194,11 @@ def _train_one_target(
     model.fit(X_train, y_train)
 
     train_prob = model.predict_proba(X_train)[:, 1]
+    train_metrics = _compute_metrics(y_train, train_prob)
     result: dict[str, Any] = {
         "rows_train": int(len(train_df)),
         "positive_rate_train": float(y_train.mean()) if len(y_train) else None,
-        "metrics_train": _compute_metrics(y_train, train_prob),
+        "metrics_train": train_metrics,
         "calibration_train": _compute_calibration_bins(y_train, train_prob, bins=10),
     }
 
@@ -177,13 +206,22 @@ def _train_one_target(
         y_test = pd.to_numeric(test_df[target], errors="coerce").fillna(0).astype(int)
         X_test = test_df[feature_cols]
         test_prob = model.predict_proba(X_test)[:, 1]
+        test_metrics = _compute_metrics(y_test, test_prob)
         result.update(
             {
                 "rows_test": int(len(test_df)),
                 "positive_rate_test": float(y_test.mean()) if len(y_test) else None,
-                "metrics_test": _compute_metrics(y_test, test_prob),
+                "metrics_test": test_metrics,
                 "calibration_test": _compute_calibration_bins(y_test, test_prob, bins=10),
             }
+        )
+        logging.info(
+            "%s metrics | Train AUC=%.6f Train Brier=%.6f Test AUC=%s Test Brier=%.6f",
+            target,
+            train_metrics["auc"] if train_metrics["auc"] is not None else float("nan"),
+            train_metrics["brier"],
+            f"{test_metrics['auc']:.6f}" if test_metrics["auc"] is not None else "None",
+            test_metrics["brier"],
         )
     else:
         result.update(
@@ -193,6 +231,12 @@ def _train_one_target(
                 "metrics_test": None,
                 "calibration_test": [],
             }
+        )
+        logging.info(
+            "%s metrics | Train AUC=%s Train Brier=%.6f Test AUC=None Test Brier=None",
+            target,
+            f"{train_metrics['auc']:.6f}" if train_metrics["auc"] is not None else "None",
+            train_metrics["brier"],
         )
 
     return model, result
@@ -240,7 +284,8 @@ def main() -> None:
     log_header(SCRIPT_NAME, repo_root, config_path, dirs)
 
     model_version = str(config.get("model_version", "nrfi_xgb"))
-    xgb_params = dict(config.get("xgb_params", {}))
+    xgb_params = dict(DEFAULT_XGB_PARAMS)
+    xgb_params.update(dict(config.get("xgb_params", {})))
 
     if args.mode == "eval":
         train_seasons = _as_int_seasons(config.get("train_seasons_default"))
