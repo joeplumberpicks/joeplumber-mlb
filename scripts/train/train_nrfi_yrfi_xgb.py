@@ -83,14 +83,23 @@ def _identity_leakage_columns(columns: list[str]) -> list[str]:
     drop_cols: list[str] = []
     for col in columns:
         c = col.lower()
-        if (
-            "_id" in c
-            or "game_pk" in c
-            or c.startswith("bat_batter")
-            or c.startswith("pit_pitcher")
-        ):
+        if "_id" in c or "game_pk" in c or c.startswith("bat_batter") or c.startswith("pit_pitcher"):
             drop_cols.append(col)
     return drop_cols
+
+
+def _sorted_seasons(df: pd.DataFrame) -> list[int]:
+    if "season" not in df.columns:
+        return []
+    vals = pd.to_numeric(df["season"], errors="coerce").dropna().astype(int).unique().tolist()
+    return sorted(vals)
+
+
+def _target_counts(df: pd.DataFrame | None, target: str) -> dict[str, int]:
+    if df is None or df.empty or target not in df.columns:
+        return {}
+    vc = df[target].value_counts(dropna=False).to_dict()
+    return {str(k): int(v) for k, v in vc.items()}
 
 
 def _build_numeric_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
@@ -102,11 +111,9 @@ def _build_numeric_feature_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[
     if present_drop_cols:
         X = X.drop(columns=present_drop_cols)
 
-    # coerce every candidate feature to numeric so numeric-looking strings survive
     for col in X.columns:
         X[col] = pd.to_numeric(X[col], errors="coerce")
 
-    # keep only columns with at least one non-null numeric value
     keep_cols = [c for c in X.columns if X[c].notna().any()]
     X = X[keep_cols]
 
@@ -214,6 +221,14 @@ def _train_one_target(
                 "metrics_test": test_metrics,
                 "calibration_test": _compute_calibration_bins(y_test, test_prob, bins=10),
             }
+        )
+        logging.info(
+            "%s test_pred stats | std=%.6f min=%.6f mean=%.6f max=%.6f",
+            target,
+            float(np.std(test_prob)),
+            float(np.min(test_prob)),
+            float(np.mean(test_prob)),
+            float(np.max(test_prob)),
         )
         logging.info(
             "%s metrics | Train AUC=%.6f Train Brier=%.6f Test AUC=%s Test Brier=%.6f",
@@ -324,6 +339,32 @@ def main() -> None:
             test_df[col] = test_features_frame[col]
     else:
         test_df = None
+
+    logging.info(
+        "Split summary | train_rows=%s test_rows=%s train_seasons=%s test_seasons=%s",
+        len(train_df),
+        len(test_df) if test_df is not None else 0,
+        _sorted_seasons(train_df),
+        _sorted_seasons(test_df) if test_df is not None else [],
+    )
+    logging.info("target_nrfi counts | train=%s test=%s", _target_counts(train_df, "target_nrfi"), _target_counts(test_df, "target_nrfi"))
+    logging.info("target_yrfi counts | train=%s test=%s", _target_counts(train_df, "target_yrfi"), _target_counts(test_df, "target_yrfi"))
+
+    if args.mode == "eval":
+        available_seasons = _sorted_seasons(train_df_raw)
+        if test_df is None or test_df.empty:
+            raise ValueError(
+                "Broken split: test_df is empty. "
+                f"Configured train_seasons={train_seasons}, test_seasons={test_seasons}, "
+                f"available_seasons={available_seasons}"
+            )
+        for target in TARGETS:
+            uniq = pd.to_numeric(test_df[target], errors="coerce").dropna().nunique()
+            if uniq < 2:
+                vc = _target_counts(test_df, target)
+                raise ValueError(
+                    f"Broken split: test_df[{target}] has <2 unique classes; value_counts={vc}"
+                )
 
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     report_path, model_paths = _resolve_output_paths(
