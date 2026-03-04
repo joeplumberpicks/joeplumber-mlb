@@ -54,18 +54,28 @@ def main() -> None:
 
     out = pd.DataFrame(
         {
-            "game_pk": pd.to_numeric(day.get("game_pk"), errors="coerce").astype("Int64"),
+            "game_pk": day.get("game_pk"),
             "game_date": pd.to_datetime(day.get("game_date"), errors="coerce"),
-            "season": pd.to_numeric(day.get("season"), errors="coerce").fillna(args.season).astype("Int64"),
+            "season": day.get("season"),
             "home_team": day.get("home_team"),
             "away_team": day.get("away_team"),
-            "venue_id": pd.to_numeric(day.get("venue_id"), errors="coerce").astype("Int64"),
-            "home_sp_id": pd.to_numeric(day.get("home_probable_pitcher_id"), errors="coerce").astype("Int64"),
-            "away_sp_id": pd.to_numeric(day.get("away_probable_pitcher_id"), errors="coerce").astype("Int64"),
+            "venue_id": day.get("venue_id"),
+            "home_probable_pitcher_id": day.get("home_probable_pitcher_id"),
+            "away_probable_pitcher_id": day.get("away_probable_pitcher_id"),
             "home_sp_name": day.get("home_probable_pitcher_name"),
             "away_sp_name": day.get("away_probable_pitcher_name"),
         }
     )
+
+    for col in ["home_sp_id", "away_sp_id", "home_probable_pitcher_id", "away_probable_pitcher_id"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
+
+    out["home_sp_id"] = pd.to_numeric(out.get("home_probable_pitcher_id"), errors="coerce").astype("Int64")
+    out["away_sp_id"] = pd.to_numeric(out.get("away_probable_pitcher_id"), errors="coerce").astype("Int64")
+    out["game_pk"] = pd.to_numeric(out.get("game_pk"), errors="coerce").astype("Int64")
+    out["season"] = pd.to_numeric(out.get("season"), errors="coerce").fillna(args.season).astype("Int64")
+    out["venue_id"] = pd.to_numeric(out.get("venue_id"), errors="coerce").astype("Int64")
 
     out = out.dropna(subset=["game_pk"]).copy()
     out["game_pk"] = out["game_pk"].astype("int64")
