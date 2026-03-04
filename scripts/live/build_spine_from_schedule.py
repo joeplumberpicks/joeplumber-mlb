@@ -60,6 +60,10 @@ def main() -> None:
             "home_team": day.get("home_team"),
             "away_team": day.get("away_team"),
             "venue_id": pd.to_numeric(day.get("venue_id"), errors="coerce").astype("Int64"),
+            "home_sp_id": pd.to_numeric(day.get("home_probable_pitcher_id"), errors="coerce").astype("Int64"),
+            "away_sp_id": pd.to_numeric(day.get("away_probable_pitcher_id"), errors="coerce").astype("Int64"),
+            "home_sp_name": day.get("home_probable_pitcher_name"),
+            "away_sp_name": day.get("away_probable_pitcher_name"),
         }
     )
 
@@ -69,7 +73,19 @@ def main() -> None:
     out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce")
 
     write_parquet(out, out_path)
-    logging.info("live schedule spine rows=%s out=%s", len(out), out_path)
+    home_present = int(out["home_sp_id"].notna().sum()) if len(out) else 0
+    away_present = int(out["away_sp_id"].notna().sum()) if len(out) else 0
+    home_pct = (home_present / len(out) * 100.0) if len(out) else 0.0
+    away_pct = (away_present / len(out) * 100.0) if len(out) else 0.0
+    logging.info(
+        "live schedule spine rows=%s out=%s home_sp_id_present=%s (%.2f%%) away_sp_id_present=%s (%.2f%%)",
+        len(out),
+        out_path,
+        home_present,
+        home_pct,
+        away_present,
+        away_pct,
+    )
     print(f"Row count [model_spine_game_{args.season}_{args.date}]: {len(out):,}")
     print(f"Writing to: {out_path.resolve()}")
 

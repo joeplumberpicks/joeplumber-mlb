@@ -57,6 +57,8 @@ def _to_rows(payload: dict, season: int, game_types: set[str]) -> list[dict]:
             home = teams.get("home", {}).get("team", {})
             venue = g.get("venue", {})
             status = g.get("status", {}).get("detailedState") or g.get("status", {}).get("abstractGameState")
+            home_prob = teams.get("home", {}).get("probablePitcher")
+            away_prob = teams.get("away", {}).get("probablePitcher")
 
             rows.append(
                 {
@@ -76,6 +78,10 @@ def _to_rows(payload: dict, season: int, game_types: set[str]) -> list[dict]:
                     "start_time_utc": pd.to_datetime(g.get("gameDate"), errors="coerce", utc=True).tz_convert(None)
                     if g.get("gameDate")
                     else pd.NaT,
+                    "home_probable_pitcher_id": home_prob.get("id") if home_prob else None,
+                    "away_probable_pitcher_id": away_prob.get("id") if away_prob else None,
+                    "home_probable_pitcher_name": home_prob.get("fullName") if home_prob else None,
+                    "away_probable_pitcher_name": away_prob.get("fullName") if away_prob else None,
                 }
             )
     return rows
@@ -118,6 +124,10 @@ def main() -> None:
                 "doubleheader",
                 "game_num",
                 "start_time_utc",
+                "home_probable_pitcher_id",
+                "away_probable_pitcher_id",
+                "home_probable_pitcher_name",
+                "away_probable_pitcher_name",
             ]
         )
     else:
@@ -125,8 +135,23 @@ def main() -> None:
         for c in int_cols:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    df["home_probable_pitcher_id"] = pd.to_numeric(df.get("home_probable_pitcher_id"), errors="coerce").astype("Int64")
+    df["away_probable_pitcher_id"] = pd.to_numeric(df.get("away_probable_pitcher_id"), errors="coerce").astype("Int64")
+
     write_parquet(df, out_path)
-    logging.info("schedule ingest rows=%s out=%s", len(df), out_path)
+    home_present = int(df["home_probable_pitcher_id"].notna().sum()) if len(df) else 0
+    away_present = int(df["away_probable_pitcher_id"].notna().sum()) if len(df) else 0
+    home_pct = (home_present / len(df) * 100.0) if len(df) else 0.0
+    away_pct = (away_present / len(df) * 100.0) if len(df) else 0.0
+    logging.info(
+        "schedule ingest rows=%s out=%s home_probables=%s (%.2f%%) away_probables=%s (%.2f%%)",
+        len(df),
+        out_path,
+        home_present,
+        home_pct,
+        away_present,
+        away_pct,
+    )
     print(f"Row count [games_schedule_{args.season}]: {len(df):,}")
     print(f"Writing to: {out_path.resolve()}")
 
