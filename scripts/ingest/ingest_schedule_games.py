@@ -79,8 +79,12 @@ def _to_rows(payload: dict, season: int, game_types: set[str]) -> list[dict]:
                     "start_time_utc": pd.to_datetime(g.get("gameDate"), errors="coerce", utc=True).tz_convert(None)
                     if g.get("gameDate")
                     else pd.NaT,
-                    "home_probable_pitcher_id": home_prob.get("id") if home_prob else None,
-                    "away_probable_pitcher_id": away_prob.get("id") if away_prob else None,
+                    "home_probable_pitcher_id": pd.to_numeric(
+                        home_prob.get("id") if home_prob else None, errors="coerce"
+                    ),
+                    "away_probable_pitcher_id": pd.to_numeric(
+                        away_prob.get("id") if away_prob else None, errors="coerce"
+                    ),
                     "home_probable_pitcher_name": home_prob.get("fullName") if home_prob else None,
                     "away_probable_pitcher_name": away_prob.get("fullName") if away_prob else None,
                 }
@@ -106,6 +110,13 @@ def _merge_probables(schedule_df: pd.DataFrame, prob_df: pd.DataFrame) -> pd.Dat
             merged[col] = merged[col].where(merged[col].notna(), merged[api_col])
             merged = merged.drop(columns=[api_col])
     return merged
+
+
+def _coerce_probable_id_cols(df: pd.DataFrame) -> pd.DataFrame:
+    for c in ["home_probable_pitcher_id", "away_probable_pitcher_id"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+    return df
 
 def main() -> None:
     args = parse_args()
@@ -155,12 +166,11 @@ def main() -> None:
         int_cols = ["game_pk", "season", "away_team_id", "home_team_id", "venue_id", "game_num"]
         for c in int_cols:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = _coerce_probable_id_cols(df)
 
     prob_df = fetch_probables_for_date(args.date)
     df = _merge_probables(df, prob_df)
-
-    df["home_probable_pitcher_id"] = pd.to_numeric(df.get("home_probable_pitcher_id"), errors="coerce").astype("Int64")
-    df["away_probable_pitcher_id"] = pd.to_numeric(df.get("away_probable_pitcher_id"), errors="coerce").astype("Int64")
+    df = _coerce_probable_id_cols(df)
 
     write_parquet(df, out_path)
     write_parquet(df, date_scoped_out_path)

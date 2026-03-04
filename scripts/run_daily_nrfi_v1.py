@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +33,45 @@ GRADE_THRESHOLDS = [
 ]
 TEAM_ID_PREFER = ["team", "team_abbrev", "team_name", "team_id", "batter_team", "pitcher_team"]
 
+def _fmt_pct(x: float) -> str:
+    try:
+        if x is None or (isinstance(x, float) and math.isnan(x)):
+            return "--.-%"
+        return f"{100.0 * float(x):.1f}%"
+    except Exception:
+        return "--.-%"
+
+
+def _print_nrfi_board(daily: pd.DataFrame, date_str: str, top_n: int = 15) -> None:
+    """Pretty console board for quick sanity-checking."""
+    if daily is None or daily.empty:
+        print(f"\nJOE PLUMBER NRFI BOARD — {date_str}\n-----------------------------------\n(no games)\n")
+        return
+
+    needed = {"away_team", "home_team", "pick", "pick_prob", "grade", "p_nrfi", "p_yrfi"}
+    missing = sorted(list(needed - set(daily.columns)))
+    if missing:
+        print(f"\nJOE PLUMBER NRFI BOARD — {date_str}\n-----------------------------------")
+        print(f"(missing columns: {missing})\n")
+        return
+
+    view = daily.copy()
+    view["pick_prob"] = pd.to_numeric(view["pick_prob"], errors="coerce")
+    view["p_nrfi"] = pd.to_numeric(view["p_nrfi"], errors="coerce")
+    view = view.sort_values(["pick_prob", "p_nrfi"], ascending=[False, False]).head(top_n)
+
+    print(f"\nJOE PLUMBER NRFI BOARD — {date_str}")
+    print("-----------------------------------")
+    for _, r in view.iterrows():
+        away = str(r.get("away_team", "") or "")
+        home = str(r.get("home_team", "") or "")
+        pick = str(r.get("pick", "") or "")
+        prob = float(r.get("pick_prob")) if pd.notna(r.get("pick_prob")) else float("nan")
+        grade = str(r.get("grade", "") or "")
+        matchup = f"{away} @ {home}"
+        print(f"{matchup:<26} {pick:<4} {_fmt_pct(prob):>6}   {grade}")
+    print("")
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run daily NRFI v1.0 scoring with optional schedule-spine auto-build.")
@@ -40,6 +80,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--auto-build", action="store_true")
     p.add_argument("--allow-mart-miss", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--config", type=Path, default=Path("configs/project.yaml"))
+    p.add_argument("--no-board", action="store_true", help="Disable printing the console NRFI board.")
+    p.add_argument("--board-top", type=int, default=15, help="How many games to show on the console board.")
     return p.parse_args()
 
 
@@ -409,6 +451,12 @@ def main() -> None:
     ledger["_pk"] = pd.to_numeric(ledger["game_pk"], errors="coerce")
     ledger = ledger.sort_values(["_gd", "_pk"], kind="mergesort").drop(columns=["_gd", "_pk"])
     ledger.to_csv(ledger_path, index=False)
+
+    if not args.no_board:
+        try:
+            _print_nrfi_board(daily=daily, date_str=args.date, top_n=int(args.board_top))
+        except Exception:
+            logging.exception("Failed printing NRFI board (non-fatal).")
 
     logging.info(
         "daily nrfi run complete date=%s season=%s rows=%s daily_out=%s public_out=%s ledger=%s",
