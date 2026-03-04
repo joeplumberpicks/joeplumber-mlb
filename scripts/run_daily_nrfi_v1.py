@@ -30,6 +30,7 @@ GRADE_THRESHOLDS = [
     ("C", 0.51),
     ("C-", 0.50),
 ]
+TEAM_ID_PREFER = ["team", "team_abbrev", "team_name", "team_id"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--date", required=True, help="YYYY-MM-DD")
     p.add_argument("--season", type=int, default=None)
     p.add_argument("--auto-build", action="store_true")
+    p.add_argument("--allow-mart-miss", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--config", type=Path, default=Path("configs/project.yaml"))
     return p.parse_args()
 
@@ -67,6 +69,112 @@ def _load_features(path: Path) -> list[str]:
     if not feats:
         raise ValueError(f"Feature list empty: {path}")
     return feats
+
+
+def _pick_team_identifier(df: pd.DataFrame) -> str:
+    for col in TEAM_ID_PREFER:
+        if col in df.columns:
+            return col
+    raise ValueError(f"No team identifier column found in rolling table. Expected one of {TEAM_ID_PREFER}")
+
+
+def _latest_team_rollup(df: pd.DataFrame, team_col: str, prefix: str) -> pd.DataFrame:
+    if team_col not in df.columns:
+        raise ValueError(f"Rolling table missing identifier column: {team_col}")
+    d = df.copy()
+    d["game_date"] = pd.to_datetime(d.get("game_date"), errors="coerce")
+    d = d.dropna(subset=[team_col, "game_date"]).sort_values([team_col, "game_date"], kind="mergesort")
+    d = d.groupby(team_col, as_index=False).tail(1)
+
+    feat_cols = [c for c in d.columns if c.startswith(prefix) and pd.api.types.is_numeric_dtype(d[c])]
+    return d[[team_col] + feat_cols].copy()
+
+
+def _combine_side_features(df: pd.DataFrame, base_prefix: str) -> pd.DataFrame:
+    away_cols = [c for c in df.columns if c.startswith(f"away_{base_prefix}")]
+    home_cols = [c for c in df.columns if c.startswith(f"home_{base_prefix}")]
+    out = df.copy()
+
+    names = set([c.replace("away_", "", 1) for c in away_cols]) | set([c.replace("home_", "", 1) for c in home_cols])
+    for name in sorted(names):
+        ac = f"away_{name}"
+        hc = f"home_{name}"
+        if ac in out.columns and hc in out.columns:
+            out[name] = (pd.to_numeric(out[ac], errors="coerce").fillna(0.0) + pd.to_numeric(out[hc], errors="coerce").fillna(0.0)) / 2.0
+        elif ac in out.columns:
+            out[name] = pd.to_numeric(out[ac], errors="coerce").fillna(0.0)
+        elif hc in out.columns:
+            out[name] = pd.to_numeric(out[hc], errors="coerce").fillna(0.0)
+    return out
+
+
+def _build_live_features(data_root: Path, season: int, date_str: str) -> pd.DataFrame:
+    spine_path = data_root / "processed" / "live" / f"model_spine_game_{season}_{date_str}.parquet"
+    if not spine_path.exists():
+        raise FileNotFoundError(
+            f"Live schedule spine not found: {spine_path}. Run with --auto-build or build schedule spine first."
+        )
+
+    spine = pd.read_parquet(spine_path).copy()
+    if spine.empty:
+        raise RuntimeError(f"Live schedule spine is empty for date={date_str}: {spine_path}")
+
+    bat_path = data_root / "processed" / "batter_game_rolling.parquet"
+    pit_path = data_root / "processed" / "pitcher_game_rolling.parquet"
+    if not bat_path.exists() or not pit_path.exists():
+        raise FileNotFoundError(f"Missing rolling source tables: batter={bat_path.exists()} pitcher={pit_path.exists()}")
+
+    bat = pd.read_parquet(bat_path)
+    pit = pd.read_parquet(pit_path)
+
+    bat_key = _pick_team_identifier(bat)
+    pit_key = _pick_team_identifier(pit)
+    logging.info("Using rolling team identifiers: batting=%s pitching=%s", bat_key, pit_key)
+
+    bat_roll = _latest_team_rollup(bat, bat_key, "bat_")
+    pit_roll = _latest_team_rollup(pit, pit_key, "pit_")
+
+    live = spine.copy()
+    away_key_col = "away_team" if bat_key != "team_id" else "away_team_id"
+    home_key_col = "home_team" if bat_key != "team_id" else "home_team_id"
+    if away_key_col not in live.columns:
+        away_key_col = "away_team"
+    if home_key_col not in live.columns:
+        home_key_col = "home_team"
+
+    live = live.merge(
+        bat_roll.rename(columns={bat_key: away_key_col, **{c: f"away_{c}" for c in bat_roll.columns if c != bat_key}}),
+        on=away_key_col,
+        how="left",
+    )
+    live = live.merge(
+        bat_roll.rename(columns={bat_key: home_key_col, **{c: f"home_{c}" for c in bat_roll.columns if c != bat_key}}),
+        on=home_key_col,
+        how="left",
+    )
+
+    away_p_key_col = "away_team" if pit_key != "team_id" else "away_team_id"
+    home_p_key_col = "home_team" if pit_key != "team_id" else "home_team_id"
+    if away_p_key_col not in live.columns:
+        away_p_key_col = "away_team"
+    if home_p_key_col not in live.columns:
+        home_p_key_col = "home_team"
+
+    live = live.merge(
+        pit_roll.rename(columns={pit_key: away_p_key_col, **{c: f"away_{c}" for c in pit_roll.columns if c != pit_key}}),
+        on=away_p_key_col,
+        how="left",
+    )
+    live = live.merge(
+        pit_roll.rename(columns={pit_key: home_p_key_col, **{c: f"home_{c}" for c in pit_roll.columns if c != pit_key}}),
+        on=home_p_key_col,
+        how="left",
+    )
+
+    live = _combine_side_features(live, "bat_")
+    live = _combine_side_features(live, "pit_")
+    live["season"] = season
+    return live
 
 
 def main() -> None:
@@ -141,8 +249,13 @@ def main() -> None:
     mart["game_date"] = pd.to_datetime(mart["game_date"], errors="coerce")
     daily = mart[mart["game_date"].dt.date == date_ts.date()].copy()
 
+    used_live_fallback = False
     if daily.empty:
-        raise RuntimeError(f"No games found in mart={mart_path} for date={args.date}")
+        if not args.allow_mart_miss:
+            raise RuntimeError(f"No games found in mart={mart_path} for date={args.date}")
+        logging.warning("No rows in mart for date; building live features from rolling carryover.")
+        daily = _build_live_features(data_root=data_root, season=season, date_str=args.date)
+        used_live_fallback = True
 
     features = _load_features(features_path)
     X = daily.reindex(columns=features).copy()
@@ -158,14 +271,14 @@ def main() -> None:
     daily["pick_prob"] = daily[["p_nrfi", "p_yrfi"]].max(axis=1)
     daily["grade"] = daily["pick_prob"].map(_grade_from_prob)
 
-    if _has_targets(daily):
+    if (not used_live_fallback) and _has_targets(daily):
         daily["actual"] = daily["target_nrfi"].map(lambda x: "NRFI" if pd.notna(x) and int(x) == 1 else "YRFI")
         daily["win"] = (daily["pick"] == daily["actual"]).astype(int)
     else:
         daily["actual"] = ""
         daily["win"] = ""
 
-    daily["game_date"] = daily["game_date"].dt.strftime("%Y-%m-%d")
+    daily["game_date"] = pd.to_datetime(daily.get("game_date"), errors="coerce").dt.strftime("%Y-%m-%d")
 
     required = [
         "game_date",
