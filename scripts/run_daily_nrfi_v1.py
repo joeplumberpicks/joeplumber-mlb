@@ -30,7 +30,6 @@ GRADE_THRESHOLDS = [
     ("C", 0.51),
     ("C-", 0.50),
 ]
-TEAM_ID_PREFER = ["team", "team_abbrev", "team_name", "team_id"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,41 +70,54 @@ def _load_features(path: Path) -> list[str]:
     return feats
 
 
-def _pick_team_identifier(df: pd.DataFrame) -> str:
-    for col in TEAM_ID_PREFER:
-        if col in df.columns:
-            return col
-    raise ValueError(f"No team identifier column found in rolling table. Expected one of {TEAM_ID_PREFER}")
+def _build_batting_rollup(bat: pd.DataFrame, target_date: pd.Timestamp) -> pd.DataFrame:
+    if "batter_team" not in bat.columns:
+        raise ValueError("batter_game_rolling.parquet missing required column: batter_team")
+    bat = bat.copy()
+    bat["game_date"] = pd.to_datetime(bat.get("game_date"), errors="coerce")
+    bat = bat[(bat["game_date"].notna()) & (bat["game_date"] < target_date)].copy()
+    if bat.empty:
+        return pd.DataFrame(columns=["batter_team"])
+
+    metric_cols = [
+        c
+        for c in bat.columns
+        if c not in {"game_pk", "batter_id", "game_date", "home_team", "away_team", "batter_team"}
+        and pd.api.types.is_numeric_dtype(bat[c])
+    ]
+
+    latest_dates = bat.groupby("batter_team", as_index=False)["game_date"].max().rename(columns={"game_date": "_max_date"})
+    bat_latest = bat.merge(latest_dates, on="batter_team", how="inner")
+    bat_latest = bat_latest[bat_latest["game_date"] == bat_latest["_max_date"]].copy()
+
+    # team-level aggregation on latest date: mean across batter rows
+    roll = bat_latest.groupby("batter_team", as_index=False)[metric_cols].mean(numeric_only=True)
+    roll = roll.rename(columns={c: f"bat_{c}" for c in metric_cols})
+    return roll
 
 
-def _latest_team_rollup(df: pd.DataFrame, team_col: str, prefix: str) -> pd.DataFrame:
-    if team_col not in df.columns:
-        raise ValueError(f"Rolling table missing identifier column: {team_col}")
-    d = df.copy()
-    d["game_date"] = pd.to_datetime(d.get("game_date"), errors="coerce")
-    d = d.dropna(subset=[team_col, "game_date"]).sort_values([team_col, "game_date"], kind="mergesort")
-    d = d.groupby(team_col, as_index=False).tail(1)
+def _build_pitching_rollup(pit: pd.DataFrame, target_date: pd.Timestamp) -> pd.DataFrame:
+    if "pitcher_id" not in pit.columns:
+        raise ValueError("pitcher_game_rolling.parquet missing required column: pitcher_id")
+    pit = pit.copy()
+    pit["game_date"] = pd.to_datetime(pit.get("game_date"), errors="coerce")
+    pit = pit[(pit["game_date"].notna()) & (pit["game_date"] < target_date)].copy()
+    if pit.empty:
+        return pd.DataFrame(columns=["pitcher_id"])
 
-    feat_cols = [c for c in d.columns if c.startswith(prefix) and pd.api.types.is_numeric_dtype(d[c])]
-    return d[[team_col] + feat_cols].copy()
+    metric_cols = [
+        c
+        for c in pit.columns
+        if c not in {"game_pk", "pitcher_id", "game_date", "home_team", "away_team"}
+        and pd.api.types.is_numeric_dtype(pit[c])
+    ]
 
-
-def _combine_side_features(df: pd.DataFrame, base_prefix: str) -> pd.DataFrame:
-    away_cols = [c for c in df.columns if c.startswith(f"away_{base_prefix}")]
-    home_cols = [c for c in df.columns if c.startswith(f"home_{base_prefix}")]
-    out = df.copy()
-
-    names = set([c.replace("away_", "", 1) for c in away_cols]) | set([c.replace("home_", "", 1) for c in home_cols])
-    for name in sorted(names):
-        ac = f"away_{name}"
-        hc = f"home_{name}"
-        if ac in out.columns and hc in out.columns:
-            out[name] = (pd.to_numeric(out[ac], errors="coerce").fillna(0.0) + pd.to_numeric(out[hc], errors="coerce").fillna(0.0)) / 2.0
-        elif ac in out.columns:
-            out[name] = pd.to_numeric(out[ac], errors="coerce").fillna(0.0)
-        elif hc in out.columns:
-            out[name] = pd.to_numeric(out[hc], errors="coerce").fillna(0.0)
-    return out
+    pit = pit.sort_values(["pitcher_id", "game_date"], kind="mergesort")
+    latest = pit.groupby("pitcher_id", as_index=False).tail(1)
+    keep_cols = ["pitcher_id"] + metric_cols
+    latest = latest[keep_cols].copy()
+    latest = latest.rename(columns={c: f"pit_{c}" for c in metric_cols})
+    return latest
 
 
 def _build_live_features(data_root: Path, season: int, date_str: str) -> pd.DataFrame:
@@ -119,62 +131,83 @@ def _build_live_features(data_root: Path, season: int, date_str: str) -> pd.Data
     if spine.empty:
         raise RuntimeError(f"Live schedule spine is empty for date={date_str}: {spine_path}")
 
+    for c in ["game_pk", "away_team", "home_team"]:
+        if c not in spine.columns:
+            raise ValueError(f"Live schedule spine missing required column: {c}")
+
     bat_path = data_root / "processed" / "batter_game_rolling.parquet"
     pit_path = data_root / "processed" / "pitcher_game_rolling.parquet"
     if not bat_path.exists() or not pit_path.exists():
         raise FileNotFoundError(f"Missing rolling source tables: batter={bat_path.exists()} pitcher={pit_path.exists()}")
 
+    target_date = pd.to_datetime(date_str, format="%Y-%m-%d", errors="raise")
     bat = pd.read_parquet(bat_path)
     pit = pd.read_parquet(pit_path)
 
-    bat_key = _pick_team_identifier(bat)
-    pit_key = _pick_team_identifier(pit)
-    logging.info("Using rolling team identifiers: batting=%s pitching=%s", bat_key, pit_key)
-
-    bat_roll = _latest_team_rollup(bat, bat_key, "bat_")
-    pit_roll = _latest_team_rollup(pit, pit_key, "pit_")
+    bat_roll = _build_batting_rollup(bat, target_date)
+    pit_roll = _build_pitching_rollup(pit, target_date)
 
     live = spine.copy()
-    away_key_col = "away_team" if bat_key != "team_id" else "away_team_id"
-    home_key_col = "home_team" if bat_key != "team_id" else "home_team_id"
-    if away_key_col not in live.columns:
-        away_key_col = "away_team"
-    if home_key_col not in live.columns:
-        home_key_col = "home_team"
 
-    live = live.merge(
-        bat_roll.rename(columns={bat_key: away_key_col, **{c: f"away_{c}" for c in bat_roll.columns if c != bat_key}}),
-        on=away_key_col,
-        how="left",
-    )
-    live = live.merge(
-        bat_roll.rename(columns={bat_key: home_key_col, **{c: f"home_{c}" for c in bat_roll.columns if c != bat_key}}),
-        on=home_key_col,
-        how="left",
-    )
+    away_bat = bat_roll.rename(columns={"batter_team": "away_team", **{c: f"away_{c}" for c in bat_roll.columns if c != "batter_team"}})
+    home_bat = bat_roll.rename(columns={"batter_team": "home_team", **{c: f"home_{c}" for c in bat_roll.columns if c != "batter_team"}})
+    live = live.merge(away_bat, on="away_team", how="left")
+    live = live.merge(home_bat, on="home_team", how="left")
 
-    away_p_key_col = "away_team" if pit_key != "team_id" else "away_team_id"
-    home_p_key_col = "home_team" if pit_key != "team_id" else "home_team_id"
-    if away_p_key_col not in live.columns:
-        away_p_key_col = "away_team"
-    if home_p_key_col not in live.columns:
-        home_p_key_col = "home_team"
+    if "away_sp_id" in live.columns:
+        live["away_sp_id"] = pd.to_numeric(live["away_sp_id"], errors="coerce")
+    else:
+        live["away_sp_id"] = pd.NA
+        logging.warning("away_sp_id not present in live spine; away pitching features will be zeros where missing.")
 
-    live = live.merge(
-        pit_roll.rename(columns={pit_key: away_p_key_col, **{c: f"away_{c}" for c in pit_roll.columns if c != pit_key}}),
-        on=away_p_key_col,
-        how="left",
-    )
-    live = live.merge(
-        pit_roll.rename(columns={pit_key: home_p_key_col, **{c: f"home_{c}" for c in pit_roll.columns if c != pit_key}}),
-        on=home_p_key_col,
-        how="left",
-    )
+    if "home_sp_id" in live.columns:
+        live["home_sp_id"] = pd.to_numeric(live["home_sp_id"], errors="coerce")
+    else:
+        live["home_sp_id"] = pd.NA
+        logging.warning("home_sp_id not present in live spine; home pitching features will be zeros where missing.")
 
-    live = _combine_side_features(live, "bat_")
-    live = _combine_side_features(live, "pit_")
-    live["season"] = season
-    return live
+    away_pit = pit_roll.rename(columns={"pitcher_id": "away_sp_id", **{c: f"away_{c}" for c in pit_roll.columns if c != "pitcher_id"}})
+    home_pit = pit_roll.rename(columns={"pitcher_id": "home_sp_id", **{c: f"home_{c}" for c in pit_roll.columns if c != "pitcher_id"}})
+    live = live.merge(away_pit, on="away_sp_id", how="left")
+    live = live.merge(home_pit, on="home_sp_id", how="left")
+
+    # combine side features into model-style bat_*/pit_* columns (mean of away/home where both present)
+    out = live.copy()
+    side_cols = [c for c in out.columns if c.startswith("away_bat_") or c.startswith("home_bat_") or c.startswith("away_pit_") or c.startswith("home_pit_")]
+    base_names = set()
+    for c in side_cols:
+        if c.startswith("away_"):
+            base_names.add(c[len("away_") :])
+        elif c.startswith("home_"):
+            base_names.add(c[len("home_") :])
+
+    for base in sorted(base_names):
+        ac = f"away_{base}"
+        hc = f"home_{base}"
+        if ac in out.columns and hc in out.columns:
+            out[base] = (pd.to_numeric(out[ac], errors="coerce").fillna(0.0) + pd.to_numeric(out[hc], errors="coerce").fillna(0.0)) / 2.0
+        elif ac in out.columns:
+            out[base] = pd.to_numeric(out[ac], errors="coerce").fillna(0.0)
+        elif hc in out.columns:
+            out[base] = pd.to_numeric(out[hc], errors="coerce").fillna(0.0)
+
+    # smoke-style diagnostics
+    n_games = len(out)
+    starter_present = ((pd.to_numeric(out["away_sp_id"], errors="coerce").notna()) & (pd.to_numeric(out["home_sp_id"], errors="coerce").notna())).mean() if n_games else 0.0
+    away_bat_found = int(out[[c for c in out.columns if c.startswith("away_bat_")]].notna().any(axis=1).sum()) if n_games else 0
+    home_bat_found = int(out[[c for c in out.columns if c.startswith("home_bat_")]].notna().any(axis=1).sum()) if n_games else 0
+    logging.info(
+        "live feature smoke | games=%s pct_with_starters=%.2f away_bat_rollups_found=%s home_bat_rollups_found=%s",
+        n_games,
+        float(starter_present) * 100.0,
+        away_bat_found,
+        home_bat_found,
+    )
+    print(f"live_feature_smoke games={n_games} pct_with_starters={float(starter_present)*100.0:.2f} away_bat_found={away_bat_found} home_bat_found={home_bat_found}")
+
+    out["season"] = season
+    out["game_date"] = pd.to_datetime(out.get("game_date"), errors="coerce")
+    return out
 
 
 def main() -> None:
