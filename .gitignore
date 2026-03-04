@@ -1,0 +1,17 @@
+data/*
+!data/reference/
+data/reference/*
+outputs/
+models/
+*.parquet
+*.csv
+*.joblib
+*.pkl
+*.xgb
+*.jsonl
+*.log
+__pycache__/
+.ipynb_checkpoints/
+.env
+!data/reference/parks_master.csv
+!data/reference/park_overrides.csv
