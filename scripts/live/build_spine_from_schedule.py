@@ -37,13 +37,21 @@ def main() -> None:
     log_header("scripts/live/build_spine_from_schedule.py", repo_root, config_path, dirs)
 
     date_ts = pd.to_datetime(args.date, format="%Y-%m-%d", errors="raise")
-    in_path = dirs["raw_dir"] / "live" / f"games_schedule_{args.season}.parquet"
+    date_scoped_in_path = dirs["raw_dir"] / "live" / f"games_schedule_{args.season}_{args.date}.parquet"
+    cumulative_in_path = dirs["raw_dir"] / "live" / f"games_schedule_{args.season}.parquet"
     out_path = dirs["processed_dir"] / "live" / f"model_spine_game_{args.season}_{args.date}.parquet"
 
     if out_path.exists() and not args.force:
         raise FileExistsError(f"Output already exists (use --force): {out_path}")
+
+    if date_scoped_in_path.exists():
+        in_path = date_scoped_in_path
+    else:
+        in_path = cumulative_in_path
     if not in_path.exists():
-        raise FileNotFoundError(f"Schedule parquet not found: {in_path}")
+        raise FileNotFoundError(
+            f"Schedule parquet not found. checked date-scoped={date_scoped_in_path} cumulative={cumulative_in_path}"
+        )
 
     sched = read_parquet(in_path)
     if "game_date" not in sched.columns:
@@ -51,6 +59,8 @@ def main() -> None:
 
     sched["game_date"] = pd.to_datetime(sched["game_date"], errors="coerce")
     day = sched[sched["game_date"].dt.date == date_ts.date()].copy()
+    game_types = sorted(day["game_type"].dropna().astype(str).unique().tolist()) if "game_type" in day.columns else []
+    logging.info("schedule_path_used=%s date_rows=%s game_types=%s", in_path, len(day), game_types)
 
     out = pd.DataFrame(
         {

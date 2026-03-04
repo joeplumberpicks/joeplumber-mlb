@@ -101,6 +101,7 @@ def main() -> None:
     end_date = args.end or args.date
     game_types = {x.strip().upper() for x in args.game_types.split(",") if x.strip()}
     out_path = args.out or (dirs["raw_dir"] / "live" / f"games_schedule_{args.season}.parquet")
+    date_scoped_out_path = dirs["raw_dir"] / "live" / f"games_schedule_{args.season}_{args.date}.parquet"
 
     payload = _fetch_schedule(args.season, start_date, end_date)
     rows = _to_rows(payload, args.season, game_types)
@@ -139,14 +140,16 @@ def main() -> None:
     df["away_probable_pitcher_id"] = pd.to_numeric(df.get("away_probable_pitcher_id"), errors="coerce").astype("Int64")
 
     write_parquet(df, out_path)
+    write_parquet(df, date_scoped_out_path)
     home_present = int(df["home_probable_pitcher_id"].notna().sum()) if len(df) else 0
     away_present = int(df["away_probable_pitcher_id"].notna().sum()) if len(df) else 0
     home_pct = (home_present / len(df) * 100.0) if len(df) else 0.0
     away_pct = (away_present / len(df) * 100.0) if len(df) else 0.0
     logging.info(
-        "schedule ingest rows=%s out=%s home_probables=%s (%.2f%%) away_probables=%s (%.2f%%)",
+        "schedule ingest rows=%s out=%s date_out=%s home_probables=%s (%.2f%%) away_probables=%s (%.2f%%)",
         len(df),
         out_path,
+        date_scoped_out_path,
         home_present,
         home_pct,
         away_present,
@@ -154,6 +157,7 @@ def main() -> None:
     )
     print(f"Row count [games_schedule_{args.season}]: {len(df):,}")
     print(f"Writing to: {out_path.resolve()}")
+    print(f"Writing date-scoped to: {date_scoped_out_path.resolve()}")
 
 
 if __name__ == "__main__":
