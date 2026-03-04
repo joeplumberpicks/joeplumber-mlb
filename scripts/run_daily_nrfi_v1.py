@@ -71,6 +71,10 @@ def _load_features(path: Path) -> list[str]:
     return feats
 
 
+def _coerce_int64(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").astype("Int64")
+
+
 def _pick_team_identifier(df: pd.DataFrame, *, side: str | None = None) -> str:
     for col in TEAM_ID_PREFER:
         if col in df.columns and df[col].notna().any():
@@ -185,19 +189,21 @@ def _build_live_features(data_root: Path, season: int, date_str: str) -> pd.Data
     live = live.merge(home_bat, on="home_team", how="left")
 
     if "away_sp_id" in live.columns:
-        live["away_sp_id"] = pd.to_numeric(live["away_sp_id"], errors="coerce")
+        live["away_sp_id"] = _coerce_int64(live["away_sp_id"])
     else:
-        live["away_sp_id"] = pd.NA
+        live["away_sp_id"] = pd.Series([pd.NA] * len(live), dtype="Int64")
         logging.warning("away_sp_id not present in live spine; away pitching features will be zeros where missing.")
 
     if "home_sp_id" in live.columns:
-        live["home_sp_id"] = pd.to_numeric(live["home_sp_id"], errors="coerce")
+        live["home_sp_id"] = _coerce_int64(live["home_sp_id"])
     else:
-        live["home_sp_id"] = pd.NA
+        live["home_sp_id"] = pd.Series([pd.NA] * len(live), dtype="Int64")
         logging.warning("home_sp_id not present in live spine; home pitching features will be zeros where missing.")
 
     if away_pit_key == "pitcher_id":
         away_pit = pit_roll_away.rename(columns={"pitcher_id": "away_sp_id", **{c: f"away_{c}" for c in pit_roll_away.columns if c != "pitcher_id"}})
+        if "away_sp_id" in away_pit.columns:
+            away_pit["away_sp_id"] = _coerce_int64(away_pit["away_sp_id"])
         live = live.merge(away_pit, on="away_sp_id", how="left")
     else:
         away_pit = pit_roll_away.rename(columns={away_pit_key: "away_team", **{c: f"away_{c}" for c in pit_roll_away.columns if c != away_pit_key}})
@@ -205,10 +211,20 @@ def _build_live_features(data_root: Path, season: int, date_str: str) -> pd.Data
 
     if home_pit_key == "pitcher_id":
         home_pit = pit_roll_home.rename(columns={"pitcher_id": "home_sp_id", **{c: f"home_{c}" for c in pit_roll_home.columns if c != "pitcher_id"}})
+        if "home_sp_id" in home_pit.columns:
+            home_pit["home_sp_id"] = _coerce_int64(home_pit["home_sp_id"])
         live = live.merge(home_pit, on="home_sp_id", how="left")
     else:
         home_pit = pit_roll_home.rename(columns={home_pit_key: "home_team", **{c: f"home_{c}" for c in pit_roll_home.columns if c != home_pit_key}})
         live = live.merge(home_pit, on="home_team", how="left")
+
+    logging.info(
+        "Starter ID dtypes after coercion: live.away_sp_id=%s live.home_sp_id=%s away_pit.away_sp_id=%s home_pit.home_sp_id=%s",
+        live["away_sp_id"].dtype if "away_sp_id" in live.columns else None,
+        live["home_sp_id"].dtype if "home_sp_id" in live.columns else None,
+        away_pit["away_sp_id"].dtype if "away_sp_id" in away_pit.columns else None,
+        home_pit["home_sp_id"].dtype if "home_sp_id" in home_pit.columns else None,
+    )
 
     # combine side features into model-style bat_*/pit_* columns (mean of away/home where both present)
     out = live.copy()
