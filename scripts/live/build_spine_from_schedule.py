@@ -26,6 +26,15 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+
+
+def _to_nullable_int(series: pd.Series) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    try:
+        return s.astype("Int64")
+    except (TypeError, ValueError):
+        return s
+
 def main() -> None:
     args = parse_args()
     repo_root = get_repo_root()
@@ -77,15 +86,15 @@ def main() -> None:
         }
     )
 
-    for col in ["home_sp_id", "away_sp_id", "home_probable_pitcher_id", "away_probable_pitcher_id"]:
+    for col in ["home_probable_pitcher_id", "away_probable_pitcher_id"]:
         if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
+            out[col] = _to_nullable_int(out[col])
 
-    out["home_sp_id"] = pd.to_numeric(out.get("home_probable_pitcher_id"), errors="coerce").astype("Int64")
-    out["away_sp_id"] = pd.to_numeric(out.get("away_probable_pitcher_id"), errors="coerce").astype("Int64")
-    out["game_pk"] = pd.to_numeric(out.get("game_pk"), errors="coerce").astype("Int64")
-    out["season"] = pd.to_numeric(out.get("season"), errors="coerce").fillna(args.season).astype("Int64")
-    out["venue_id"] = pd.to_numeric(out.get("venue_id"), errors="coerce").astype("Int64")
+    out["home_sp_id"] = _to_nullable_int(out.get("home_probable_pitcher_id"))
+    out["away_sp_id"] = _to_nullable_int(out.get("away_probable_pitcher_id"))
+    out["game_pk"] = _to_nullable_int(out.get("game_pk"))
+    out["season"] = _to_nullable_int(pd.to_numeric(out.get("season"), errors="coerce").fillna(args.season))
+    out["venue_id"] = _to_nullable_int(out.get("venue_id"))
 
     out = out.dropna(subset=["game_pk"]).copy()
     out["game_pk"] = out["game_pk"].astype("int64")

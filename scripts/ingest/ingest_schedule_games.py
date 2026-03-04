@@ -12,6 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.ingest.ingest_probables import fetch_probables_for_date
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
 from src.utils.io import write_parquet
@@ -87,6 +88,25 @@ def _to_rows(payload: dict, season: int, game_types: set[str]) -> list[dict]:
     return rows
 
 
+
+
+def _merge_probables(schedule_df: pd.DataFrame, prob_df: pd.DataFrame) -> pd.DataFrame:
+    if schedule_df.empty or prob_df.empty:
+        return schedule_df
+
+    merged = schedule_df.merge(prob_df, on="game_pk", how="left", suffixes=("", "_api"))
+    for col in [
+        "home_probable_pitcher_id",
+        "away_probable_pitcher_id",
+        "home_probable_pitcher_name",
+        "away_probable_pitcher_name",
+    ]:
+        api_col = f"{col}_api"
+        if api_col in merged.columns:
+            merged[col] = merged[col].where(merged[col].notna(), merged[api_col])
+            merged = merged.drop(columns=[api_col])
+    return merged
+
 def main() -> None:
     args = parse_args()
     repo_root = get_repo_root()
@@ -135,6 +155,9 @@ def main() -> None:
         int_cols = ["game_pk", "season", "away_team_id", "home_team_id", "venue_id", "game_num"]
         for c in int_cols:
             df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    prob_df = fetch_probables_for_date(args.date)
+    df = _merge_probables(df, prob_df)
 
     df["home_probable_pitcher_id"] = pd.to_numeric(df.get("home_probable_pitcher_id"), errors="coerce").astype("Int64")
     df["away_probable_pitcher_id"] = pd.to_numeric(df.get("away_probable_pitcher_id"), errors="coerce").astype("Int64")
