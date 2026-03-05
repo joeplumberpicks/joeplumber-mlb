@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import xgboost as xgb
 
@@ -183,6 +184,121 @@ def _build_pitching_rollup(pit: pd.DataFrame, target_date: pd.Timestamp, key_col
     return latest
 
 
+
+
+def _attach_live_feature_blocks(out: pd.DataFrame, data_root: Path, season: int, date_str: str) -> pd.DataFrame:
+    pa_path = data_root / "raw" / "by_season" / f"pa_{season}.parquet"
+    if not pa_path.exists() or out.empty:
+        return out
+    try:
+        pa = pd.read_parquet(pa_path)
+    except Exception:
+        logging.exception("Failed reading PA source for live feature blocks.")
+        return out
+
+    inning_col = "inning" if "inning" in pa.columns else None
+    half_col = next((c for c in ["inning_topbot", "inning_half", "topbot", "inning_top_bot"] if c in pa.columns), None)
+    if inning_col is None or half_col is None:
+        return out
+
+    d = pa.copy()
+    d["game_date"] = pd.to_datetime(d.get("game_date"), errors="coerce")
+    target_date = pd.to_datetime(date_str, errors="coerce")
+    d = d[d["game_date"].notna() & (d["game_date"] < target_date)].copy()
+    if d.empty:
+        return out
+
+    d["game_pk"] = pd.to_numeric(d.get("game_pk"), errors="coerce").astype("Int64")
+    d["pitcher_id"] = pd.to_numeric(d.get("pitcher"), errors="coerce").astype("Int64") if "pitcher" in d.columns else pd.NA
+    d["batter_id"] = pd.to_numeric(d.get("batter"), errors="coerce").astype("Int64") if "batter" in d.columns else pd.NA
+    d["_half"] = d[half_col].astype(str).str.lower()
+    d = d[pd.to_numeric(d[inning_col], errors="coerce") == 1].copy()
+    if d.empty:
+        return out
+
+    # SP first-inning suppression approximation from last 30 starts in inning 1
+    d["rbi"] = pd.to_numeric(d.get("rbi"), errors="coerce").fillna(0.0)
+    fi = d.groupby(["game_pk", "pitcher_id"], dropna=False).agg(fi_runs=("rbi", "sum"), fi_pa=("game_pk", "size"), game_date=("game_date", "max")).reset_index()
+    fi["fi_allowed_yrfi"] = (fi["fi_runs"] >= 1).astype(float)
+    fi = fi.sort_values(["pitcher_id", "game_date"], kind="mergesort")
+    grp = fi.groupby("pitcher_id", dropna=False)
+    n_prev = grp["fi_allowed_yrfi"].shift(1).rolling(30, min_periods=1).count()
+    y_prev = grp["fi_allowed_yrfi"].shift(1).rolling(30, min_periods=1).sum()
+    fi["sp_fi_yrfi_rate_w30"] = (y_prev / n_prev).fillna(0.0)
+    fi["sp_fi_runs_per_start_w30"] = grp["fi_runs"].shift(1).rolling(30, min_periods=1).mean().fillna(0.0)
+    fi["sp_fi_pa_w30"] = grp["fi_pa"].shift(1).rolling(30, min_periods=1).sum().fillna(0.0)
+    lg = float(fi["fi_allowed_yrfi"].mean()) if len(fi) else 0.27
+    fi["sp_fi_yrfi_rate_shrunk_w30"] = ((y_prev.fillna(0.0) + 10.0 * lg) / (n_prev.fillna(0.0) + 10.0)).fillna(lg)
+    fi_latest = fi.sort_values(["pitcher_id", "game_date"]).groupby("pitcher_id", dropna=False).tail(1)
+
+    away = fi_latest.rename(columns={"pitcher_id": "away_sp_id", **{c: f"away_sp_{c}" for c in ["sp_fi_yrfi_rate_w30", "sp_fi_runs_per_start_w30", "sp_fi_pa_w30", "sp_fi_yrfi_rate_shrunk_w30"]}})
+    home = fi_latest.rename(columns={"pitcher_id": "home_sp_id", **{c: f"home_sp_{c}" for c in ["sp_fi_yrfi_rate_w30", "sp_fi_runs_per_start_w30", "sp_fi_pa_w30", "sp_fi_yrfi_rate_shrunk_w30"]}})
+    out = out.merge(away[[c for c in away.columns if c.startswith("away_sp_") or c == "away_sp_id"]], on="away_sp_id", how="left")
+    out = out.merge(home[[c for c in home.columns if c.startswith("home_sp_") or c == "home_sp_id"]], on="home_sp_id", how="left")
+
+    # Top-3 fallback from most frequent first-inning hitters over last 10 team games
+    if not {"home_team", "away_team"}.issubset(d.columns):
+        return out
+    d["bat_team"] = np.where(d["_half"].str.contains("top", na=False), d.get("away_team"), d.get("home_team"))
+    order_col = "at_bat_number" if "at_bat_number" in d.columns else None
+    if order_col:
+        d[order_col] = pd.to_numeric(d[order_col], errors="coerce")
+        d = d.sort_values(["game_date", "game_pk", "_half", order_col], kind="mergesort")
+    d = d.dropna(subset=["batter_id", "bat_team"])
+    first3 = d.drop_duplicates(subset=["game_pk", "_half", "batter_id"], keep="first").copy()
+    first3["slot"] = first3.groupby(["game_pk", "_half"]).cumcount() + 1
+    first3 = first3[first3["slot"] <= 3]
+    recent = first3.sort_values("game_date").groupby(["bat_team", "batter_id"], dropna=False).tail(10)
+    top_ids = (
+        recent.groupby(["bat_team", "batter_id"], dropna=False).size().rename("n").reset_index().sort_values(["bat_team", "n"], ascending=[True, False]).groupby("bat_team").head(3)
+    )
+
+    hand_col = "p_throws" if "p_throws" in pa.columns else None
+    if hand_col is None:
+        return out
+    all_pa = pa.copy()
+    all_pa["game_date"] = pd.to_datetime(all_pa.get("game_date"), errors="coerce")
+    all_pa = all_pa[all_pa["game_date"].notna() & (all_pa["game_date"] < target_date)].copy()
+    all_pa["batter_id"] = pd.to_numeric(all_pa.get("batter"), errors="coerce").astype("Int64")
+    all_pa["opp_hand"] = all_pa[hand_col].astype(str).str.upper()
+    all_pa["pa"] = 1.0
+    ev = all_pa.get("events", pd.Series(index=all_pa.index, dtype=object)).astype(str).str.lower()
+    all_pa["bb"] = ev.isin(["walk", "intent_walk"]).astype(float)
+    all_pa["so"] = ev.isin(["strikeout", "strikeout_double_play"]).astype(float)
+    all_pa["h"] = ev.isin(["single", "double", "triple", "home_run"]).astype(float)
+    all_pa["tb"] = ev.map({"single": 1, "double": 2, "triple": 3, "home_run": 4}).fillna(0).astype(float)
+    b = all_pa.groupby(["batter_id", "opp_hand"], dropna=False).agg(pa=("pa", "sum"), bb=("bb", "sum"), so=("so", "sum"), h=("h", "sum"), tb=("tb", "sum")).reset_index()
+    b["woba"] = (0.69 * b["bb"] + 0.89 * b["h"]) / b["pa"].replace(0, np.nan)
+    b["iso"] = (b["tb"] - b["h"]) / b["pa"].replace(0, np.nan)
+    b["k_rate"] = b["so"] / b["pa"].replace(0, np.nan)
+    b["bb_rate"] = b["bb"] / b["pa"].replace(0, np.nan)
+    b = b.fillna(0.0)
+
+    hand_map = all_pa.assign(pitcher_id=pd.to_numeric(all_pa.get("pitcher"), errors="coerce").astype("Int64"))[["pitcher_id", "opp_hand"]].dropna().drop_duplicates("pitcher_id", keep="last")
+    out = out.merge(hand_map.rename(columns={"pitcher_id": "home_sp_id", "opp_hand": "home_sp_hand"}), on="home_sp_id", how="left")
+    out = out.merge(hand_map.rename(columns={"pitcher_id": "away_sp_id", "opp_hand": "away_sp_hand"}), on="away_sp_id", how="left")
+
+    def _agg(team_col, hand_col_name, prefix):
+        keys = out[[team_col, hand_col_name, "game_pk"]].rename(columns={team_col: "bat_team", hand_col_name: "opp_hand"})
+        z = keys.merge(top_ids[["bat_team", "batter_id"]], on="bat_team", how="left")
+        z = z.merge(b[["batter_id", "opp_hand", "woba", "iso", "k_rate", "bb_rate", "pa"]], on=["batter_id", "opp_hand"], how="left")
+        g = z.groupby("game_pk", dropna=False).agg(
+            **{
+                f"{prefix}_top3_woba_vs_sp_hand_w30": ("woba", "mean"),
+                f"{prefix}_top3_iso_vs_sp_hand_w30": ("iso", "mean"),
+                f"{prefix}_top3_k_rate_vs_sp_hand_w30": ("k_rate", "mean"),
+                f"{prefix}_top3_bb_rate_vs_sp_hand_w30": ("bb_rate", "mean"),
+                f"{prefix}_top3_pa_w30": ("pa", "sum"),
+            }
+        ).reset_index()
+        return g
+
+    away_g = _agg("away_team", "home_sp_hand", "away")
+    home_g = _agg("home_team", "away_sp_hand", "home")
+    out = out.merge(away_g, on="game_pk", how="left").merge(home_g, on="game_pk", how="left")
+    return out
+
+
 def _build_live_features(data_root: Path, season: int, date_str: str) -> pd.DataFrame:
     spine_path = data_root / "processed" / "live" / f"model_spine_game_{season}_{date_str}.parquet"
     if not spine_path.exists():
@@ -301,6 +417,14 @@ def _build_live_features(data_root: Path, season: int, date_str: str) -> pd.Data
         home_bat_found,
     )
     print(f"live_feature_smoke games={n_games} pct_with_starters={float(starter_present)*100.0:.2f} away_bat_found={away_bat_found} home_bat_found={home_bat_found}")
+
+    out = _attach_live_feature_blocks(out, data_root, season, date_str)
+
+    # sanity for new feature blocks
+    new_cols = [c for c in out.columns if ("_top3_" in c or "_sp_sp_fi_" in c)]
+    if new_cols:
+        non_null = {c: float(out[c].notna().mean()) for c in new_cols}
+        logging.info("live new-feature non_null_pct: %s", non_null)
 
     out["season"] = season
     out["game_date"] = pd.to_datetime(out.get("game_date"), errors="coerce")
