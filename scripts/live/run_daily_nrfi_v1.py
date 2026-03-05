@@ -83,6 +83,20 @@ def _grade_at_or_above(grade: str, min_grade: str) -> bool:
     return rank[grade] <= rank[min_grade]
 
 
+
+
+def _log_nrfi_block_sanity(daily: pd.DataFrame) -> None:
+    fi_cols = sorted([c for c in daily.columns if c.startswith(("away_sp_sp_fi_", "home_sp_sp_fi_"))])
+    top3_cols = sorted([c for c in daily.columns if "_top3_" in c and (c.startswith("away_") or c.startswith("home_"))])
+    check_cols = fi_cols + top3_cols
+    if not check_cols:
+        logging.warning("NRFI feature-block sanity: no SP-FI or top3 columns found in daily mart slice")
+        return
+    stats = []
+    for c in check_cols:
+        nn = float(pd.to_numeric(daily[c], errors="coerce").notna().mean()) if c in daily.columns else 0.0
+        stats.append(f"{c}={nn:.3f}")
+    logging.info("NRFI feature-block sanity non-null ratios | %s", " | ".join(stats))
 def _load_booster(path: Path) -> xgb.Booster:
     if not path.exists():
         raise FileNotFoundError(f"Model file not found: {path}")
@@ -177,6 +191,8 @@ def main() -> None:
     if daily.empty:
         logging.error("No games found for date=%s in mart=%s", args.date, mart_path)
         raise SystemExit(1)
+
+    _log_nrfi_block_sanity(daily)
 
     features = _load_features(features_path)
     X = daily.reindex(columns=features).copy()
