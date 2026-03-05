@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -171,6 +172,12 @@ def main() -> None:
     prob_df = fetch_probables_for_date(args.date)
     df = _merge_probables(df, prob_df)
     df = _coerce_probable_id_cols(df)
+
+    game_types_present = sorted(df["game_type"].dropna().astype(str).unique().tolist()) if "game_type" in df.columns else []
+    if game_types_present == ["S"] and os.environ.get("JOE_ALLOW_SPRING") != "1":
+        logging.warning(
+            "Schedule slate contains only Spring Training games (game_type=S). Set JOE_ALLOW_SPRING=1 to silence."
+        )
 
     write_parquet(df, out_path)
     write_parquet(df, date_scoped_out_path)

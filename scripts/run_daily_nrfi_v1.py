@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
 from src.utils.logging import configure_logging, log_header
+from src.utils.team_ids import normalize_team_abbr
 
 MODEL_VERSION = "nrfi_xgb_v1.0"
 A_TIER = {"A+", "A", "A-"}
@@ -323,9 +325,50 @@ def _build_live_features(data_root: Path, season: int, date_str: str) -> pd.Data
     bat = pd.read_parquet(bat_path)
     pit = pd.read_parquet(pit_path)
 
+    live = spine.copy()
+
     away_bat_key = _pick_team_identifier(bat, side="away")
     home_bat_key = _pick_team_identifier(bat, side="home")
     logging.info("Selected batting team identifier columns: away=%s home=%s", away_bat_key, home_bat_key)
+
+    live["away_team_key"] = live["away_team"].map(normalize_team_abbr)
+    live["home_team_key"] = live["home_team"].map(normalize_team_abbr)
+    bat["_away_team_key"] = bat[away_bat_key].map(normalize_team_abbr)
+    bat["_home_team_key"] = bat[home_bat_key].map(normalize_team_abbr)
+
+    if os.environ.get("JOE_DEBUG_TEAMS") == "1":
+        away_live_vals = live["away_team_key"].dropna().astype(str).unique().tolist()[:20]
+        home_live_vals = live["home_team_key"].dropna().astype(str).unique().tolist()[:20]
+        away_roll_vals = bat["_away_team_key"].dropna().astype(str).unique().tolist()[:20]
+        home_roll_vals = bat["_home_team_key"].dropna().astype(str).unique().tolist()[:20]
+        away_match = int(live["away_team_key"].isin(set(bat["_away_team_key"].dropna())).sum())
+        home_match = int(live["home_team_key"].isin(set(bat["_home_team_key"].dropna())).sum())
+        logging.info(
+            "JOE_DEBUG_TEAMS batting keys away_col=%s home_col=%s live_away=%s live_home=%s roll_away=%s roll_home=%s away_matches=%s/%s home_matches=%s/%s",
+            away_bat_key,
+            home_bat_key,
+            away_live_vals,
+            home_live_vals,
+            away_roll_vals,
+            home_roll_vals,
+            away_match,
+            len(live),
+            home_match,
+            len(live),
+        )
+
+    away_team_n = int(bat["_away_team_key"].replace("UNK", pd.NA).dropna().nunique())
+    home_team_n = int(bat["_home_team_key"].replace("UNK", pd.NA).dropna().nunique())
+    logging.warning(
+        "Live rollup join keys: away_bat_key=%s home_bat_key=%s away_teams=%s home_teams=%s",
+        away_bat_key,
+        home_bat_key,
+        away_team_n,
+        home_team_n,
+    )
+    if away_team_n == 0 and home_team_n == 0:
+        raise RuntimeError("Batting rollups not found; likely team key mismatch or missing rollup file.")
+
     bat_roll_away = _build_batting_rollup(bat, target_date, away_bat_key)
     bat_roll_home = _build_batting_rollup(bat, target_date, home_bat_key)
 
@@ -339,12 +382,12 @@ def _build_live_features(data_root: Path, season: int, date_str: str) -> pd.Data
     pit_roll_away = _build_pitching_rollup(pit, target_date, away_pit_key)
     pit_roll_home = _build_pitching_rollup(pit, target_date, home_pit_key)
 
-    live = spine.copy()
-
-    away_bat = bat_roll_away.rename(columns={away_bat_key: "away_team", **{c: f"away_{c}" for c in bat_roll_away.columns if c != away_bat_key}})
-    home_bat = bat_roll_home.rename(columns={home_bat_key: "home_team", **{c: f"home_{c}" for c in bat_roll_home.columns if c != home_bat_key}})
-    live = live.merge(away_bat, on="away_team", how="left")
-    live = live.merge(home_bat, on="home_team", how="left")
+    away_bat = bat_roll_away.rename(columns={away_bat_key: "away_team_raw", **{c: f"away_{c}" for c in bat_roll_away.columns if c != away_bat_key}})
+    away_bat["away_team_key"] = away_bat["away_team_raw"].map(normalize_team_abbr)
+    home_bat = bat_roll_home.rename(columns={home_bat_key: "home_team_raw", **{c: f"home_{c}" for c in bat_roll_home.columns if c != home_bat_key}})
+    home_bat["home_team_key"] = home_bat["home_team_raw"].map(normalize_team_abbr)
+    live = live.merge(away_bat.drop(columns=["away_team_raw"], errors="ignore"), on="away_team_key", how="left")
+    live = live.merge(home_bat.drop(columns=["home_team_raw"], errors="ignore"), on="home_team_key", how="left")
 
     if "away_sp_id" in live.columns:
         live["away_sp_id"] = _coerce_int64(live["away_sp_id"])
@@ -394,15 +437,18 @@ def _build_live_features(data_root: Path, season: int, date_str: str) -> pd.Data
         elif c.startswith("home_"):
             base_names.add(c[len("home_") :])
 
+    derived_cols: dict[str, pd.Series] = {}
     for base in sorted(base_names):
         ac = f"away_{base}"
         hc = f"home_{base}"
         if ac in out.columns and hc in out.columns:
-            out[base] = (pd.to_numeric(out[ac], errors="coerce").fillna(0.0) + pd.to_numeric(out[hc], errors="coerce").fillna(0.0)) / 2.0
+            derived_cols[base] = (pd.to_numeric(out[ac], errors="coerce").fillna(0.0) + pd.to_numeric(out[hc], errors="coerce").fillna(0.0)) / 2.0
         elif ac in out.columns:
-            out[base] = pd.to_numeric(out[ac], errors="coerce").fillna(0.0)
+            derived_cols[base] = pd.to_numeric(out[ac], errors="coerce").fillna(0.0)
         elif hc in out.columns:
-            out[base] = pd.to_numeric(out[hc], errors="coerce").fillna(0.0)
+            derived_cols[base] = pd.to_numeric(out[hc], errors="coerce").fillna(0.0)
+    if derived_cols:
+        out = pd.concat([out, pd.DataFrame(derived_cols, index=out.index)], axis=1)
 
     # smoke-style diagnostics
     n_games = len(out)
@@ -481,7 +527,11 @@ def main() -> None:
     if not mart_path.exists():
         fallback = data_root / "marts" / "by_season" / "nrfi_features_2025.parquet"
         if fallback.exists():
-            logging.warning("Season mart missing for %s, using fallback: %s", season, fallback)
+            logging.warning(
+                "Season mart missing for %s, using fallback: %s. Live carryover joins use normalized team keys away_team_key/home_team_key.",
+                season,
+                fallback,
+            )
             mart_path = fallback
         else:
             raise FileNotFoundError(f"No mart found for season={season} and no 2025 fallback at {fallback}")
@@ -519,18 +569,21 @@ def main() -> None:
     booster.load_model(str(model_path))
     dmat = xgb.DMatrix(X, feature_names=features)
 
-    daily["p_nrfi"] = booster.predict(dmat)
-    daily["p_yrfi"] = 1.0 - daily["p_nrfi"]
-    daily["pick"] = daily["p_nrfi"].ge(0.5).map({True: "NRFI", False: "YRFI"})
-    daily["pick_prob"] = daily[["p_nrfi", "p_yrfi"]].max(axis=1)
-    daily["grade"] = daily["pick_prob"].map(_grade_from_prob)
+    p_nrfi = booster.predict(dmat)
+    p_yrfi = 1.0 - p_nrfi
+    pick = pd.Series(p_nrfi, index=daily.index).ge(0.5).map({True: "NRFI", False: "YRFI"})
+    pick_prob = pd.concat(
+        [pd.Series(p_nrfi, index=daily.index), pd.Series(p_yrfi, index=daily.index)], axis=1
+    ).max(axis=1)
+    grade = pick_prob.map(_grade_from_prob)
+    daily = daily.assign(p_nrfi=p_nrfi, p_yrfi=p_yrfi, pick=pick, pick_prob=pick_prob, grade=grade)
 
     if (not used_live_fallback) and _has_targets(daily):
-        daily["actual"] = daily["target_nrfi"].map(lambda x: "NRFI" if pd.notna(x) and int(x) == 1 else "YRFI")
-        daily["win"] = (daily["pick"] == daily["actual"]).astype(int)
+        actual = daily["target_nrfi"].map(lambda x: "NRFI" if pd.notna(x) and int(x) == 1 else "YRFI")
+        win = (daily["pick"] == actual).astype(int)
+        daily = daily.assign(actual=actual, win=win)
     else:
-        daily["actual"] = ""
-        daily["win"] = ""
+        daily = daily.assign(actual="", win="")
 
     daily["game_date"] = pd.to_datetime(daily.get("game_date"), errors="coerce").dt.strftime("%Y-%m-%d")
 
