@@ -7,6 +7,7 @@ import pandas as pd
 
 from src.marts.build_hitter_batter_features import build_hitter_batter_features
 from src.marts.build_pitcher_game_features import build_pitcher_game_features
+from src.marts.nrfi_feature_blocks import build_nrfi_feature_blocks
 from src.targets.paths import target_input_candidates
 from src.utils.checks import print_rowcount, require_files
 from src.utils.io import read_parquet, write_parquet
@@ -291,6 +292,9 @@ def build_marts(
                     float(mart_df["target_home_win"].isna().mean()) if len(mart_df) else 0.0,
                 )
         elif filename == "nrfi_features.parquet":
+            nrfi_blocks = build_nrfi_feature_blocks(dirs, spine, season)
+            if not nrfi_blocks.empty:
+                mart_df = mart_df.merge(nrfi_blocks, on="game_pk", how="left")
             nrfi_t = _read_target_file(dirs["processed_dir"], "nrfi", season, ["game_pk", "target_nrfi", "target_yrfi"])
             if not nrfi_t.empty:
                 mart_df = mart_df.merge(nrfi_t[["game_pk", "target_nrfi", "target_yrfi"]].drop_duplicates(subset=["game_pk"]), on="game_pk", how="left", suffixes=("", "_t"))
