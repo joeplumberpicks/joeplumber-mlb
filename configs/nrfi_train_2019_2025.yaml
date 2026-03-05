@@ -1,0 +1,14 @@
+model_version: nrfi_xgb_v1.0
+train_seasons_default: [2019, 2020, 2021, 2022, 2023, 2024]
+test_seasons_default: [2025]
+production_seasons_default: [2019, 2020, 2021, 2022, 2023, 2024, 2025]
+artifacts_subdir: data/models/nrfi_xgb
+backtests_subdir: data/backtests/nrfi_xgb
+xgb_params:
+  n_estimators: 300
+  max_depth: 3
+  learning_rate: 0.05
+  subsample: 0.85
+  colsample_bytree: 0.85
+  reg_lambda: 2.5
+  min_child_weight: 3
