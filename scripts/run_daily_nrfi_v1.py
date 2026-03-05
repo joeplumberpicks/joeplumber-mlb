@@ -327,8 +327,17 @@ def _build_live_features(data_root: Path, season: int, date_str: str) -> pd.Data
 
     live = spine.copy()
 
-    away_bat_key = _pick_team_identifier(bat, side="away")
-    home_bat_key = _pick_team_identifier(bat, side="home")
+    if "away_team" in bat.columns and "away_team_key" not in bat.columns:
+        bat["away_team_key"] = bat["away_team"].map(normalize_team_abbr)
+    if "home_team" in bat.columns and "home_team_key" not in bat.columns:
+        bat["home_team_key"] = bat["home_team"].map(normalize_team_abbr)
+
+    away_bat_key = next((c for c in ["away_team_key", "away_team", "batter_team"] if c in bat.columns), None)
+    home_bat_key = next((c for c in ["home_team_key", "home_team", "batter_team"] if c in bat.columns), None)
+    if away_bat_key is None:
+        away_bat_key = _pick_team_identifier(bat, side="away")
+    if home_bat_key is None:
+        home_bat_key = _pick_team_identifier(bat, side="home")
     logging.info("Selected batting team identifier columns: away=%s home=%s", away_bat_key, home_bat_key)
 
     live["away_team_key"] = live["away_team"].map(normalize_team_abbr)
