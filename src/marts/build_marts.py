@@ -326,6 +326,11 @@ def build_marts(
             # Use targets as the authoritative key set (game_pk, batter_id).
             targets = _load_hitter_targets(dirs["processed_dir"], season)
             if targets.empty:
+                if season is None:
+                    logging.warning(
+                        "hitter_props targets empty for multi-season build; skipping hitter_props_features mart"
+                    )
+                    continue
                 raise ValueError(f"hitter_props targets empty for season={season}")
 
             targets = targets.copy()
