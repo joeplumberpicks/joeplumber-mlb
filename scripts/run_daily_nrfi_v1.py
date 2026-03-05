@@ -19,7 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
 from src.utils.logging import configure_logging, log_header
-from src.utils.team_ids import normalize_team_abbr
+from src.utils.team_ids import normalize_team_abbr, team_id_to_abbr
 
 MODEL_VERSION = "nrfi_xgb_v1.0"
 A_TIER = {"A+", "A", "A-"}
@@ -340,8 +340,41 @@ def _build_live_features(data_root: Path, season: int, date_str: str) -> pd.Data
         home_bat_key = _pick_team_identifier(bat, side="home")
     logging.info("Selected batting team identifier columns: away=%s home=%s", away_bat_key, home_bat_key)
 
-    live["away_team_key"] = live["away_team"].map(normalize_team_abbr)
-    live["home_team_key"] = live["home_team"].map(normalize_team_abbr)
+    if "away_team_id" in live.columns:
+        live["away_team_key"] = (
+            live["away_team_id"].map(team_id_to_abbr).replace("UNK", pd.NA).fillna(live["away_team"].map(normalize_team_abbr))
+        )
+    else:
+        live["away_team_key"] = live["away_team"].map(normalize_team_abbr)
+
+    if "home_team_id" in live.columns:
+        live["home_team_key"] = (
+            live["home_team_id"].map(team_id_to_abbr).replace("UNK", pd.NA).fillna(live["home_team"].map(normalize_team_abbr))
+        )
+    else:
+        live["home_team_key"] = live["home_team"].map(normalize_team_abbr)
+
+    away_unk = int((live["away_team_key"] == "UNK").sum()) if len(live) else 0
+    home_unk = int((live["home_team_key"] == "UNK").sum()) if len(live) else 0
+    logging.info("Live team key mapping UNK counts: away=%s home=%s", away_unk, home_unk)
+    if away_unk and "away_team_id" in live.columns:
+        unk_away_ids = (
+            pd.to_numeric(live.loc[live["away_team_key"] == "UNK", "away_team_id"], errors="coerce")
+            .dropna()
+            .astype(int)
+            .unique()
+            .tolist()
+        )
+        logging.warning("Unknown away_team_id values for team-key mapping: %s", sorted(unk_away_ids))
+    if home_unk and "home_team_id" in live.columns:
+        unk_home_ids = (
+            pd.to_numeric(live.loc[live["home_team_key"] == "UNK", "home_team_id"], errors="coerce")
+            .dropna()
+            .astype(int)
+            .unique()
+            .tolist()
+        )
+        logging.warning("Unknown home_team_id values for team-key mapping: %s", sorted(unk_home_ids))
     bat["_away_team_key"] = bat[away_bat_key].map(normalize_team_abbr)
     bat["_home_team_key"] = bat[home_bat_key].map(normalize_team_abbr)
 
