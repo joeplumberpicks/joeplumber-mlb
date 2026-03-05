@@ -114,13 +114,26 @@ def _read_target_file(processed_dir: Path, market: str, season: int | None, requ
     logging.warning("Missing target file for market=%s season=%s. Run: python scripts/build_targets_%s.py --season %s --force", market, season, market, season)
     return pd.DataFrame()
 
+
+def _load_moneyline_targets(dirs: dict[str, Path], season: int | None) -> pd.DataFrame | None:
+    # Multi-season build: concat all per-season moneyline targets
+    if season is None:
+        tdir = Path(dirs["processed_dir"]) / "targets" / "moneyline"
+        files = sorted(tdir.glob("targets_moneyline_*.parquet"))
+        if not files:
+            return None
+        dfs = [read_parquet(p) for p in files]
+        return pd.concat(dfs, ignore_index=True)
+
+    path = dirs["processed_dir"] / "targets" / "moneyline" / f"targets_moneyline_{season}.parquet"
+    if not path.exists():
+        return None
+    return read_parquet(path)
+
 def _merge_moneyline_targets(mart_df: pd.DataFrame, processed_dir: Path, season: int | None) -> pd.DataFrame:
     out = mart_df.copy()
-    if season is None:
-        return out
-
-    targets = _read_target_file(processed_dir, "moneyline", season, ["game_pk", "target_home_win"])
-    if targets.empty:
+    targets = _load_moneyline_targets({"processed_dir": processed_dir}, season)
+    if targets is None or targets.empty:
         return out
 
     slim = targets[["game_pk", "target_home_win"]].copy()
