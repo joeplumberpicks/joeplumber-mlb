@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from src.utils.team_normalize import canonical_team_abbr
 
 
@@ -51,13 +53,52 @@ _TEAM_ID_TO_ABBR = {
     158: "MIL",
 }
 
+NAME_TO_ABBR = {
+    "arizona diamondbacks": "AZ",
+    "atlanta braves": "ATL",
+    "baltimore orioles": "BAL",
+    "boston red sox": "BOS",
+    "chicago cubs": "CHC",
+    "chicago white sox": "CWS",
+    "cincinnati reds": "CIN",
+    "colorado rockies": "COL",
+    "houston astros": "HOU",
+    "kansas city royals": "KC",
+    "los angeles angels": "LAA",
+    "los angeles dodgers": "LAD",
+    "miami marlins": "MIA",
+    "milwaukee brewers": "MIL",
+    "minnesota twins": "MIN",
+    "new york mets": "NYM",
+    "new york yankees": "NYY",
+    "philadelphia phillies": "PHI",
+    "pittsburgh pirates": "PIT",
+    "san diego padres": "SD",
+    "seattle mariners": "SEA",
+    "st louis cardinals": "STL",
+    "texas rangers": "TEX",
+    "toronto blue jays": "TOR",
+    "washington nationals": "WSN",
+}
+
+
+def _clean_team_token(s: str) -> str:
+    s = str(s).lower().replace(".", " ").replace(",", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
 
 def normalize_team_abbr(x: str | None) -> str:
     if x is None:
         return "UNK"
-    raw = str(x).strip().upper()
-    if not raw:
+    if isinstance(x, float) and x != x:
         return "UNK"
+
+    cleaned = _clean_team_token(str(x))
+    if not cleaned:
+        return "UNK"
+
+    raw = cleaned.upper()
     if raw in _TEAM_MAP:
         return _TEAM_MAP[raw]
     can = canonical_team_abbr(raw)
@@ -65,6 +106,8 @@ def normalize_team_abbr(x: str | None) -> str:
         return _TEAM_MAP.get(can, can)
     if len(raw) in (2, 3) and raw.isalpha():
         return _TEAM_MAP.get(raw, raw)
+    if cleaned in NAME_TO_ABBR:
+        return NAME_TO_ABBR[cleaned]
     return "UNK"
 
 
