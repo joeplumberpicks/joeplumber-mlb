@@ -147,6 +147,28 @@ def main() -> None:
         raise ValueError(f"Model missing feature_names_in_: {model_path}")
     X = X.reindex(columns=expected, fill_value=np.nan)
 
+    logging.info("moneyline live X shape rows=%s cols=%s", X.shape[0], X.shape[1])
+    avg_missing = float(X.isna().mean().mean()) if X.shape[1] else 0.0
+    logging.info("moneyline live avg_missing_rate=%.6f", avg_missing)
+
+    varied = X.nunique(dropna=False)
+    varied_count = int((varied > 1).sum())
+    logging.info("moneyline live varied_feature_cols=%s", varied_count)
+
+    top_varied = [(c, int(v)) for c, v in varied.sort_values(ascending=False).head(30).items()]
+    logging.info("moneyline live top30_varied_cols=%s", top_varied)
+
+    missing = X.isna().mean().sort_values(ascending=False)
+    top_missing = [(c, float(v)) for c, v in missing.head(30).items()]
+    logging.info("moneyline live top30_missing_cols=%s", top_missing)
+
+    all_missing_cols = [c for c in X.columns if X[c].isna().all()]
+    logging.info(
+        "moneyline live all_missing_feature_cols=%s first30=%s",
+        len(all_missing_cols),
+        all_missing_cols[:30],
+    )
+
     p_home = model.predict_proba(X)[:, 1]
     out = merged[["game_date", "game_pk", "away_team", "home_team"]].copy()
     out = out.assign(
