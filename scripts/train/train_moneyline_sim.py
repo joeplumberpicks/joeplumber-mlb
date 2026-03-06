@@ -55,12 +55,15 @@ def _identifier_like_columns(df_cols: list[str]) -> list[str]:
         "home_team",
         "away_team",
         "canonical_park_key",
+        "bat_batter",
+        "pit_pitcher",
     }
+    exact_drop_lower = {c.lower() for c in exact_drop}
 
     dropped: list[str] = []
     for c in df_cols:
         lc = c.lower()
-        if c in exact_drop:
+        if lc in exact_drop_lower:
             dropped.append(c)
             continue
         if "game_pk" in lc:
@@ -79,8 +82,8 @@ def _identifier_like_columns(df_cols: list[str]) -> list[str]:
             dropped.append(c)
             continue
 
-    # keep order, unique
-    return list(dict.fromkeys(dropped))
+    # keep unique + alphabetical for stable logs/repro
+    return sorted(set(dropped), key=lambda x: x.lower())
 
 def main() -> None:
     args = parse_args()
@@ -96,9 +99,9 @@ def main() -> None:
     mart_df = read_parquet(mart_path)
     drop_cols = _identifier_like_columns(list(mart_df.columns))
     logging.info(
-        "moneyline identifier filter dropped_cols=%s first30=%s",
+        "moneyline identifier filter dropped_cols=%s first50=%s",
         len(drop_cols),
-        drop_cols[:30],
+        drop_cols[:50],
     )
 
     filtered = mart_df.drop(columns=drop_cols, errors="ignore")
