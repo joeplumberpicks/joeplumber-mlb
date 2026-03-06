@@ -93,44 +93,49 @@ def main() -> None:
     if not fallback_mart_path.exists():
         raise FileNotFoundError(f"Fallback moneyline mart not found: {fallback_mart_path}")
 
-    live = pd.read_parquet(spine_path).copy()
+    live_df = pd.read_parquet(spine_path).copy()
     required = ["game_pk", "game_date", "home_team", "away_team", "home_sp_id", "away_sp_id", "venue_id"]
-    missing = [c for c in required if c not in live.columns]
+    missing = [c for c in required if c not in live_df.columns]
     if missing:
         raise ValueError(f"Live spine missing required columns: {missing}")
 
-    fallback = pd.read_parquet(fallback_mart_path).copy()
-    if "game_date" not in fallback.columns:
+    fallback_df = pd.read_parquet(fallback_mart_path).copy()
+    if "game_date" not in fallback_df.columns:
         raise ValueError(f"Fallback mart missing game_date: {fallback_mart_path}")
 
-    live["game_date"] = pd.to_datetime(live["game_date"], errors="coerce")
-    fallback["game_date"] = pd.to_datetime(fallback["game_date"], errors="coerce")
+    live_df["game_date"] = pd.to_datetime(live_df["game_date"], errors="coerce")
+    fallback_df["game_date"] = pd.to_datetime(fallback_df["game_date"], errors="coerce")
 
-    live["home_team_key"] = live["home_team"].map(normalize_team_abbr)
-    live["away_team_key"] = live["away_team"].map(normalize_team_abbr)
-    fallback["home_team_key"] = fallback["home_team"].map(normalize_team_abbr)
-    fallback["away_team_key"] = fallback["away_team"].map(normalize_team_abbr)
+    live_df["home_team_key"] = live_df["home_team"].apply(normalize_team_abbr)
+    live_df["away_team_key"] = live_df["away_team"].apply(normalize_team_abbr)
+    fallback_df["home_team_key"] = fallback_df["home_team"].apply(normalize_team_abbr)
+    fallback_df["away_team_key"] = fallback_df["away_team"].apply(normalize_team_abbr)
+
+    logging.info("moneyline live unique home_team_keys=%s", live_df["home_team_key"].nunique())
+    logging.info("moneyline live unique away_team_keys=%s", live_df["away_team_key"].nunique())
+    logging.info("moneyline fallback unique home_team_keys=%s", fallback_df["home_team_key"].nunique())
+    logging.info("moneyline fallback unique away_team_keys=%s", fallback_df["away_team_key"].nunique())
 
     numeric_cols = [
         c
-        for c in fallback.select_dtypes(include=[np.number]).columns
+        for c in fallback_df.select_dtypes(include=[np.number]).columns
         if c not in {"game_pk", "season", "target_home_win"}
     ]
 
     home_latest = (
-        fallback.sort_values("game_date", kind="mergesort")
+        fallback_df.sort_values("game_date", kind="mergesort")
         .groupby("home_team_key", dropna=False)
         .tail(1)[["home_team_key"] + numeric_cols]
         .rename(columns={c: f"home_{c}" for c in numeric_cols})
     )
     away_latest = (
-        fallback.sort_values("game_date", kind="mergesort")
+        fallback_df.sort_values("game_date", kind="mergesort")
         .groupby("away_team_key", dropna=False)
         .tail(1)[["away_team_key"] + numeric_cols]
         .rename(columns={c: f"away_{c}" for c in numeric_cols})
     )
 
-    merged = live.merge(home_latest, on="home_team_key", how="left")
+    merged = live_df.merge(home_latest, on="home_team_key", how="left")
     merged = merged.merge(away_latest, on="away_team_key", how="left")
 
     model_path = _latest_model(model_dir)
