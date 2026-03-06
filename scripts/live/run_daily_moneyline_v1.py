@@ -239,21 +239,21 @@ def main() -> None:
         if c not in {"game_pk", "season", "target_home_win"}
     ]
 
+    fallback_sorted = fallback_df.sort_values("game_date", kind="mergesort")
     home_latest = (
-        fallback_df.sort_values("game_date", kind="mergesort")
-        .groupby("home_team_key", dropna=False)
+        fallback_sorted.groupby("home_team_key", dropna=False)
         .tail(1)[["home_team_key"] + numeric_cols]
-        .rename(columns={c: f"home_{c}" for c in numeric_cols})
+        .drop_duplicates(subset=["home_team_key"], keep="last")
+        .set_index("home_team_key")
     )
     away_latest = (
-        fallback_df.sort_values("game_date", kind="mergesort")
-        .groupby("away_team_key", dropna=False)
+        fallback_sorted.groupby("away_team_key", dropna=False)
         .tail(1)[["away_team_key"] + numeric_cols]
-        .rename(columns={c: f"away_{c}" for c in numeric_cols})
+        .drop_duplicates(subset=["away_team_key"], keep="last")
+        .set_index("away_team_key")
     )
 
-    merged = live_df.merge(home_latest, on="home_team_key", how="left")
-    merged = merged.merge(away_latest, on="away_team_key", how="left")
+    merged = live_df.copy()
 
     model_path = _latest_model(model_dir)
     model = joblib.load(model_path)
@@ -302,21 +302,43 @@ def main() -> None:
                 if X[col].notna().any():
                     diff_off_populated += 1
 
-    # fallback mart: fill any remaining feature gaps without overwriting rolling-derived values
+    # fallback mart: fill remaining feature gaps without overwriting rolling-derived values
+    home_num_cols = set(home_latest.columns) if not home_latest.empty else set()
+    away_num_cols = set(away_latest.columns) if not away_latest.empty else set()
+
+    def _fallback_side_series(side_df: pd.DataFrame, team_keys: pd.Series, side_prefix: str, target_col: str) -> pd.Series:
+        if side_df.empty:
+            return pd.Series(np.nan, index=team_keys.index, dtype="float64")
+        source_col = _pick_metric_name(set(side_df.columns), target_col, side_prefix)
+        if source_col is None:
+            source_col = _pick_metric_name(set(side_df.columns), target_col, "")
+        if source_col is None:
+            return pd.Series(np.nan, index=team_keys.index, dtype="float64")
+        return pd.to_numeric(team_keys.map(side_df[source_col]), errors="coerce")
+
     for col in expected:
-        if X[col].notna().any():
+        mask = X[col].isna()
+        if not bool(mask.any()):
             continue
-        hcol = f"home_{col}"
-        acol = f"away_{col}"
-        if hcol in merged.columns and acol in merged.columns:
-            home_v = pd.to_numeric(merged[hcol], errors="coerce")
-            away_v = pd.to_numeric(merged[acol], errors="coerce")
-            if col.startswith("diff_off_"):
-                X[col] = away_v - home_v
-            else:
-                X[col] = (away_v + home_v) / 2.0
-        elif col in merged.columns:
-            X[col] = pd.to_numeric(merged[col], errors="coerce")
+
+        home_v = _fallback_side_series(home_latest, merged["home_team_key"], "home_", col)
+        away_v = _fallback_side_series(away_latest, merged["away_team_key"], "away_", col)
+
+        candidate = None
+        if col.startswith("diff_off_"):
+            candidate = away_v - home_v
+        else:
+            avg = (away_v + home_v) / 2.0
+            single = pd.Series(np.nan, index=merged.index, dtype="float64")
+            direct_home = _pick_metric_name(home_num_cols, col, "") if home_num_cols else None
+            direct_away = _pick_metric_name(away_num_cols, col, "") if away_num_cols else None
+            if direct_home is not None:
+                single = single.fillna(pd.to_numeric(merged["home_team_key"].map(home_latest[direct_home]), errors="coerce"))
+            if direct_away is not None:
+                single = single.fillna(pd.to_numeric(merged["away_team_key"].map(away_latest[direct_away]), errors="coerce"))
+            candidate = avg.fillna(single)
+
+        X.loc[mask, col] = candidate.loc[mask]
 
     X = X.reindex(columns=expected, fill_value=np.nan)
 
