@@ -135,8 +135,7 @@ def _build_top3_vs_hand(spine: pd.DataFrame, pa: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
     bs = bs.sort_values(["batter_id", "opp_hand", "game_date"], kind="mergesort")
-    windows = [15, 30]
-    for w in windows:
+    for w in [30]:
         grp = bs.groupby(["batter_id", "opp_hand"], dropna=False)
         pa_prev = grp["pa"].shift(1).rolling(w, min_periods=1).sum()
         bb_prev = grp["bb"].shift(1).rolling(w, min_periods=1).sum()
@@ -148,21 +147,6 @@ def _build_top3_vs_hand(spine: pd.DataFrame, pa: pd.DataFrame) -> pd.DataFrame:
         bs[f"k_rate_vs_hand_w{w}"] = _rate(so_prev, pa_prev)
         bs[f"bb_rate_vs_hand_w{w}"] = _rate(bb_prev, pa_prev)
         bs[f"sample_pa_w{w}"] = pa_prev.fillna(0.0)
-
-    # Latest rolling split snapshot by batter/opponent hand (used for pregame/live fallback)
-    latest_cols = [
-        "batter_id",
-        "opp_hand",
-        "game_date",
-    ] + [c for c in bs.columns if c.endswith("_w15") or c.endswith("_w30")]
-    latest_split = (
-        bs[latest_cols]
-        .dropna(subset=["batter_id", "opp_hand", "game_date"])
-        .sort_values(["batter_id", "opp_hand", "game_date"], kind="mergesort")
-        .groupby(["batter_id", "opp_hand"], dropna=False)
-        .tail(1)
-        .drop(columns=["game_date"])
-    )
 
     # top3 from first inning appearances
     p1 = p[pd.to_numeric(p[inning_col], errors="coerce") == 1].copy()
@@ -176,42 +160,7 @@ def _build_top3_vs_hand(spine: pd.DataFrame, pa: pd.DataFrame) -> pd.DataFrame:
     p1["rn"] = p1.groupby(["game_pk", "_half"]).cumcount() + 1
     top3 = p1[p1["rn"] <= 3][["game_pk", "batter_id", "_half"]].copy()
 
-    # Team-level top3 identity for fallback (most frequent first-inning first-3 hitters in last 10 games).
-    team_col = _pick(p, ["batting_team", "offense_team", "bat_team", "team", "fld_team"])
-    if team_col:
-        p1_team = p1.copy()
-        p1_team["bat_team"] = p1_team[team_col].astype(str).replace("nan", pd.NA)
-        p1_team["game_date"] = pd.to_datetime(p1_team["game_date"], errors="coerce")
-        p1_team = p1_team.dropna(subset=["bat_team", "batter_id", "game_date"]).copy()
-        team_game_order = (
-            p1_team[["bat_team", "game_pk", "game_date"]]
-            .drop_duplicates(subset=["bat_team", "game_pk"])
-            .sort_values(["bat_team", "game_date", "game_pk"], kind="mergesort")
-        )
-        team_game_order["game_num"] = team_game_order.groupby("bat_team").cumcount() + 1
-        p1_team = p1_team.merge(team_game_order[["bat_team", "game_pk", "game_num"]], on=["bat_team", "game_pk"], how="left")
-        top3_team = p1_team[p1_team["rn"] <= 3][["bat_team", "game_pk", "game_num", "batter_id"]].drop_duplicates()
-        cand = top3_team.merge(
-            team_game_order[["bat_team", "game_pk", "game_num"]].rename(
-                columns={"game_pk": "hist_game_pk", "game_num": "hist_game_num"}
-            ),
-            on=["bat_team"],
-            how="inner",
-        )
-        hist_gap = cand["game_num"] - cand["hist_game_num"]
-        cand = cand[(hist_gap >= 1) & (hist_gap <= 10)].copy()
-        fallback_top3 = (
-            cand.groupby(["game_pk", "bat_team", "batter_id"], dropna=False)
-            .agg(freq=("hist_game_pk", "nunique"), recency=("hist_game_num", "max"))
-            .reset_index()
-            .sort_values(["game_pk", "freq", "recency", "batter_id"], ascending=[True, False, False, True], kind="mergesort")
-        )
-        fallback_top3["rn"] = fallback_top3.groupby("game_pk").cumcount() + 1
-        fallback_top3 = fallback_top3[fallback_top3["rn"] <= 3][["game_pk", "batter_id", "bat_team"]].copy()
-    else:
-        fallback_top3 = pd.DataFrame(columns=["game_pk", "batter_id", "bat_team"])
-
-    s = spine[[c for c in ["game_pk", "game_date", "away_team", "home_team", "away_sp_id", "home_sp_id"] if c in spine.columns]].copy()
+    s = spine[[c for c in ["game_pk", "away_sp_id", "home_sp_id"] if c in spine.columns]].copy()
     s["game_pk"] = pd.to_numeric(s.get("game_pk"), errors="coerce").astype("Int64")
     hand_map = p[["pitcher_id", "opp_hand"]].dropna().drop_duplicates(subset=["pitcher_id"], keep="last")
     s = s.merge(hand_map.rename(columns={"pitcher_id": "home_sp_id", "opp_hand": "home_sp_hand"}), on="home_sp_id", how="left")
@@ -226,40 +175,11 @@ def _build_top3_vs_hand(spine: pd.DataFrame, pa: pd.DataFrame) -> pd.DataFrame:
     home_top = home_top.rename(columns={"away_sp_hand": "opp_hand"})
 
     top = pd.concat([away_top.assign(side="away"), home_top.assign(side="home")], ignore_index=True)
-    use_cols = ["game_pk", "batter_id", "opp_hand"] + [c for c in bs.columns if c.endswith("_w15") or c.endswith("_w30")]
-    use = bs[use_cols]
+    use = bs[["game_pk", "batter_id", "opp_hand", "woba_vs_hand_w30", "iso_vs_hand_w30", "k_rate_vs_hand_w30", "bb_rate_vs_hand_w30", "sample_pa_w30"]]
     top = top.merge(use, on=["game_pk", "batter_id", "opp_hand"], how="left")
-
-    # Live fallback: when same-game top3 cannot be observed pregame, infer top3 identity from last-10 starts.
-    if not fallback_top3.empty and {"away_team", "home_team"}.issubset(s.columns):
-        away_fb = fallback_top3.merge(s[["game_pk", "away_team", "home_sp_hand"]], left_on=["game_pk", "bat_team"], right_on=["game_pk", "away_team"], how="inner")
-        away_fb = away_fb.rename(columns={"home_sp_hand": "opp_hand"})[["game_pk", "batter_id", "opp_hand"]].assign(side="away")
-
-        home_fb = fallback_top3.merge(s[["game_pk", "home_team", "away_sp_hand"]], left_on=["game_pk", "bat_team"], right_on=["game_pk", "home_team"], how="inner")
-        home_fb = home_fb.rename(columns={"away_sp_hand": "opp_hand"})[["game_pk", "batter_id", "opp_hand"]].assign(side="home")
-
-        fb = pd.concat([away_fb, home_fb], ignore_index=True)
-        fb = fb.merge(latest_split, on=["batter_id", "opp_hand"], how="left")
-
-        metric_cols = [c for c in top.columns if c.endswith("_w15") or c.endswith("_w30")]
-        top = top.merge(
-            fb[["game_pk", "batter_id", "opp_hand", "side"] + metric_cols],
-            on=["game_pk", "batter_id", "opp_hand", "side"],
-            how="left",
-            suffixes=("", "_fb"),
-        )
-        for c in metric_cols:
-            fb_col = f"{c}_fb"
-            top[c] = top[c].fillna(top[fb_col])
-            top = top.drop(columns=[fb_col])
     agg = (
         top.groupby(["game_pk", "side"], dropna=False)
         .agg(
-            top3_woba_vs_sp_hand_w15=("woba_vs_hand_w15", "mean"),
-            top3_iso_vs_sp_hand_w15=("iso_vs_hand_w15", "mean"),
-            top3_k_rate_vs_sp_hand_w15=("k_rate_vs_hand_w15", "mean"),
-            top3_bb_rate_vs_sp_hand_w15=("bb_rate_vs_hand_w15", "mean"),
-            top3_pa_w15=("sample_pa_w15", "sum"),
             top3_woba_vs_sp_hand_w30=("woba_vs_hand_w30", "mean"),
             top3_iso_vs_sp_hand_w30=("iso_vs_hand_w30", "mean"),
             top3_k_rate_vs_sp_hand_w30=("k_rate_vs_hand_w30", "mean"),
