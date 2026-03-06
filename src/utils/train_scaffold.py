@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,50 @@ from sklearn.preprocessing import StandardScaler
 
 from src.utils.checks import print_rowcount
 from src.utils.io import read_parquet, write_json
+
+
+def _identifier_like_columns(df_cols: list[str]) -> list[str]:
+    exact_drop = {
+        "game_pk",
+        "game_date",
+        "season",
+        "venue_id",
+        "park_id",
+        "home_sp_id",
+        "away_sp_id",
+        "home_team_id",
+        "away_team_id",
+        "home_team",
+        "away_team",
+        "canonical_park_key",
+        "bat_batter",
+        "pit_pitcher",
+    }
+    exact_drop_lower = {c.lower() for c in exact_drop}
+
+    dropped: list[str] = []
+    for c in df_cols:
+        lc = c.lower()
+        if lc in exact_drop_lower:
+            dropped.append(c)
+            continue
+        if "game_pk" in lc:
+            dropped.append(c)
+            continue
+        if "batter_id" in lc or "pitcher_id" in lc:
+            dropped.append(c)
+            continue
+        if lc.endswith("_id"):
+            dropped.append(c)
+            continue
+        if re.match(r".*_id_roll\d+$", lc):
+            dropped.append(c)
+            continue
+        if re.match(r".*game_pk_roll\d+$", lc):
+            dropped.append(c)
+            continue
+
+    return sorted(set(dropped), key=lambda x: x.lower())
 
 
 def _prep_X(df: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.DataFrame, list[str], list[str]]:
@@ -79,7 +124,15 @@ def run_training_scaffold(engine: str, mart_file: str, target_col: str, dirs: di
         print(f"Writing to: {report_path.resolve()}")
         return report
 
-    drop_feature_cols = {target_col, "game_pk", "game_date"}
+    identifier_drop_cols = _identifier_like_columns(list(train_df.columns))
+    logging.info(
+        "%s identifier filter dropped_cols=%s first50=%s",
+        engine,
+        len(identifier_drop_cols),
+        identifier_drop_cols[:50],
+    )
+
+    drop_feature_cols = {target_col, *identifier_drop_cols}
     feature_cols = [c for c in train_df.columns if c not in drop_feature_cols]
 
     logging.info("%s features before preprocessing: %s", engine, len(feature_cols))
