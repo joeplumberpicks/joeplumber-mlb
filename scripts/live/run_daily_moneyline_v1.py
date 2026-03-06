@@ -4,6 +4,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+from typing import Iterable
 
 import joblib
 import numpy as np
@@ -72,6 +73,112 @@ def _latest_model(models_dir: Path) -> Path:
     return cand[-1]
 
 
+def _first_existing(cols: Iterable[str], candidates: list[str]) -> str | None:
+    colset = set(cols)
+    for c in candidates:
+        if c in colset:
+            return c
+    return None
+
+
+def _latest_team_offense_rollups(batter_roll: pd.DataFrame, target_date: pd.Timestamp) -> tuple[pd.DataFrame, str | None]:
+    if batter_roll.empty:
+        return pd.DataFrame(), None
+
+    team_col = _first_existing(
+        batter_roll.columns,
+        ["batter_team", "batting_team", "bat_team", "offense_team", "team", "team_abbrev", "team_name"],
+    )
+    if team_col is None:
+        logging.warning("moneyline live offense rollups skipped: no team column in batter rolling")
+        return pd.DataFrame(), None
+
+    bat = batter_roll.copy()
+    bat["game_date"] = pd.to_datetime(bat.get("game_date"), errors="coerce")
+    bat = bat[(bat["game_date"].notna()) & (bat["game_date"] < target_date)].copy()
+    if bat.empty:
+        return pd.DataFrame(), team_col
+
+    bat["team_key"] = bat[team_col].map(normalize_team_abbr)
+    bat = bat[bat["team_key"].notna()].copy()
+    if bat.empty:
+        return pd.DataFrame(), team_col
+
+    exclude = {
+        "game_pk",
+        "game_date",
+        "season",
+        "batter_id",
+        "batter",
+        "pitcher_id",
+        "home_team",
+        "away_team",
+        "team_key",
+        team_col,
+    }
+    metric_cols = [c for c in bat.select_dtypes(include=[np.number]).columns if c not in exclude]
+    if not metric_cols:
+        return pd.DataFrame(), team_col
+
+    latest_dates = bat.groupby("team_key", as_index=False)["game_date"].max().rename(columns={"game_date": "_max_date"})
+    latest = bat.merge(latest_dates, on="team_key", how="inner")
+    latest = latest[latest["game_date"] == latest["_max_date"]]
+    rollup = latest.groupby("team_key", as_index=True)[metric_cols].mean(numeric_only=True)
+    return rollup, team_col
+
+
+def _latest_pitcher_rollups(pitcher_roll: pd.DataFrame, target_date: pd.Timestamp) -> tuple[pd.DataFrame, str | None]:
+    if pitcher_roll.empty:
+        return pd.DataFrame(), None
+
+    key_col = _first_existing(pitcher_roll.columns, ["pitcher_id", "pitcher", "player_id", "mlb_id"])
+    if key_col is None:
+        logging.warning("moneyline live pitcher rollups skipped: no pitcher id column in pitcher rolling")
+        return pd.DataFrame(), None
+
+    pit = pitcher_roll.copy()
+    pit["game_date"] = pd.to_datetime(pit.get("game_date"), errors="coerce")
+    pit = pit[(pit["game_date"].notna()) & (pit["game_date"] < target_date)].copy()
+    if pit.empty:
+        return pd.DataFrame(), key_col
+
+    pit["pitcher_key"] = pd.to_numeric(pit[key_col], errors="coerce").astype("Int64")
+    pit = pit[pit["pitcher_key"].notna()].copy()
+    if pit.empty:
+        return pd.DataFrame(), key_col
+
+    exclude = {
+        "game_pk",
+        "game_date",
+        "season",
+        "pitcher_id",
+        "pitcher",
+        "player_id",
+        "mlb_id",
+        "home_team",
+        "away_team",
+        "pitcher_key",
+    }
+    metric_cols = [c for c in pit.select_dtypes(include=[np.number]).columns if c not in exclude]
+    if not metric_cols:
+        return pd.DataFrame(), key_col
+
+    pit = pit.sort_values(["pitcher_key", "game_date"], kind="mergesort")
+    latest = pit.groupby("pitcher_key", as_index=False).tail(1).set_index("pitcher_key")
+    return latest[metric_cols], key_col
+
+
+def _pick_metric_name(source_cols: set[str], expected_col: str, prefix: str) -> str | None:
+    if expected_col in source_cols:
+        return expected_col
+    suffix = expected_col[len(prefix) :] if expected_col.startswith(prefix) else expected_col
+    candidates = [suffix, f"{prefix}{suffix}"]
+    for c in candidates:
+        if c in source_cols:
+            return c
+    return None
+
+
 def main() -> None:
     args = parse_args()
     date_ts = pd.to_datetime(args.date, format="%Y-%m-%d", errors="raise")
@@ -86,6 +193,8 @@ def main() -> None:
 
     spine_path = dirs["processed_dir"] / "live" / f"model_spine_game_{args.season}_{args.date}.parquet"
     fallback_mart_path = dirs["marts_dir"] / "by_season" / f"moneyline_features_{args.fallback_season}.parquet"
+    batter_roll_path = dirs["processed_dir"] / "batter_game_rolling.parquet"
+    pitcher_roll_path = dirs["processed_dir"] / "pitcher_game_rolling.parquet"
     model_dir = dirs["models_dir"] / "moneyline_sim"
 
     if not spine_path.exists():
@@ -110,6 +219,14 @@ def main() -> None:
     live_df["away_team_key"] = live_df["away_team"].apply(normalize_team_abbr)
     fallback_df["home_team_key"] = fallback_df["home_team"].apply(normalize_team_abbr)
     fallback_df["away_team_key"] = fallback_df["away_team"].apply(normalize_team_abbr)
+
+    batter_roll = pd.read_parquet(batter_roll_path).copy() if batter_roll_path.exists() else pd.DataFrame()
+    pitcher_roll = pd.read_parquet(pitcher_roll_path).copy() if pitcher_roll_path.exists() else pd.DataFrame()
+    off_roll, off_team_col = _latest_team_offense_rollups(batter_roll, date_ts)
+    pit_roll, pit_key_col = _latest_pitcher_rollups(pitcher_roll, date_ts)
+
+    live_df["away_sp_id"] = pd.to_numeric(live_df["away_sp_id"], errors="coerce").astype("Int64")
+    live_df["home_sp_id"] = pd.to_numeric(live_df["home_sp_id"], errors="coerce").astype("Int64")
 
     logging.info("moneyline live unique home_team_keys=%s", live_df["home_team_key"].nunique())
     logging.info("moneyline live unique away_team_keys=%s", live_df["away_team_key"].nunique())
@@ -145,6 +262,62 @@ def main() -> None:
     expected = list(getattr(model, "feature_names_in_", []))
     if not expected:
         raise ValueError(f"Model missing feature_names_in_: {model_path}")
+
+    X = pd.DataFrame(index=merged.index, columns=expected, dtype="float64")
+
+    off_cols = set(off_roll.columns) if not off_roll.empty else set()
+    pit_cols = set(pit_roll.columns) if not pit_roll.empty else set()
+
+    away_off_match = int(live_df["away_team_key"].isin(off_roll.index).sum()) if not off_roll.empty else 0
+    home_off_match = int(live_df["home_team_key"].isin(off_roll.index).sum()) if not off_roll.empty else 0
+    away_pit_match = int(live_df["away_sp_id"].isin(pit_roll.index).sum()) if not pit_roll.empty else 0
+    home_pit_match = int(live_df["home_sp_id"].isin(pit_roll.index).sum()) if not pit_roll.empty else 0
+
+    bat_populated = 0
+    pit_populated = 0
+    diff_off_populated = 0
+    for col in expected:
+        if col.startswith("bat_") and off_cols:
+            m = _pick_metric_name(off_cols, col, "bat_")
+            if m is not None:
+                away_v = merged["away_team_key"].map(off_roll[m])
+                home_v = merged["home_team_key"].map(off_roll[m])
+                X[col] = (pd.to_numeric(away_v, errors="coerce") + pd.to_numeric(home_v, errors="coerce")) / 2.0
+                if X[col].notna().any():
+                    bat_populated += 1
+        elif col.startswith("pit_") and pit_cols:
+            m = _pick_metric_name(pit_cols, col, "pit_")
+            if m is not None:
+                away_v = merged["away_sp_id"].map(pit_roll[m])
+                home_v = merged["home_sp_id"].map(pit_roll[m])
+                X[col] = (pd.to_numeric(away_v, errors="coerce") + pd.to_numeric(home_v, errors="coerce")) / 2.0
+                if X[col].notna().any():
+                    pit_populated += 1
+        elif col.startswith("diff_off_") and off_cols:
+            m = _pick_metric_name(off_cols, col, "diff_off_")
+            if m is not None:
+                away_v = merged["away_team_key"].map(off_roll[m])
+                home_v = merged["home_team_key"].map(off_roll[m])
+                X[col] = pd.to_numeric(away_v, errors="coerce") - pd.to_numeric(home_v, errors="coerce")
+                if X[col].notna().any():
+                    diff_off_populated += 1
+
+    # fallback mart: fill any remaining feature gaps without overwriting rolling-derived values
+    for col in expected:
+        if X[col].notna().any():
+            continue
+        hcol = f"home_{col}"
+        acol = f"away_{col}"
+        if hcol in merged.columns and acol in merged.columns:
+            home_v = pd.to_numeric(merged[hcol], errors="coerce")
+            away_v = pd.to_numeric(merged[acol], errors="coerce")
+            if col.startswith("diff_off_"):
+                X[col] = away_v - home_v
+            else:
+                X[col] = (away_v + home_v) / 2.0
+        elif col in merged.columns:
+            X[col] = pd.to_numeric(merged[col], errors="coerce")
+
     X = X.reindex(columns=expected, fill_value=np.nan)
 
     logging.info("moneyline live X shape rows=%s cols=%s", X.shape[0], X.shape[1])
@@ -167,6 +340,28 @@ def main() -> None:
         "moneyline live all_missing_feature_cols=%s first30=%s",
         len(all_missing_cols),
         all_missing_cols[:30],
+    )
+    logging.info(
+        "moneyline live populated_feature_families bat_cols=%s pit_cols=%s diff_off_cols=%s",
+        bat_populated,
+        pit_populated,
+        diff_off_populated,
+    )
+    logging.info(
+        "moneyline live offense_rolling_coverage away_matches=%s/%s home_matches=%s/%s team_col=%s",
+        away_off_match,
+        len(live_df),
+        home_off_match,
+        len(live_df),
+        off_team_col,
+    )
+    logging.info(
+        "moneyline live pitcher_rolling_coverage away_matches=%s/%s home_matches=%s/%s pitcher_col=%s",
+        away_pit_match,
+        len(live_df),
+        home_pit_match,
+        len(live_df),
+        pit_key_col,
     )
 
     p_home = model.predict_proba(X)[:, 1]
