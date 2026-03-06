@@ -386,11 +386,29 @@ def main() -> None:
         pit_key_col,
     )
 
-    p_home = model.predict_proba(X)[:, 1]
+    p_home_win_raw = model.predict_proba(X)[:, 1]
+    p_home_win = 0.5 + 0.35 * (p_home_win_raw - 0.5)
+    p_home_win = np.clip(p_home_win, 0.35, 0.65)
+    p_away_win = 1.0 - p_home_win
+
+    logging.info(
+        "moneyline live raw_p_home summary min=%.6f mean=%.6f max=%.6f",
+        float(np.min(p_home_win_raw)) if len(p_home_win_raw) else float("nan"),
+        float(np.mean(p_home_win_raw)) if len(p_home_win_raw) else float("nan"),
+        float(np.max(p_home_win_raw)) if len(p_home_win_raw) else float("nan"),
+    )
+    logging.info(
+        "moneyline live calibrated_p_home summary min=%.6f mean=%.6f max=%.6f",
+        float(np.min(p_home_win)) if len(p_home_win) else float("nan"),
+        float(np.mean(p_home_win)) if len(p_home_win) else float("nan"),
+        float(np.max(p_home_win)) if len(p_home_win) else float("nan"),
+    )
+
     out = merged[["game_date", "game_pk", "away_team", "home_team"]].copy()
     out = out.assign(
-        p_home_win=p_home,
-        p_away_win=(1.0 - p_home),
+        p_home_win_raw=p_home_win_raw,
+        p_home_win=p_home_win,
+        p_away_win=p_away_win,
     )
     out = out.assign(
         pick=np.where(out["p_home_win"] >= 0.5, "HOME", "AWAY"),
