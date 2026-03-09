@@ -90,6 +90,9 @@ def main() -> None:
     batter = pd.read_parquet(bat_path).copy()
     pitcher = pd.read_parquet(pit_path).copy() if pit_path.exists() else pd.DataFrame()
 
+    parks_path = dirs["reference_dir"] / "parks.parquet"
+    weather_path = dirs["processed_dir"] / "weather_game.parquet"
+
     lineup_path = next((p for p in lineup_candidates if p.exists()), None)
     if lineup_path:
         lu = pd.read_parquet(lineup_path).copy()
@@ -114,9 +117,46 @@ def main() -> None:
         lu["player_name"] = lu[name_col] if name_col else lu["batter_id"].astype(str)
         lu["lineup_slot"] = np.nan
 
-    game_cols = [c for c in ["game_pk", "away_team", "home_team", "home_sp_id", "away_sp_id", "temperature", "weather_wind", "park_factor"] if c in spine.columns]
+    game_cols = [c for c in ["game_pk", "away_team", "home_team", "home_sp_id", "away_sp_id", "temperature", "weather_wind", "park_factor", "park_factor_hits", "venue_id", "canonical_park_key", "park_id"] if c in spine.columns]
     g = spine[game_cols].copy()
     g["game_pk"] = pd.to_numeric(g.get("game_pk"), errors="coerce").astype("Int64")
+
+    if weather_path.exists():
+        try:
+            wg = pd.read_parquet(weather_path).copy()
+            if "game_pk" in wg.columns:
+                wg["game_pk"] = pd.to_numeric(wg["game_pk"], errors="coerce").astype("Int64")
+                tcol = _pick(list(wg.columns), ["temperature", "temp_f", "game_temp", "weather_temp"])
+                wcol = _pick(list(wg.columns), ["weather_wind", "wind_speed", "wind_mph", "wind"])
+                keep = ["game_pk"] + ([tcol] if tcol else []) + ([wcol] if wcol else [])
+                g = g.merge(wg[keep].drop_duplicates(subset=["game_pk"], keep="last"), on="game_pk", how="left", suffixes=("", "_wg"))
+                if tcol:
+                    g["temperature"] = pd.to_numeric(g.get("temperature"), errors="coerce").fillna(pd.to_numeric(g.get(f"{tcol}_wg"), errors="coerce"))
+                    g = g.drop(columns=[f"{tcol}_wg"], errors="ignore")
+                if wcol:
+                    g["weather_wind"] = pd.to_numeric(g.get("weather_wind"), errors="coerce").fillna(pd.to_numeric(g.get(f"{wcol}_wg"), errors="coerce"))
+                    g = g.drop(columns=[f"{wcol}_wg"], errors="ignore")
+        except Exception:
+            logging.exception("hit_prop live optional weather join failed; continuing")
+    else:
+        logging.warning("hit_prop live optional weather table missing: %s", weather_path)
+
+    if parks_path.exists():
+        try:
+            parks = pd.read_parquet(parks_path).copy()
+            pkey = _pick(list(parks.columns), ["canonical_park_key", "venue_id", "park_id"])
+            if pkey and "park_factor_hits" in parks.columns:
+                gkey = _pick(list(g.columns), ["canonical_park_key", "venue_id", "park_id"])
+                if gkey:
+                    g["_park_join_key"] = g[gkey].astype(str)
+                    parks["_park_join_key"] = parks[pkey].astype(str)
+                    g = g.merge(parks[["_park_join_key", "park_factor_hits"]].drop_duplicates(subset=["_park_join_key"], keep="last"), on="_park_join_key", how="left", suffixes=("", "_p"))
+                    g["park_factor_hits"] = pd.to_numeric(g.get("park_factor_hits"), errors="coerce").fillna(pd.to_numeric(g.get("park_factor_hits_p"), errors="coerce"))
+                    g = g.drop(columns=["_park_join_key", "park_factor_hits_p"], errors="ignore")
+        except Exception:
+            logging.exception("hit_prop live optional parks join failed; continuing")
+    else:
+        logging.warning("hit_prop live optional parks table missing: %s", parks_path)
 
     team_col = _pick(list(lu.columns), ["batter_team", "team", "team_abbrev", "team_name"])
     bid_col = _pick(list(lu.columns), ["batter_id", "batter", "player_id"])

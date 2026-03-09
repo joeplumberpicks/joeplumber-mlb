@@ -95,6 +95,9 @@ def main() -> None:
     logging.info("hit_prop train dropped_all_null_features_n=%s features=%s", len(dropped_all_null), dropped_all_null)
     if not features:
         raise ValueError("No numeric non-null features available for training")
+    surviving_stats = [(c, int(pd.to_numeric(df[c], errors="coerce").notna().sum()), float(pd.to_numeric(df[c], errors="coerce").notna().mean())) for c in features]
+    logging.info("hit_prop train surviving_features=%s", features)
+    logging.info("hit_prop train surviving_feature_non_null_stats=%s", surviving_stats)
 
     X = df[features].replace([np.inf, -np.inf], np.nan)
     model = Pipeline(

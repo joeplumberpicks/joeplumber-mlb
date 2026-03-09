@@ -143,6 +143,69 @@ def _context_from_spine(spine: pd.DataFrame) -> pd.DataFrame:
     return by_game, by_player
 
 
+
+
+def _join_optional_park_weather(batter: pd.DataFrame, dirs: dict[str, Path], spine: pd.DataFrame) -> pd.DataFrame:
+    out = batter.copy()
+
+    parks_path = dirs["reference_dir"] / "parks.parquet"
+    if parks_path.exists():
+        try:
+            parks = pd.read_parquet(parks_path).copy()
+            parks_key = _pick(list(parks.columns), ["canonical_park_key", "venue_id", "park_id"])
+            if parks_key and "park_factor_hits" in parks.columns:
+                out_key_col = _pick(list(out.columns), ["canonical_park_key", "venue_id", "park_id"])
+                if out_key_col is None and not spine.empty:
+                    spine_k = _pick(list(spine.columns), ["canonical_park_key", "venue_id", "park_id"])
+                    if spine_k:
+                        sp = spine[["game_pk", spine_k]].copy().rename(columns={spine_k: "_park_join_key"})
+                        sp["game_pk"] = pd.to_numeric(sp["game_pk"], errors="coerce").astype("Int64")
+                        out = out.merge(sp.drop_duplicates(subset=["game_pk"], keep="last"), on="game_pk", how="left")
+                        out_key_col = "_park_join_key"
+                if out_key_col:
+                    left = out.copy()
+                    left["_park_join_key"] = left[out_key_col].astype(str)
+                    p2 = parks[[parks_key, "park_factor_hits"]].copy()
+                    p2["_park_join_key"] = p2[parks_key].astype(str)
+                    out = left.merge(p2[["_park_join_key", "park_factor_hits"]].drop_duplicates(subset=["_park_join_key"]), on="_park_join_key", how="left")
+                    out = out.drop(columns=["_park_join_key"], errors="ignore")
+            else:
+                logging.warning("parks.parquet found but missing expected keys/park_factor_hits")
+        except Exception:
+            logging.exception("Failed optional parks join; continuing without park_factor_hits")
+    else:
+        logging.warning("Optional parks reference missing: %s", parks_path)
+
+    weather_path = dirs["processed_dir"] / "weather_game.parquet"
+    if weather_path.exists():
+        try:
+            wg = pd.read_parquet(weather_path).copy()
+            if "game_pk" in wg.columns:
+                wg["game_pk"] = pd.to_numeric(wg["game_pk"], errors="coerce").astype("Int64")
+                temp_col = _pick(list(wg.columns), ["temperature", "temp_f", "game_temp", "weather_temp"])
+                wind_col = _pick(list(wg.columns), ["weather_wind", "wind_speed", "wind_mph", "wind"])
+                keep = ["game_pk"]
+                if temp_col:
+                    keep.append(temp_col)
+                if wind_col:
+                    keep.append(wind_col)
+                tmp = wg[keep].drop_duplicates(subset=["game_pk"], keep="last")
+                out = out.merge(tmp, on="game_pk", how="left", suffixes=("", "_wg"))
+                if temp_col:
+                    out["temperature"] = pd.to_numeric(out.get("temperature"), errors="coerce").fillna(pd.to_numeric(out.get(f"{temp_col}_wg"), errors="coerce"))
+                    out = out.drop(columns=[f"{temp_col}_wg"], errors="ignore")
+                if wind_col:
+                    out["weather_wind"] = pd.to_numeric(out.get("weather_wind"), errors="coerce").fillna(pd.to_numeric(out.get(f"{wind_col}_wg"), errors="coerce"))
+                    out = out.drop(columns=[f"{wind_col}_wg"], errors="ignore")
+        except Exception:
+            logging.exception("Failed optional weather_game join; continuing")
+    else:
+        logging.warning("Optional weather table missing: %s", weather_path)
+
+    if "park_factor_hits" not in out.columns:
+        out["park_factor_hits"] = np.nan
+    return out
+
 def main() -> None:
     args = parse_args()
     repo_root = get_repo_root()
@@ -214,6 +277,8 @@ def main() -> None:
             batter["lineup_slot"] = pd.to_numeric(batter["lineup_slot"], errors="coerce").fillna(pd.to_numeric(batter.get("lineup_slot_spine"), errors="coerce"))
             batter = batter.drop(columns=["lineup_slot_spine"], errors="ignore")
 
+    batter = _join_optional_park_weather(batter, dirs, spine)
+
     if not pitcher.empty:
         pitcher["game_pk"] = pd.to_numeric(pitcher.get("game_pk"), errors="coerce").astype("Int64")
         pid_col = _pick(list(pitcher.columns), ["pitcher_id", "pitcher", "player_id", "mlb_id"])
@@ -252,12 +317,12 @@ def main() -> None:
 
     context_cols = [
         "lineup_slot",
-        "park_factor",
-        "weather_wind",
-        "temperature",
         "expected_batting_order_pa",
         "lineup_confidence",
         "expected_ab_proxy",
+        "park_factor_hits",
+        "temperature",
+        "weather_wind",
     ]
 
     for season in range(args.season_start, args.season_end + 1):

@@ -111,6 +111,8 @@ def main() -> None:
     logging.info("hit_prop eval dropped_all_null_features_n=%s features=%s", len(dropped_all_null), dropped_all_null)
     logging.info("hit_prop eval final_feature_count=%s", len(feats))
     logging.info("hit_prop eval surviving_features=%s", feats)
+    surviving_stats = [(c, int(pd.to_numeric(train[c], errors="coerce").notna().sum()), float(pd.to_numeric(train[c], errors="coerce").notna().mean())) for c in feats]
+    logging.info("hit_prop eval surviving_feature_non_null_stats=%s", surviving_stats)
     if not feats:
         raise ValueError("No numeric non-null features available for evaluation")
 
