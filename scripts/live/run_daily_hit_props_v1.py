@@ -227,26 +227,38 @@ def main() -> None:
 
     board["expected_batting_order_pa"] = pd.to_numeric(board["lineup_slot"], errors="coerce").map(LINEUP_PA_MAP)
     board["lineup_confidence"] = _lineup_conf(board["lineup_slot"])
-    if "bat_ab_per_game_roll15" not in X.columns:
-        X["bat_ab_per_game_roll15"] = np.nan
-    if "bat_pa_per_game_roll15" not in X.columns:
-        X["bat_pa_per_game_roll15"] = np.nan
-    X["expected_batting_order_pa"] = pd.to_numeric(board["expected_batting_order_pa"], errors="coerce")
-    X["lineup_confidence"] = pd.to_numeric(board["lineup_confidence"], errors="coerce")
-    has_slot = pd.to_numeric(board.get("lineup_slot"), errors="coerce").notna()
-    X["expected_ab_proxy"] = pd.Series(np.nan, index=X.index, dtype="float64")
-    X.loc[has_slot, "expected_ab_proxy"] = pd.to_numeric(X.loc[has_slot, "lineup_confidence"], errors="coerce") * pd.to_numeric(X.loc[has_slot, "expected_batting_order_pa"], errors="coerce")
 
-    X = X.reindex(columns=feats, fill_value=np.nan)
+    has_slot = pd.to_numeric(board.get("lineup_slot"), errors="coerce").notna()
+    ab_proxy_series = pd.Series(np.nan, index=X.index, dtype="float64")
+    ab_proxy_series.loc[has_slot] = (
+        pd.to_numeric(board.loc[has_slot, "lineup_confidence"], errors="coerce")
+        * pd.to_numeric(board.loc[has_slot, "expected_batting_order_pa"], errors="coerce")
+    )
+
+    x_extra = {
+        "bat_ab_per_game_roll15": pd.to_numeric(X["bat_ab_per_game_roll15"], errors="coerce") if "bat_ab_per_game_roll15" in X.columns else pd.Series(np.nan, index=X.index, dtype="float64"),
+        "bat_pa_per_game_roll15": pd.to_numeric(X["bat_pa_per_game_roll15"], errors="coerce") if "bat_pa_per_game_roll15" in X.columns else pd.Series(np.nan, index=X.index, dtype="float64"),
+        "expected_batting_order_pa": pd.to_numeric(board["expected_batting_order_pa"], errors="coerce"),
+        "lineup_confidence": pd.to_numeric(board["lineup_confidence"], errors="coerce"),
+        "expected_ab_proxy": ab_proxy_series,
+    }
+    X = pd.concat([X, pd.DataFrame(x_extra, index=X.index)], axis=1)
+
+    # scoring matrix remains aligned to trained features only
+    X_scoring = X.reindex(columns=feats, fill_value=np.nan)
+
     real_slot = int(pd.to_numeric(board.get("lineup_slot"), errors="coerce").notna().sum()) if "lineup_slot" in board.columns else 0
     fallback_conf_only = int(((pd.to_numeric(board.get("lineup_slot"), errors="coerce").isna()) & (pd.to_numeric(board.get("lineup_confidence"), errors="coerce").notna())).sum()) if "lineup_confidence" in board.columns else 0
-    ab_non_null = int(pd.to_numeric(X.get("expected_ab_proxy"), errors="coerce").notna().sum())
+    if "expected_ab_proxy" in X.columns:
+        expected_ab_proxy = pd.to_numeric(X["expected_ab_proxy"], errors="coerce")
+    else:
+        expected_ab_proxy = pd.Series(np.nan, index=X.index, dtype="float64")
+    ab_non_null = int(expected_ab_proxy.notna().sum())
     logging.info("hit_prop live lineup_slot_real_count=%s", real_slot)
     logging.info("hit_prop live lineup_confidence_fallback_only_count=%s", fallback_conf_only)
     logging.info("hit_prop live expected_ab_proxy_non_null_count=%s", ab_non_null)
 
-    base_hit_probability = model.predict_proba(X)[:, 1]
-    expected_ab_proxy = pd.to_numeric(X.get("expected_ab_proxy"), errors="coerce")
+    base_hit_probability = model.predict_proba(X_scoring)[:, 1]
     live_adjusted_hit_probability = np.clip(
         base_hit_probability + 0.015 * (expected_ab_proxy.fillna(4.1) - 4.1),
         0.01,
@@ -256,7 +268,7 @@ def main() -> None:
     logging.info("hit_prop live average_adjustment_applied=%.6f", avg_adjustment)
 
     out = board[[c for c in ["player_name", "batter_team", "opponent_team", "lineup_slot", "expected_batting_order_pa", "lineup_confidence"] if c in board.columns]].copy()
-    out["bat_ab_per_game_roll15"] = pd.to_numeric(X.get("bat_ab_per_game_roll15"), errors="coerce")
+    out["bat_ab_per_game_roll15"] = pd.to_numeric(X["bat_ab_per_game_roll15"], errors="coerce") if "bat_ab_per_game_roll15" in X.columns else pd.Series(np.nan, index=out.index, dtype="float64")
     out["expected_ab_proxy"] = expected_ab_proxy
     out["base_hit_probability"] = base_hit_probability
     out["live_adjusted_hit_probability"] = live_adjusted_hit_probability
