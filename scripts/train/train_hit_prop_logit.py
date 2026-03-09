@@ -39,8 +39,18 @@ def _season_filter(df: pd.DataFrame, start: int, end: int) -> pd.DataFrame:
     if season.notna().any():
         return df[(season >= start) & (season <= end)].copy()
     gd = pd.to_datetime(df.get("game_date"), errors="coerce")
-    sy = gd.dt.year
-    return df[(sy >= start) & (sy <= end)].copy()
+    return df[(gd.dt.year >= start) & (gd.dt.year <= end)].copy()
+
+
+def _drop_all_null_numeric_features(df: pd.DataFrame, features: list[str]) -> tuple[list[str], list[str]]:
+    keep: list[str] = []
+    dropped: list[str] = []
+    for c in features:
+        if pd.to_numeric(df[c], errors="coerce").notna().any():
+            keep.append(c)
+        else:
+            dropped.append(c)
+    return keep, dropped
 
 
 def main() -> None:
@@ -72,11 +82,13 @@ def main() -> None:
     y = pd.to_numeric(df[TARGET], errors="coerce").astype(int)
 
     excluded = {"game_pk", "batter_id", "opp_pitcher_id", "season", TARGET, "target_hit1p", "target_hit_1p"}
-    feats = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in excluded]
-    if not feats:
-        raise ValueError("No numeric features available")
+    numeric_features = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in excluded]
+    features, dropped_all_null = _drop_all_null_numeric_features(df, numeric_features)
+    logging.info("hit_prop train dropped_all_null_features_n=%s features=%s", len(dropped_all_null), dropped_all_null)
+    if not features:
+        raise ValueError("No numeric non-null features available for training")
 
-    X = df[feats].replace([np.inf, -np.inf], np.nan)
+    X = df[features].replace([np.inf, -np.inf], np.nan)
     model = Pipeline(
         [
             ("imputer", SimpleImputer(strategy="median")),
@@ -93,16 +105,20 @@ def main() -> None:
 
     bundle = {
         "model": model,
-        "feature_list": feats,
+        "feature_list": features,
         "target": TARGET,
         "train_start": args.train_start,
         "train_end": args.train_end,
         "trained_at": ts,
         "n_rows": int(len(df)),
+        "dropped_all_null_features": dropped_all_null,
     }
     joblib.dump(bundle, model_path)
 
-    coef = pd.DataFrame({"feature": feats, "coef": model.named_steps["clf"].coef_[0]})
+    coef_vals = model.named_steps["clf"].coef_[0]
+    if len(coef_vals) != len(features):
+        raise ValueError(f"Coefficient length mismatch coef={len(coef_vals)} features={len(features)}")
+    coef = pd.DataFrame({"feature": features, "coef": coef_vals})
     coef_path = out_dir / f"hit_prop_logit_{ts}_coefficients.csv"
     coef.to_csv(coef_path, index=False)
 
@@ -110,7 +126,7 @@ def main() -> None:
     with meta_path.open("w", encoding="utf-8") as f:
         json.dump({k: v for k, v in bundle.items() if k != "model"}, f, indent=2)
 
-    logging.info("trained hit_prop model rows=%s features=%s path=%s", len(df), len(feats), model_path)
+    logging.info("trained hit_prop model rows=%s features=%s path=%s", len(df), len(features), model_path)
     print(f"model_out={model_path}")
 
 

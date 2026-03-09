@@ -42,13 +42,30 @@ def _season(df: pd.DataFrame) -> pd.Series:
     return pd.to_datetime(df.get("game_date"), errors="coerce").dt.year
 
 
+def _drop_all_null_numeric_features(df: pd.DataFrame, features: list[str]) -> tuple[list[str], list[str]]:
+    keep: list[str] = []
+    dropped: list[str] = []
+    for c in features:
+        if pd.to_numeric(df[c], errors="coerce").notna().any():
+            keep.append(c)
+        else:
+            dropped.append(c)
+    return keep, dropped
+
+
 def _cal_bins(y: np.ndarray, p: np.ndarray, bins: int = 10) -> pd.DataFrame:
     d = pd.DataFrame({"y": y, "p": p}).sort_values("p").reset_index(drop=True)
     try:
         d["bin"] = pd.qcut(d["p"], q=min(bins, max(1, len(d))), labels=False, duplicates="drop")
     except Exception:
         d["bin"] = 0
-    return d.groupby("bin", as_index=False).agg(n=("y", "size"), p_mean=("p", "mean"), y_mean=("y", "mean"), p_min=("p", "min"), p_max=("p", "max"))
+    return d.groupby("bin", as_index=False).agg(
+        n=("y", "size"),
+        p_mean=("p", "mean"),
+        y_mean=("y", "mean"),
+        p_min=("p", "min"),
+        p_max=("p", "max"),
+    )
 
 
 def main() -> None:
@@ -68,6 +85,9 @@ def main() -> None:
             df[TARGET] = pd.to_numeric(df["target_hit1p"], errors="coerce")
         elif "target_hit_1p" in df.columns:
             df[TARGET] = pd.to_numeric(df["target_hit_1p"], errors="coerce")
+    if TARGET not in df.columns:
+        raise ValueError("Missing target_hit_1_plus in mart")
+
     season = _season(df)
     train = df[(season >= args.train_start) & (season <= args.train_end)].copy()
     test = df[season == args.test_season].copy()
@@ -78,15 +98,22 @@ def main() -> None:
     y_test = pd.to_numeric(test[TARGET], errors="coerce").astype(int)
 
     excluded = {"game_pk", "batter_id", "opp_pitcher_id", "season", TARGET, "target_hit1p", "target_hit_1p"}
-    feats = [c for c in train.columns if pd.api.types.is_numeric_dtype(train[c]) and c not in excluded]
+    numeric_features = [c for c in train.columns if pd.api.types.is_numeric_dtype(train[c]) and c not in excluded]
+    feats, dropped_all_null = _drop_all_null_numeric_features(train, numeric_features)
+    logging.info("hit_prop eval dropped_all_null_features_n=%s features=%s", len(dropped_all_null), dropped_all_null)
+    logging.info("hit_prop eval final_feature_count=%s", len(feats))
+    if not feats:
+        raise ValueError("No numeric non-null features available for evaluation")
 
     pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler()),
         ("clf", LogisticRegression(max_iter=4000, solver="lbfgs")),
     ])
-    pipe.fit(train[feats].replace([np.inf, -np.inf], np.nan), y_train)
-    p = pipe.predict_proba(test[feats].replace([np.inf, -np.inf], np.nan))[:, 1]
+    X_train = train[feats].replace([np.inf, -np.inf], np.nan)
+    X_test = test[feats].replace([np.inf, -np.inf], np.nan)
+    pipe.fit(X_train, y_train)
+    p = pipe.predict_proba(X_test)[:, 1]
 
     scored = test.copy()
     scored["hit_probability"] = p
@@ -99,6 +126,7 @@ def main() -> None:
         "top_decile_hit_rate": float(pd.to_numeric(top_decile[TARGET], errors="coerce").mean()) if len(top_decile) else None,
         "n_train": int(len(train)),
         "n_test": int(len(test)),
+        "feature_count": int(len(feats)),
     }
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -109,7 +137,13 @@ def main() -> None:
     scored_path = out_dir / f"eval_hit_prop_{ts}_scored_test.csv"
 
     with json_path.open("w", encoding="utf-8") as f:
-        json.dump({"metrics": metrics, "train_start": args.train_start, "train_end": args.train_end, "test_season": args.test_season}, f, indent=2)
+        json.dump({
+            "metrics": metrics,
+            "train_start": args.train_start,
+            "train_end": args.train_end,
+            "test_season": args.test_season,
+            "dropped_all_null_features": dropped_all_null,
+        }, f, indent=2)
     _cal_bins(y_test.to_numpy(), p).to_csv(cal_path, index=False)
     scored.to_csv(scored_path, index=False)
 

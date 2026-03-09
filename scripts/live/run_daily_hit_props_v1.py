@@ -74,6 +74,10 @@ def main() -> None:
     log_header("scripts/live/run_daily_hit_props_v1.py", repo_root, config_path, dirs)
 
     spine_path = dirs["processed_dir"] / "live" / f"model_spine_game_{args.season}_{args.date}.parquet"
+    if not spine_path.exists():
+        raise FileNotFoundError(
+            f"Live spine not found: {spine_path}. Build it first (e.g. run scripts/live/build_spine_from_schedule.py for the requested season/date)."
+        )
     bat_path = dirs["processed_dir"] / "batter_game_rolling.parquet"
     pit_path = dirs["processed_dir"] / "pitcher_game_rolling.parquet"
     lineup_candidates = [

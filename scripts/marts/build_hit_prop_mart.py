@@ -30,9 +30,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def _pick(cols: list[str], cands: list[str]) -> str | None:
-    s = set(cols)
+    colset = set(cols)
     for c in cands:
-        if c in s:
+        if c in colset:
             return c
     return None
 
@@ -49,11 +49,11 @@ def _read_targets(processed_dir: Path, season: int) -> pd.DataFrame:
                 t["target_hit_1_plus"] = pd.to_numeric(t["target_hit_1p"], errors="coerce").astype("Int64")
         if "target_hit_1_plus" not in t.columns:
             continue
-        t["game_pk"] = pd.to_numeric(t.get("game_pk"), errors="coerce").astype("Int64")
-        bid = _pick(list(t.columns), ["batter_id", "batter", "player_id", "mlbam_batter_id"])
-        if bid is None:
+        batter_col = _pick(list(t.columns), ["batter_id", "batter", "player_id", "mlbam_batter_id"])
+        if batter_col is None:
             continue
-        t["batter_id"] = pd.to_numeric(t[bid], errors="coerce").astype("Int64")
+        t["game_pk"] = pd.to_numeric(t.get("game_pk"), errors="coerce").astype("Int64")
+        t["batter_id"] = pd.to_numeric(t[batter_col], errors="coerce").astype("Int64")
         return t[["game_pk", "batter_id", "target_hit_1_plus"]].drop_duplicates()
     return pd.DataFrame(columns=["game_pk", "batter_id", "target_hit_1_plus"])
 
@@ -70,15 +70,39 @@ def _lineup_conf(slot: pd.Series) -> pd.Series:
 def _derive_ab_pa_per_game(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if "bat_ab_per_game_roll15" not in out.columns:
-        ab_col = _pick(list(out.columns), ["bat_ab_roll15", "ab_roll15", "bat_ab_roll_15"])
-        g_col = _pick(list(out.columns), ["bat_g_roll15", "g_roll15", "games_roll15", "bat_games_roll15"])
-        if ab_col and g_col:
+        ab_col = _pick(list(out.columns), ["bat_ab_per_game_roll15", "ab_per_game_roll15", "bat_ab_roll15", "ab_roll15"])
+        g_col = _pick(list(out.columns), ["bat_g_roll15", "games_roll15", "g_roll15", "bat_games_roll15"])
+        if ab_col and g_col and ab_col != "bat_ab_per_game_roll15":
             out["bat_ab_per_game_roll15"] = pd.to_numeric(out[ab_col], errors="coerce") / pd.to_numeric(out[g_col], errors="coerce").replace(0, np.nan)
     if "bat_pa_per_game_roll15" not in out.columns:
-        pa_col = _pick(list(out.columns), ["bat_pa_roll15", "pa_roll15", "bat_pa_roll_15"])
-        g_col = _pick(list(out.columns), ["bat_g_roll15", "g_roll15", "games_roll15", "bat_games_roll15"])
-        if pa_col and g_col:
+        pa_col = _pick(list(out.columns), ["bat_pa_per_game_roll15", "pa_per_game_roll15", "bat_pa_roll15", "pa_roll15"])
+        g_col = _pick(list(out.columns), ["bat_g_roll15", "games_roll15", "g_roll15", "bat_games_roll15"])
+        if pa_col and g_col and pa_col != "bat_pa_per_game_roll15":
             out["bat_pa_per_game_roll15"] = pd.to_numeric(out[pa_col], errors="coerce") / pd.to_numeric(out[g_col], errors="coerce").replace(0, np.nan)
+    return out
+
+
+def _context_from_spine(spine: pd.DataFrame) -> pd.DataFrame:
+    s = spine.copy()
+    s["game_pk"] = pd.to_numeric(s.get("game_pk"), errors="coerce").astype("Int64")
+
+    park_col = _pick(list(s.columns), ["park_factor", "park_factor_run", "venue_factor", "park_run_factor"])
+    wind_col = _pick(list(s.columns), ["weather_wind", "wind_speed", "wind_mph", "wind"])
+    temp_col = _pick(list(s.columns), ["temperature", "temp_f", "game_temp", "weather_temp"])
+
+    out = s[["game_pk"]].drop_duplicates().copy()
+    out["park_factor"] = pd.to_numeric(s[park_col], errors="coerce") if park_col else np.nan
+    out["weather_wind"] = pd.to_numeric(s[wind_col], errors="coerce") if wind_col else np.nan
+    out["temperature"] = pd.to_numeric(s[temp_col], errors="coerce") if temp_col else np.nan
+
+    if "lineup_slot" in s.columns:
+        lineup = pd.to_numeric(s["lineup_slot"], errors="coerce")
+        if lineup.notna().any() and "batter_id" in s.columns:
+            tmp = s[["game_pk", "batter_id", "lineup_slot"]].copy()
+            tmp["game_pk"] = pd.to_numeric(tmp["game_pk"], errors="coerce").astype("Int64")
+            tmp["batter_id"] = pd.to_numeric(tmp["batter_id"], errors="coerce").astype("Int64")
+            tmp["lineup_slot"] = pd.to_numeric(tmp["lineup_slot"], errors="coerce")
+            out = out.merge(tmp.drop_duplicates(subset=["game_pk", "batter_id"]), on="game_pk", how="left")
     return out
 
 
@@ -94,23 +118,25 @@ def main() -> None:
 
     bat_path = dirs["processed_dir"] / "batter_game_rolling.parquet"
     pit_path = dirs["processed_dir"] / "pitcher_game_rolling.parquet"
+    spine_path = dirs["processed_dir"] / "model_spine_game.parquet"
     batter = pd.read_parquet(bat_path).copy()
     pitcher = pd.read_parquet(pit_path).copy() if pit_path.exists() else pd.DataFrame()
+    spine = pd.read_parquet(spine_path).copy() if spine_path.exists() else pd.DataFrame()
 
     batter["game_pk"] = pd.to_numeric(batter.get("game_pk"), errors="coerce").astype("Int64")
     batter["game_date"] = pd.to_datetime(batter.get("game_date"), errors="coerce")
-    bid_col = _pick(list(batter.columns), ["batter_id", "batter", "player_id", "mlbam_batter_id"])
-    if bid_col is None:
-        raise ValueError("batter rolling missing batter id column")
-    batter["batter_id"] = pd.to_numeric(batter[bid_col], errors="coerce").astype("Int64")
+    batter_id_col = _pick(list(batter.columns), ["batter_id", "batter", "player_id", "mlbam_batter_id"])
+    if batter_id_col is None:
+        raise ValueError("batter rolling missing batter identifier")
+    batter["batter_id"] = pd.to_numeric(batter[batter_id_col], errors="coerce").astype("Int64")
 
     team_col = _pick(list(batter.columns), ["batter_team", "bat_team", "batting_team", "team", "team_abbrev", "team_name"])
     home_col = _pick(list(batter.columns), ["home_team", "home_team_abbr"])
     away_col = _pick(list(batter.columns), ["away_team", "away_team_abbr"])
-    lineup_col = _pick(list(batter.columns), ["lineup_slot", "bat_order", "batting_order"])
+    lineup_col = _pick(list(batter.columns), ["lineup_slot", "bat_order", "batting_order", "lineup_position"])
 
     batter["batter_team"] = batter[team_col] if team_col else pd.NA
-    if home_col and away_col and team_col:
+    if team_col and home_col and away_col:
         batter["home_away"] = np.where(batter[team_col].astype(str) == batter[home_col].astype(str), 1.0, 0.0)
         batter["opponent_team"] = np.where(batter["home_away"] == 1.0, batter[away_col], batter[home_col])
     else:
@@ -118,8 +144,28 @@ def main() -> None:
         batter["opponent_team"] = pd.NA
 
     batter["lineup_slot"] = pd.to_numeric(batter[lineup_col], errors="coerce") if lineup_col else np.nan
-    batter["expected_batting_order_pa"] = batter["lineup_slot"].map(LINEUP_PA_MAP)
-    batter["lineup_confidence"] = _lineup_conf(batter["lineup_slot"])
+
+    if not spine.empty:
+        ctx = _context_from_spine(spine)
+        merge_cols = ["game_pk"]
+        if "batter_id" in ctx.columns and ctx["batter_id"].notna().any():
+            merge_cols = ["game_pk", "batter_id"]
+        batter = batter.merge(ctx.drop_duplicates(subset=merge_cols), on=merge_cols, how="left", suffixes=("", "_spine"))
+        for c in ["lineup_slot", "park_factor", "weather_wind", "temperature"]:
+            spine_c = f"{c}_spine"
+            if spine_c in batter.columns:
+                batter[c] = pd.to_numeric(batter[c], errors="coerce").fillna(pd.to_numeric(batter[spine_c], errors="coerce"))
+                batter = batter.drop(columns=[spine_c], errors="ignore")
+
+    if "park_factor" not in batter.columns:
+        park_col = _pick(list(batter.columns), ["park_factor", "park_factor_run", "venue_factor", "park_run_factor"])
+        batter["park_factor"] = pd.to_numeric(batter[park_col], errors="coerce") if park_col else np.nan
+    if "weather_wind" not in batter.columns:
+        wind_col = _pick(list(batter.columns), ["weather_wind", "wind_speed", "wind_mph", "wind"])
+        batter["weather_wind"] = pd.to_numeric(batter[wind_col], errors="coerce") if wind_col else np.nan
+    if "temperature" not in batter.columns:
+        temp_col = _pick(list(batter.columns), ["temperature", "temp_f", "game_temp", "weather_temp"])
+        batter["temperature"] = pd.to_numeric(batter[temp_col], errors="coerce") if temp_col else np.nan
 
     if not pitcher.empty:
         pitcher["game_pk"] = pd.to_numeric(pitcher.get("game_pk"), errors="coerce").astype("Int64")
@@ -134,6 +180,8 @@ def main() -> None:
             batter = batter.merge(pit_game_team, on=["game_pk", "opponent_team"], how="left")
 
     batter = _derive_ab_pa_per_game(batter)
+    batter["expected_batting_order_pa"] = pd.to_numeric(batter["lineup_slot"], errors="coerce").map(LINEUP_PA_MAP)
+    batter["lineup_confidence"] = _lineup_conf(batter["lineup_slot"])
     batter["expected_ab_proxy"] = batter["lineup_confidence"] * (
         0.65 * pd.to_numeric(batter.get("bat_ab_per_game_roll15"), errors="coerce")
         + 0.35 * pd.to_numeric(batter.get("expected_batting_order_pa"), errors="coerce")
@@ -158,19 +206,30 @@ def main() -> None:
 
     for season in range(args.season_start, args.season_end + 1):
         s_df = batter[pd.to_numeric(batter["season"], errors="coerce") == season].copy()
-        t = _read_targets(dirs["processed_dir"], season)
-        if not t.empty:
-            s_df = s_df.merge(t, on=["game_pk", "batter_id"], how="left")
+        targets = _read_targets(dirs["processed_dir"], season)
+        if not targets.empty:
+            s_df = s_df.merge(targets, on=["game_pk", "batter_id"], how="left")
         s_df = s_df.drop_duplicates(subset=["game_pk", "batter_id"], keep="last")
+
+        context_cols = ["lineup_slot", "park_factor", "weather_wind", "temperature"]
+        context_rates = {c: float(pd.to_numeric(s_df.get(c), errors="coerce").notna().mean()) if c in s_df.columns else 0.0 for c in context_cols}
+        logging.info("hit_prop_mart season=%s rows=%s context_non_null_rates=%s", season, len(s_df), context_rates)
+
         out_season = by_season_dir / f"hit_prop_features_{season}.parquet"
         write_parquet(s_df, out_season)
-        logging.info("hit_prop_mart season=%s rows=%s path=%s", season, len(s_df), out_season)
         all_frames.append(s_df)
 
     full = pd.concat(all_frames, ignore_index=True, sort=False) if all_frames else pd.DataFrame()
     full_sort_cols = [c for c in ["game_date", "game_pk", "batter_id"] if c in full.columns]
     if full_sort_cols:
         full = full.sort_values(full_sort_cols, kind="mergesort")
+
+    full_context_rates = {
+        c: float(pd.to_numeric(full.get(c), errors="coerce").notna().mean()) if c in full.columns else 0.0
+        for c in ["lineup_slot", "park_factor", "weather_wind", "temperature"]
+    }
+    logging.info("hit_prop_mart full_rows=%s context_non_null_rates=%s", len(full), full_context_rates)
+
     out_full = dirs["marts_dir"] / "hit_prop_features.parquet"
     write_parquet(full, out_full)
     logging.info("hit_prop_mart complete rows=%s path=%s", len(full), out_full)
