@@ -80,11 +80,7 @@ def main() -> None:
         )
     bat_path = dirs["processed_dir"] / "batter_game_rolling.parquet"
     pit_path = dirs["processed_dir"] / "pitcher_game_rolling.parquet"
-    lineup_candidates = [
-        dirs["processed_dir"] / "live" / f"projected_lineups_{args.season}_{args.date}.parquet",
-        dirs["processed_dir"] / "live" / f"lineups_{args.season}_{args.date}.parquet",
-        dirs["processed_dir"] / "live" / f"confirmed_lineups_{args.season}_{args.date}.parquet",
-    ]
+    lineup_path = dirs["processed_dir"] / "live" / f"lineups_{args.season}_{args.date}.parquet"
 
     spine = pd.read_parquet(spine_path).copy()
     batter = pd.read_parquet(bat_path).copy()
@@ -93,29 +89,15 @@ def main() -> None:
     parks_path = dirs["reference_dir"] / "parks.parquet"
     weather_path = dirs["processed_dir"] / "weather_game.parquet"
 
-    lineup_path = next((p for p in lineup_candidates if p.exists()), None)
-    if lineup_path:
-        lu = pd.read_parquet(lineup_path).copy()
-    else:
-        # fallback pool: top recent batters per team
-        team_col = _pick(list(batter.columns), ["batter_team", "bat_team", "batting_team", "team"])
-        bid_col = _pick(list(batter.columns), ["batter_id", "batter", "player_id"])
-        name_col = _pick(list(batter.columns), ["player_name", "batter_name", "name"])
-        score_col = _pick(list(batter.columns), ["bat_pa_roll15", "bat_pa_roll30", "bat_h_roll30"])
-        tmp = batter.copy()
-        tmp["game_date"] = pd.to_datetime(tmp.get("game_date"), errors="coerce")
-        tmp = tmp[tmp["game_date"] < slate_date]
-        tmp["_score"] = pd.to_numeric(tmp.get(score_col), errors="coerce") if score_col else 0.0
-        lu = (
-            tmp.sort_values([team_col, "_score"], ascending=[True, False], kind="mergesort")
-            .groupby(team_col)
-            .head(9)
-            .copy()
+    if not lineup_path.exists():
+        raise FileNotFoundError(
+            "Missing live lineup file. Build lineups first with scripts/live/build_live_lineups.py"
         )
-        lu["batter_team"] = lu[team_col]
-        lu["batter_id"] = pd.to_numeric(lu[bid_col], errors="coerce").astype("Int64")
-        lu["player_name"] = lu[name_col] if name_col else lu["batter_id"].astype(str)
-        lu["lineup_slot"] = np.nan
+    lu = pd.read_parquet(lineup_path).copy()
+    if len(lu) == 0:
+        raise ValueError(
+            "Live lineup file is empty. Build lineups first with scripts/live/build_live_lineups.py"
+        )
 
     game_cols = [c for c in ["game_pk", "away_team", "home_team", "home_sp_id", "away_sp_id", "temperature", "weather_wind", "park_factor", "park_factor_hits", "venue_id", "canonical_park_key", "park_id"] if c in spine.columns]
     g = spine[game_cols].copy()
