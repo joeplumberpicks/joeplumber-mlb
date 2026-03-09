@@ -168,6 +168,9 @@ def main() -> None:
         all_frames.append(s_df)
 
     full = pd.concat(all_frames, ignore_index=True, sort=False) if all_frames else pd.DataFrame()
+    full_sort_cols = [c for c in ["game_date", "game_pk", "batter_id"] if c in full.columns]
+    if full_sort_cols:
+        full = full.sort_values(full_sort_cols, kind="mergesort")
     out_full = dirs["marts_dir"] / "hit_prop_features.parquet"
     write_parquet(full, out_full)
     logging.info("hit_prop_mart complete rows=%s path=%s", len(full), out_full)
