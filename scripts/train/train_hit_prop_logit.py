@@ -27,7 +27,7 @@ TARGET = "target_hit_1_plus"
 
 
 SAFE_ENGINEERED_COLS = {
-    "lineup_slot", "expected_batting_order_pa", "lineup_confidence", "bat_ab_per_game_roll15", "bat_pa_per_game_roll15", "expected_ab_proxy", "park_factor_hits", "temperature", "weather_wind"
+    "lineup_slot", "expected_batting_order_pa", "lineup_confidence", "bat_ab_per_game_roll15", "bat_pa_per_game_roll15", "expected_ab_proxy", "park_factor_hits_hist", "park_factor_hits_2026_roll", "park_factor_hits_blend", "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"
 }
 ROLL_SUFFIXES = ("_roll3", "_roll7", "_roll15", "_roll30")
 

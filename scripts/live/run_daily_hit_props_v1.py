@@ -87,6 +87,7 @@ def main() -> None:
     pitcher = pd.read_parquet(pit_path).copy() if pit_path.exists() else pd.DataFrame()
 
     parks_path = dirs["reference_dir"] / "parks.parquet"
+    parks_dyn_path = dirs["reference_dir"] / "parks_dynamic_2026.parquet"
     weather_path = dirs["processed_dir"] / "weather_game.parquet"
 
     if not lineup_path.exists():
@@ -99,7 +100,7 @@ def main() -> None:
             "Live lineup file is empty. Build lineups first with scripts/live/build_live_lineups.py"
         )
 
-    game_cols = [c for c in ["game_pk", "away_team", "home_team", "home_sp_id", "away_sp_id", "temperature", "weather_wind", "park_factor", "park_factor_hits", "venue_id", "canonical_park_key", "park_id"] if c in spine.columns]
+    game_cols = [c for c in ["game_pk", "away_team", "home_team", "home_sp_id", "away_sp_id", "temperature", "wind_speed", "park_factor_hits_blend", "park_factor_hits_hist", "venue_id", "canonical_park_key", "park_id"] if c in spine.columns]
     g = spine[game_cols].copy()
     g["game_pk"] = pd.to_numeric(g.get("game_pk"), errors="coerce").astype("Int64")
 
@@ -109,15 +110,23 @@ def main() -> None:
             if "game_pk" in wg.columns:
                 wg["game_pk"] = pd.to_numeric(wg["game_pk"], errors="coerce").astype("Int64")
                 tcol = _pick(list(wg.columns), ["temperature", "temp_f", "game_temp", "weather_temp"])
-                wcol = _pick(list(wg.columns), ["weather_wind", "wind_speed", "wind_mph", "wind"])
-                keep = ["game_pk"] + ([tcol] if tcol else []) + ([wcol] if wcol else [])
+                wcol = _pick(list(wg.columns), ["wind_speed", "weather_wind", "wind_mph", "wind"])
+                wout_col = _pick(list(wg.columns), ["weather_wind_out"])
+                win_col = _pick(list(wg.columns), ["weather_wind_in"])
+                keep = ["game_pk"] + ([tcol] if tcol else []) + ([wcol] if wcol else []) + ([wout_col] if wout_col else []) + ([win_col] if win_col else [])
                 g = g.merge(wg[keep].drop_duplicates(subset=["game_pk"], keep="last"), on="game_pk", how="left", suffixes=("", "_wg"))
                 if tcol:
                     g["temperature"] = pd.to_numeric(g.get("temperature"), errors="coerce").fillna(pd.to_numeric(g.get(f"{tcol}_wg"), errors="coerce"))
                     g = g.drop(columns=[f"{tcol}_wg"], errors="ignore")
                 if wcol:
-                    g["weather_wind"] = pd.to_numeric(g.get("weather_wind"), errors="coerce").fillna(pd.to_numeric(g.get(f"{wcol}_wg"), errors="coerce"))
+                    g["wind_speed"] = pd.to_numeric(g.get("wind_speed"), errors="coerce").fillna(pd.to_numeric(g.get(f"{wcol}_wg"), errors="coerce"))
                     g = g.drop(columns=[f"{wcol}_wg"], errors="ignore")
+                if wout_col:
+                    g["weather_wind_out"] = pd.to_numeric(g.get("weather_wind_out"), errors="coerce").fillna(pd.to_numeric(g.get(f"{wout_col}_wg"), errors="coerce"))
+                    g = g.drop(columns=[f"{wout_col}_wg"], errors="ignore")
+                if win_col:
+                    g["weather_wind_in"] = pd.to_numeric(g.get("weather_wind_in"), errors="coerce").fillna(pd.to_numeric(g.get(f"{win_col}_wg"), errors="coerce"))
+                    g = g.drop(columns=[f"{win_col}_wg"], errors="ignore")
         except Exception:
             logging.exception("hit_prop live optional weather join failed; continuing")
     else:
@@ -127,18 +136,35 @@ def main() -> None:
         try:
             parks = pd.read_parquet(parks_path).copy()
             pkey = _pick(list(parks.columns), ["canonical_park_key", "venue_id", "park_id"])
-            if pkey and "park_factor_hits" in parks.columns:
+            if pkey and "park_factor_hits_hist" in parks.columns:
                 gkey = _pick(list(g.columns), ["canonical_park_key", "venue_id", "park_id"])
                 if gkey:
                     g["_park_join_key"] = g[gkey].astype(str)
                     parks["_park_join_key"] = parks[pkey].astype(str)
-                    g = g.merge(parks[["_park_join_key", "park_factor_hits"]].drop_duplicates(subset=["_park_join_key"], keep="last"), on="_park_join_key", how="left", suffixes=("", "_p"))
-                    g["park_factor_hits"] = pd.to_numeric(g.get("park_factor_hits"), errors="coerce").fillna(pd.to_numeric(g.get("park_factor_hits_p"), errors="coerce"))
-                    g = g.drop(columns=["_park_join_key", "park_factor_hits_p"], errors="ignore")
+                    g = g.merge(parks[["_park_join_key", "park_factor_hits_hist"]].drop_duplicates(subset=["_park_join_key"], keep="last"), on="_park_join_key", how="left", suffixes=("", "_p"))
+                    g["park_factor_hits_hist"] = pd.to_numeric(g.get("park_factor_hits_hist"), errors="coerce").fillna(pd.to_numeric(g.get("park_factor_hits_hist_p"), errors="coerce"))
+                    g = g.drop(columns=["_park_join_key", "park_factor_hits_hist_p"], errors="ignore")
         except Exception:
             logging.exception("hit_prop live optional parks join failed; continuing")
     else:
         logging.warning("hit_prop live optional parks table missing: %s", parks_path)
+
+
+    if parks_dyn_path.exists():
+        try:
+            pdyn = pd.read_parquet(parks_dyn_path).copy()
+            pkey = _pick(list(pdyn.columns), ["canonical_park_key", "venue_id", "park_id"])
+            gkey = _pick(list(g.columns), ["canonical_park_key", "venue_id", "park_id"])
+            if pkey and gkey:
+                g["_park_join_key"] = g[gkey].astype(str)
+                pdyn["_park_join_key"] = pdyn[pkey].astype(str)
+                keep = ["_park_join_key"] + [c for c in ["park_factor_hits_2026_roll", "park_factor_hits_blend"] if c in pdyn.columns]
+                g = g.merge(pdyn[keep].drop_duplicates(subset=["_park_join_key"], keep="last"), on="_park_join_key", how="left")
+                g = g.drop(columns=["_park_join_key"], errors="ignore")
+        except Exception:
+            logging.exception("hit_prop live optional dynamic parks join failed; continuing")
+    else:
+        logging.warning("hit_prop live optional dynamic parks table missing: %s", parks_dyn_path)
 
     team_col = _pick(list(lu.columns), ["batter_team", "team", "team_abbrev", "team_name"])
     bid_col = _pick(list(lu.columns), ["batter_id", "batter", "player_id"])
@@ -157,6 +183,14 @@ def main() -> None:
     away["home_away"] = 0.0
     team_games = pd.concat([home, away], ignore_index=True, sort=False)
     board = lu.merge(team_games, on="batter_team", how="inner")
+    if "park_factor_hits_blend" in board.columns:
+        board["park_factor_hits_blend"] = pd.to_numeric(board["park_factor_hits_blend"], errors="coerce")
+    if "park_factor_hits_hist" in board.columns:
+        board["park_factor_hits_hist"] = pd.to_numeric(board["park_factor_hits_hist"], errors="coerce")
+    if "park_factor_hits_blend" not in board.columns:
+        board["park_factor_hits_blend"] = np.nan
+    if "park_factor_hits_hist" in board.columns:
+        board["park_factor_hits_blend"] = board["park_factor_hits_blend"].fillna(board["park_factor_hits_hist"])
 
     batter["game_date"] = pd.to_datetime(batter.get("game_date"), errors="coerce")
     batter = batter[batter["game_date"] < slate_date].copy()

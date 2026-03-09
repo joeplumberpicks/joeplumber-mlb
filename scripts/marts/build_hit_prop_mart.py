@@ -25,7 +25,9 @@ SAFE_ID_CONTEXT_COLS = {
     "game_pk", "game_date", "batter_id", "opp_pitcher_id", "season", "home_away", "park_id", "batter_team", "opponent_team"
 }
 SAFE_ENGINEERED_COLS = {
-    "lineup_slot", "expected_batting_order_pa", "lineup_confidence", "expected_ab_proxy", "park_factor_hits", "temperature", "weather_wind"
+    "lineup_slot", "expected_batting_order_pa", "lineup_confidence", "expected_ab_proxy",
+    "park_factor_hits_hist", "park_factor_hits_2026_roll", "park_factor_hits_blend",
+    "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"
 }
 ROLL_SUFFIXES = ("_roll3", "_roll7", "_roll15", "_roll30")
 RAW_LEAKAGE_BASES = {
@@ -195,9 +197,11 @@ def _context_from_spine(spine: pd.DataFrame) -> pd.DataFrame:
     s["game_pk"] = pd.to_numeric(s.get("game_pk"), errors="coerce").astype("Int64")
     batter_id_col = _pick(list(s.columns), ["batter_id", "batter", "player_id"])
     lineup_col = _pick(list(s.columns), ["lineup_slot", "bat_order", "batting_order", "lineup_position", "order"])
-    park_col = _pick(list(s.columns), ["park_factor", "park_factor_run", "venue_factor", "park_run_factor"])
-    wind_col = _pick(list(s.columns), ["weather_wind", "wind_speed", "wind_mph", "wind"])
+    park_col = _pick(list(s.columns), ["park_factor_hits_blend", "park_factor_hits_hist", "park_factor_hits", "park_factor", "park_factor_run", "venue_factor", "park_run_factor"])
+    wind_col = _pick(list(s.columns), ["wind_speed", "weather_wind", "wind_mph", "wind"])
     temp_col = _pick(list(s.columns), ["temperature", "temp_f", "game_temp", "weather_temp"])
+    wind_out_col = _pick(list(s.columns), ["weather_wind_out"])
+    wind_in_col = _pick(list(s.columns), ["weather_wind_in"])
 
     logging.info(
         "hit_prop_mart spine source cols lineup=%s park=%s wind=%s temp=%s batter_id=%s",
@@ -210,9 +214,11 @@ def _context_from_spine(spine: pd.DataFrame) -> pd.DataFrame:
 
     by_game = pd.DataFrame({
         "game_pk": s["game_pk"],
-        "park_factor": _ensure_series(s, park_col),
-        "weather_wind": _ensure_series(s, wind_col),
+        "park_factor_hits_hist": _ensure_series(s, park_col),
+        "wind_speed": _ensure_series(s, wind_col),
         "temperature": _ensure_series(s, temp_col),
+        "weather_wind_out": _ensure_series(s, wind_out_col),
+        "weather_wind_in": _ensure_series(s, wind_in_col),
     })
     by_game = by_game.groupby("game_pk", as_index=False).last()
 
@@ -232,63 +238,72 @@ def _context_from_spine(spine: pd.DataFrame) -> pd.DataFrame:
 def _join_optional_park_weather(batter: pd.DataFrame, dirs: dict[str, Path], spine: pd.DataFrame) -> pd.DataFrame:
     out = batter.copy()
 
-    parks_path = dirs["reference_dir"] / "parks.parquet"
-    if parks_path.exists():
+    join_key_col = _pick(list(out.columns), ["canonical_park_key", "venue_id", "park_id"])
+    if join_key_col is None and not spine.empty:
+        spine_k = _pick(list(spine.columns), ["canonical_park_key", "venue_id", "park_id"])
+        if spine_k and "game_pk" in spine.columns:
+            sp = spine[["game_pk", spine_k]].copy().rename(columns={spine_k: "_park_join_key_raw"})
+            sp["game_pk"] = pd.to_numeric(sp["game_pk"], errors="coerce").astype("Int64")
+            out = out.merge(sp.drop_duplicates(subset=["game_pk"], keep="last"), on="game_pk", how="left")
+            join_key_col = "_park_join_key_raw"
+
+    if join_key_col:
+        out["_park_join_key"] = out[join_key_col].astype(str)
+
+    hist_path = dirs["reference_dir"] / "parks.parquet"
+    if hist_path.exists() and "_park_join_key" in out.columns:
         try:
-            parks = pd.read_parquet(parks_path).copy()
-            parks_key = _pick(list(parks.columns), ["canonical_park_key", "venue_id", "park_id"])
-            if parks_key and "park_factor_hits" in parks.columns:
-                out_key_col = _pick(list(out.columns), ["canonical_park_key", "venue_id", "park_id"])
-                if out_key_col is None and not spine.empty:
-                    spine_k = _pick(list(spine.columns), ["canonical_park_key", "venue_id", "park_id"])
-                    if spine_k:
-                        sp = spine[["game_pk", spine_k]].copy().rename(columns={spine_k: "_park_join_key"})
-                        sp["game_pk"] = pd.to_numeric(sp["game_pk"], errors="coerce").astype("Int64")
-                        out = out.merge(sp.drop_duplicates(subset=["game_pk"], keep="last"), on="game_pk", how="left")
-                        out_key_col = "_park_join_key"
-                if out_key_col:
-                    left = out.copy()
-                    left["_park_join_key"] = left[out_key_col].astype(str)
-                    p2 = parks[[parks_key, "park_factor_hits"]].copy()
-                    p2["_park_join_key"] = p2[parks_key].astype(str)
-                    out = left.merge(p2[["_park_join_key", "park_factor_hits"]].drop_duplicates(subset=["_park_join_key"]), on="_park_join_key", how="left")
-                    out = out.drop(columns=["_park_join_key"], errors="ignore")
+            parks = pd.read_parquet(hist_path)
+            pkey = _pick(list(parks.columns), ["canonical_park_key", "venue_id", "park_id"])
+            if pkey:
+                p = parks[[c for c in [pkey, "park_factor_hits_hist"] if c in parks.columns]].copy()
+                p["_park_join_key"] = p[pkey].astype(str)
+                out = out.merge(p.drop(columns=[pkey], errors="ignore").drop_duplicates(subset=["_park_join_key"], keep="last"), on="_park_join_key", how="left")
             else:
-                logging.warning("parks.parquet found but missing expected keys/park_factor_hits")
+                logging.warning("parks.parquet exists but no park join key found")
         except Exception:
-            logging.exception("Failed optional parks join; continuing without park_factor_hits")
+            logging.exception("failed joining historical park factors; continuing")
     else:
-        logging.warning("Optional parks reference missing: %s", parks_path)
+        logging.warning("optional historical parks table missing or join key unavailable: %s", hist_path)
+
+    dyn_path = dirs["reference_dir"] / "parks_dynamic_2026.parquet"
+    if dyn_path.exists() and "_park_join_key" in out.columns:
+        try:
+            dyn = pd.read_parquet(dyn_path)
+            pkey = _pick(list(dyn.columns), ["canonical_park_key", "venue_id", "park_id"])
+            if pkey:
+                keep = [c for c in [pkey, "park_factor_hits_2026_roll", "park_factor_hits_blend"] if c in dyn.columns]
+                d = dyn[keep].copy()
+                d["_park_join_key"] = d[pkey].astype(str)
+                out = out.merge(d.drop(columns=[pkey], errors="ignore").drop_duplicates(subset=["_park_join_key"], keep="last"), on="_park_join_key", how="left")
+        except Exception:
+            logging.exception("failed joining dynamic park factors; continuing")
+    else:
+        logging.warning("optional dynamic parks table missing or join key unavailable: %s", dyn_path)
 
     weather_path = dirs["processed_dir"] / "weather_game.parquet"
     if weather_path.exists():
         try:
-            wg = pd.read_parquet(weather_path).copy()
+            wg = pd.read_parquet(weather_path)
             if "game_pk" in wg.columns:
                 wg["game_pk"] = pd.to_numeric(wg["game_pk"], errors="coerce").astype("Int64")
-                temp_col = _pick(list(wg.columns), ["temperature", "temp_f", "game_temp", "weather_temp"])
-                wind_col = _pick(list(wg.columns), ["weather_wind", "wind_speed", "wind_mph", "wind"])
-                keep = ["game_pk"]
-                if temp_col:
-                    keep.append(temp_col)
-                if wind_col:
-                    keep.append(wind_col)
-                tmp = wg[keep].drop_duplicates(subset=["game_pk"], keep="last")
-                out = out.merge(tmp, on="game_pk", how="left", suffixes=("", "_wg"))
-                if temp_col:
-                    out["temperature"] = pd.to_numeric(out.get("temperature"), errors="coerce").fillna(pd.to_numeric(out.get(f"{temp_col}_wg"), errors="coerce"))
-                    out = out.drop(columns=[f"{temp_col}_wg"], errors="ignore")
-                if wind_col:
-                    out["weather_wind"] = pd.to_numeric(out.get("weather_wind"), errors="coerce").fillna(pd.to_numeric(out.get(f"{wind_col}_wg"), errors="coerce"))
-                    out = out.drop(columns=[f"{wind_col}_wg"], errors="ignore")
+                keep = [c for c in ["game_pk", "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"] if c in wg.columns]
+                out = out.merge(wg[keep].drop_duplicates(subset=["game_pk"], keep="last"), on="game_pk", how="left", suffixes=("", "_wg"))
+                for c in ["temperature", "wind_speed", "weather_wind_out", "weather_wind_in"]:
+                    if f"{c}_wg" in out.columns:
+                        out[c] = pd.to_numeric(out.get(c), errors="coerce").fillna(pd.to_numeric(out[f"{c}_wg"], errors="coerce"))
+                        out = out.drop(columns=[f"{c}_wg"], errors="ignore")
         except Exception:
-            logging.exception("Failed optional weather_game join; continuing")
+            logging.exception("failed joining weather_game; continuing")
     else:
-        logging.warning("Optional weather table missing: %s", weather_path)
+        logging.warning("optional weather table missing: %s", weather_path)
 
-    if "park_factor_hits" not in out.columns:
-        out["park_factor_hits"] = np.nan
+    out = out.drop(columns=["_park_join_key", "_park_join_key_raw"], errors="ignore")
+    for c in ["park_factor_hits_hist", "park_factor_hits_2026_roll", "park_factor_hits_blend", "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"]:
+        if c not in out.columns:
+            out[c] = np.nan
     return out
+
 
 def main() -> None:
     args = parse_args()
@@ -323,8 +338,8 @@ def main() -> None:
     home_col = _pick(list(batter.columns), ["home_team", "home_team_abbr"])
     away_col = _pick(list(batter.columns), ["away_team", "away_team_abbr"])
     lineup_col = _pick(list(batter.columns), ["lineup_slot", "bat_order", "batting_order", "lineup_position", "order"])
-    park_col = _pick(list(batter.columns), ["park_factor", "park_factor_run", "venue_factor", "park_run_factor"])
-    wind_col = _pick(list(batter.columns), ["weather_wind", "wind_speed", "wind_mph", "wind"])
+    park_col = _pick(list(batter.columns), ["park_factor_hits_blend", "park_factor_hits_hist", "park_factor_hits", "park_factor", "park_factor_run", "venue_factor", "park_run_factor"])
+    wind_col = _pick(list(batter.columns), ["wind_speed", "weather_wind", "wind_mph", "wind"])
     temp_col = _pick(list(batter.columns), ["temperature", "temp_f", "game_temp", "weather_temp"])
 
     logging.info(
@@ -345,14 +360,16 @@ def main() -> None:
         batter["opponent_team"] = pd.NA
 
     batter["lineup_slot"] = _ensure_series(batter, lineup_col)
-    batter["park_factor"] = _ensure_series(batter, park_col)
-    batter["weather_wind"] = _ensure_series(batter, wind_col)
+    batter["park_factor_hits_hist"] = _ensure_series(batter, park_col)
+    batter["wind_speed"] = _ensure_series(batter, wind_col)
     batter["temperature"] = _ensure_series(batter, temp_col)
+    batter["weather_wind_out"] = np.nan
+    batter["weather_wind_in"] = np.nan
 
     if not spine.empty:
         spine_game, spine_player = _context_from_spine(spine)
         batter = batter.merge(spine_game, on="game_pk", how="left", suffixes=("", "_spine"))
-        for c in ["park_factor", "weather_wind", "temperature"]:
+        for c in ["park_factor_hits_hist", "wind_speed", "temperature", "weather_wind_out", "weather_wind_in"]:
             batter[c] = pd.to_numeric(batter[c], errors="coerce").fillna(pd.to_numeric(batter.get(f"{c}_spine"), errors="coerce"))
             batter = batter.drop(columns=[f"{c}_spine"], errors="ignore")
 
@@ -445,9 +462,13 @@ def main() -> None:
         "expected_ab_proxy",
         "bat_ab_per_game_roll15",
         "bat_pa_per_game_roll15",
-        "park_factor_hits",
+        "park_factor_hits_hist",
+        "park_factor_hits_2026_roll",
+        "park_factor_hits_blend",
         "temperature",
-        "weather_wind",
+        "wind_speed",
+        "weather_wind_out",
+        "weather_wind_in",
     ]
 
     for season in range(args.season_start, args.season_end + 1):
@@ -469,6 +490,9 @@ def main() -> None:
         sample_cols = [c for c in ["lineup_slot","expected_batting_order_pa","lineup_confidence","bat_ab_per_game_roll15","bat_pa_per_game_roll15","expected_ab_proxy"] if c in s_df.columns]
         if sample_cols:
             logging.info("hit_prop_mart season=%s sample_opportunity_rows=%s", season, s_df[sample_cols].head(5).to_dict(orient="records"))
+        sample_ctx_cols = [c for c in ["park_factor_hits_hist", "park_factor_hits_2026_roll", "park_factor_hits_blend", "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"] if c in s_df.columns]
+        if sample_ctx_cols:
+            logging.info("hit_prop_mart season=%s sample_context_rows=%s", season, s_df[sample_ctx_cols].head(5).to_dict(orient="records"))
 
         out_season = by_season_dir / f"hit_prop_features_{season}.parquet"
         write_parquet(s_df, out_season)
