@@ -233,8 +233,9 @@ def main() -> None:
         X["bat_pa_per_game_roll15"] = np.nan
     X["expected_batting_order_pa"] = pd.to_numeric(board["expected_batting_order_pa"], errors="coerce")
     X["lineup_confidence"] = pd.to_numeric(board["lineup_confidence"], errors="coerce")
-    X["expected_ab_proxy"] = X["lineup_confidence"] * (0.65 * pd.to_numeric(X.get("bat_ab_per_game_roll15"), errors="coerce") + 0.35 * X["expected_batting_order_pa"])
-    X["expected_ab_proxy"] = X["expected_ab_proxy"].fillna(X["lineup_confidence"] * X["expected_batting_order_pa"])
+    has_slot = pd.to_numeric(board.get("lineup_slot"), errors="coerce").notna()
+    X["expected_ab_proxy"] = pd.Series(np.nan, index=X.index, dtype="float64")
+    X.loc[has_slot, "expected_ab_proxy"] = pd.to_numeric(X.loc[has_slot, "lineup_confidence"], errors="coerce") * pd.to_numeric(X.loc[has_slot, "expected_batting_order_pa"], errors="coerce")
 
     X = X.reindex(columns=feats, fill_value=np.nan)
     real_slot = int(pd.to_numeric(board.get("lineup_slot"), errors="coerce").notna().sum()) if "lineup_slot" in board.columns else 0
@@ -244,24 +245,32 @@ def main() -> None:
     logging.info("hit_prop live lineup_confidence_fallback_only_count=%s", fallback_conf_only)
     logging.info("hit_prop live expected_ab_proxy_non_null_count=%s", ab_non_null)
 
-    p = model.predict_proba(X)[:, 1]
+    base_hit_probability = model.predict_proba(X)[:, 1]
+    expected_ab_proxy = pd.to_numeric(X.get("expected_ab_proxy"), errors="coerce")
+    live_adjusted_hit_probability = np.clip(
+        base_hit_probability + 0.015 * (expected_ab_proxy.fillna(4.1) - 4.1),
+        0.01,
+        0.99,
+    )
+    avg_adjustment = float(np.mean(live_adjusted_hit_probability - base_hit_probability)) if len(base_hit_probability) else 0.0
+    logging.info("hit_prop live average_adjustment_applied=%.6f", avg_adjustment)
 
-    out = board[[c for c in ["game_pk", "player_name", "batter_id", "batter_team", "opponent_team", "lineup_slot", "home_away", "opp_pitcher_id", "expected_batting_order_pa", "lineup_confidence"] if c in board.columns]].copy()
+    out = board[[c for c in ["player_name", "batter_team", "opponent_team", "lineup_slot", "expected_batting_order_pa", "lineup_confidence"] if c in board.columns]].copy()
     out["bat_ab_per_game_roll15"] = pd.to_numeric(X.get("bat_ab_per_game_roll15"), errors="coerce")
-    out["expected_ab_proxy"] = pd.to_numeric(X.get("expected_ab_proxy"), errors="coerce")
-    out["hit_probability"] = p
-    out["hit_probability_pct"] = (100.0 * out["hit_probability"]).round(1)
-    out["grade"] = out["hit_probability"].map(_grade)
+    out["expected_ab_proxy"] = expected_ab_proxy
+    out["base_hit_probability"] = base_hit_probability
+    out["live_adjusted_hit_probability"] = live_adjusted_hit_probability
+    out["grade"] = out["live_adjusted_hit_probability"].map(_grade)
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = dirs["outputs_dir"] / "hit_prop"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"hit_prop_board_{args.season}_{args.date}_{ts}.csv"
-    out.sort_values("hit_probability", ascending=False, kind="mergesort").to_csv(out_path, index=False)
+    out.sort_values("live_adjusted_hit_probability", ascending=False, kind="mergesort").to_csv(out_path, index=False)
 
     print("\nJOE PLUMBER 1+ HIT BOARD")
-    for _, r in out.sort_values("hit_probability", ascending=False, kind="mergesort").head(30).iterrows():
-        print(f"{str(r.get('player_name','')):<24} {100*float(r['hit_probability']):>5.1f}%  {r['grade']}")
+    for _, r in out.sort_values("live_adjusted_hit_probability", ascending=False, kind="mergesort").head(30).iterrows():
+        print(f"{str(r.get('player_name','')):<24} {100*float(r['live_adjusted_hit_probability']):>5.1f}%  {r['grade']}")
     print(f"\nboard_out={out_path}")
 
 
