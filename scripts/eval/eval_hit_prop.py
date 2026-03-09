@@ -27,7 +27,7 @@ TARGET = "target_hit_1_plus"
 
 
 SAFE_ENGINEERED_COLS = {
-    "lineup_slot", "expected_batting_order_pa", "lineup_confidence", "expected_ab_proxy", "park_factor_hits", "temperature", "weather_wind"
+    "lineup_slot", "expected_batting_order_pa", "lineup_confidence", "bat_ab_per_game_roll15", "bat_pa_per_game_roll15", "expected_ab_proxy", "park_factor_hits", "temperature", "weather_wind"
 }
 ROLL_SUFFIXES = ("_roll3", "_roll7", "_roll15", "_roll30")
 
@@ -127,6 +127,9 @@ def main() -> None:
     logging.info("hit_prop eval surviving_features=%s", feats)
     surviving_stats = [(c, int(pd.to_numeric(train[c], errors="coerce").notna().sum()), float(pd.to_numeric(train[c], errors="coerce").notna().mean())) for c in feats]
     logging.info("hit_prop eval surviving_feature_non_null_stats=%s", surviving_stats)
+    opp_feats = ["lineup_slot", "expected_batting_order_pa", "lineup_confidence", "bat_ab_per_game_roll15", "bat_pa_per_game_roll15", "expected_ab_proxy"]
+    opp_survival = {f: (f in feats) for f in opp_feats}
+    logging.info("hit_prop eval opportunity_feature_survival=%s", opp_survival)
     if not feats:
         raise ValueError("No numeric non-null features available for evaluation")
 

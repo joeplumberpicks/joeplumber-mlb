@@ -161,7 +161,7 @@ def main() -> None:
     team_col = _pick(list(lu.columns), ["batter_team", "team", "team_abbrev", "team_name"])
     bid_col = _pick(list(lu.columns), ["batter_id", "batter", "player_id"])
     name_col = _pick(list(lu.columns), ["player_name", "batter_name", "name"])
-    slot_col = _pick(list(lu.columns), ["lineup_slot", "bat_order", "batting_order"])
+    slot_col = _pick(list(lu.columns), ["lineup_slot", "bat_order", "batting_order", "lineup_position", "order"])
 
     lu["batter_team"] = lu[team_col]
     lu["batter_id"] = pd.to_numeric(lu[bid_col], errors="coerce").astype("Int64")
@@ -229,15 +229,25 @@ def main() -> None:
     board["lineup_confidence"] = _lineup_conf(board["lineup_slot"])
     if "bat_ab_per_game_roll15" not in X.columns:
         X["bat_ab_per_game_roll15"] = np.nan
+    if "bat_pa_per_game_roll15" not in X.columns:
+        X["bat_pa_per_game_roll15"] = np.nan
     X["expected_batting_order_pa"] = pd.to_numeric(board["expected_batting_order_pa"], errors="coerce")
     X["lineup_confidence"] = pd.to_numeric(board["lineup_confidence"], errors="coerce")
     X["expected_ab_proxy"] = X["lineup_confidence"] * (0.65 * pd.to_numeric(X.get("bat_ab_per_game_roll15"), errors="coerce") + 0.35 * X["expected_batting_order_pa"])
     X["expected_ab_proxy"] = X["expected_ab_proxy"].fillna(X["lineup_confidence"] * X["expected_batting_order_pa"])
 
     X = X.reindex(columns=feats, fill_value=np.nan)
+    real_slot = int(pd.to_numeric(board.get("lineup_slot"), errors="coerce").notna().sum()) if "lineup_slot" in board.columns else 0
+    fallback_conf_only = int(((pd.to_numeric(board.get("lineup_slot"), errors="coerce").isna()) & (pd.to_numeric(board.get("lineup_confidence"), errors="coerce").notna())).sum()) if "lineup_confidence" in board.columns else 0
+    ab_non_null = int(pd.to_numeric(X.get("expected_ab_proxy"), errors="coerce").notna().sum())
+    logging.info("hit_prop live lineup_slot_real_count=%s", real_slot)
+    logging.info("hit_prop live lineup_confidence_fallback_only_count=%s", fallback_conf_only)
+    logging.info("hit_prop live expected_ab_proxy_non_null_count=%s", ab_non_null)
+
     p = model.predict_proba(X)[:, 1]
 
     out = board[[c for c in ["game_pk", "player_name", "batter_id", "batter_team", "opponent_team", "lineup_slot", "home_away", "opp_pitcher_id", "expected_batting_order_pa", "lineup_confidence"] if c in board.columns]].copy()
+    out["bat_ab_per_game_roll15"] = pd.to_numeric(X.get("bat_ab_per_game_roll15"), errors="coerce")
     out["expected_ab_proxy"] = pd.to_numeric(X.get("expected_ab_proxy"), errors="coerce")
     out["hit_probability"] = p
     out["hit_probability_pct"] = (100.0 * out["hit_probability"]).round(1)
