@@ -83,6 +83,14 @@ def main() -> None:
 
     excluded = {"game_pk", "batter_id", "opp_pitcher_id", "season", TARGET, "target_hit1p", "target_hit_1p"}
     numeric_features = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in excluded]
+    feature_stats: list[tuple[str, int, float]] = []
+    for c in numeric_features:
+        nn = int(pd.to_numeric(df[c], errors="coerce").notna().sum())
+        rate = float(nn / max(1, len(df)))
+        feature_stats.append((c, nn, rate))
+    logging.info("hit_prop train candidate_numeric_features_n=%s", len(numeric_features))
+    logging.info("hit_prop train candidate_feature_non_null_stats=%s", feature_stats)
+
     features, dropped_all_null = _drop_all_null_numeric_features(df, numeric_features)
     logging.info("hit_prop train dropped_all_null_features_n=%s features=%s", len(dropped_all_null), dropped_all_null)
     if not features:
