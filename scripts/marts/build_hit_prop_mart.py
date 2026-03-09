@@ -106,6 +106,35 @@ def _derive_ab_pa_per_game(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+
+
+def _coalesce_feature(df: pd.DataFrame, out_col: str, candidates: list[str]) -> pd.DataFrame:
+    if out_col in df.columns and pd.to_numeric(df[out_col], errors="coerce").notna().any():
+        return df
+    out = pd.Series(np.nan, index=df.index, dtype="float64")
+    for c in candidates:
+        if c in df.columns:
+            out = out.fillna(pd.to_numeric(df[c], errors="coerce"))
+    df[out_col] = out
+    return df
+
+
+def _add_required_batter_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    feature_map = {
+        "h_roll3": ["h_roll3", "bat_h_roll3"],
+        "h_roll7": ["h_roll7", "bat_h_roll7"],
+        "h_roll15": ["h_roll15", "bat_h_roll15"],
+        "h_roll30": ["h_roll30", "bat_h_roll30"],
+        "launch_speed_mean_roll15": ["launch_speed_mean_roll15", "bat_launch_speed_mean_roll15"],
+        "launch_angle_mean_roll15": ["launch_angle_mean_roll15", "bat_launch_angle_mean_roll15"],
+        "whiff_rate_roll30": ["whiff_rate_roll30", "bat_whiff_rate_roll30"],
+        "chase_rate_roll30": ["chase_rate_roll30", "bat_chase_rate_roll30"],
+    }
+    for k, cands in feature_map.items():
+        out = _coalesce_feature(out, k, cands)
+    return out
+
 def _context_from_spine(spine: pd.DataFrame) -> pd.DataFrame:
     s = spine.copy()
     s["game_pk"] = pd.to_numeric(s.get("game_pk"), errors="coerce").astype("Int64")
@@ -279,17 +308,56 @@ def main() -> None:
 
     batter = _join_optional_park_weather(batter, dirs, spine)
 
+    # derive opp_pitcher_id from live/model spine when available
+    if not spine.empty:
+        sp_cols = [c for c in ["game_pk", "home_sp_id", "away_sp_id", "venue_id", "park_id"] if c in spine.columns]
+        if sp_cols:
+            sp = spine[sp_cols].copy()
+            sp["game_pk"] = pd.to_numeric(sp["game_pk"], errors="coerce").astype("Int64")
+            if "home_sp_id" in sp.columns:
+                sp["home_sp_id"] = pd.to_numeric(sp["home_sp_id"], errors="coerce").astype("Int64")
+            if "away_sp_id" in sp.columns:
+                sp["away_sp_id"] = pd.to_numeric(sp["away_sp_id"], errors="coerce").astype("Int64")
+            batter = batter.merge(sp.drop_duplicates(subset=["game_pk"], keep="last"), on="game_pk", how="left", suffixes=("", "_sp"))
+            if "opp_pitcher_id" not in batter.columns:
+                batter["opp_pitcher_id"] = pd.Series(pd.NA, index=batter.index, dtype="Int64")
+            away_mask = pd.to_numeric(batter.get("home_away"), errors="coerce") == 0.0
+            home_mask = pd.to_numeric(batter.get("home_away"), errors="coerce") == 1.0
+            if "home_sp_id" in batter.columns:
+                batter.loc[away_mask, "opp_pitcher_id"] = pd.to_numeric(batter.loc[away_mask, "home_sp_id"], errors="coerce").astype("Int64")
+            if "away_sp_id" in batter.columns:
+                batter.loc[home_mask, "opp_pitcher_id"] = pd.to_numeric(batter.loc[home_mask, "away_sp_id"], errors="coerce").astype("Int64")
+            if "park_id" not in batter.columns:
+                if "park_id_sp" in batter.columns:
+                    batter["park_id"] = batter["park_id_sp"]
+                elif "venue_id" in batter.columns:
+                    batter["park_id"] = batter["venue_id"]
+
+    # explicit batter rolling feature coverage from required family
+    batter = _add_required_batter_rolling_features(batter)
+
     if not pitcher.empty:
         pitcher["game_pk"] = pd.to_numeric(pitcher.get("game_pk"), errors="coerce").astype("Int64")
         pid_col = _pick(list(pitcher.columns), ["pitcher_id", "pitcher", "player_id", "mlb_id"])
-        pteam_col = _pick(list(pitcher.columns), ["pitcher_team", "pit_team", "team", "team_abbrev", "team_name"])
-        if pid_col and pteam_col:
+        if pid_col:
             pitcher["pitcher_id"] = pd.to_numeric(pitcher[pid_col], errors="coerce").astype("Int64")
-            pnum = [c for c in pitcher.select_dtypes(include=[np.number]).columns if c not in {"game_pk", "pitcher_id"}]
-            pit_game_team = pitcher.groupby(["game_pk", pteam_col], as_index=False)[["pitcher_id"] + pnum].mean(numeric_only=True)
-            pit_game_team = pit_game_team.rename(columns={pteam_col: "opponent_team", "pitcher_id": "opp_pitcher_id"})
-            pit_game_team = pit_game_team.rename(columns={c: f"pit_{c}" for c in pnum})
-            batter = batter.merge(pit_game_team, on=["game_pk", "opponent_team"], how="left")
+            pit_needed = {
+                "pit_whiff_rate_roll30": ["whiff_rate_roll30", "pit_whiff_rate_roll30"],
+                "pit_contact_rate_roll30": ["contact_rate_roll30", "pit_contact_rate_roll30"],
+                "pit_k_roll30": ["k_roll30", "pit_k_roll30"],
+                "pit_bb_roll30": ["bb_roll30", "pit_bb_roll30"],
+            }
+            pit_join = pitcher[["game_pk", "pitcher_id"]].copy()
+            for out_col, cands in pit_needed.items():
+                ser = pd.Series(np.nan, index=pitcher.index, dtype="float64")
+                for c in cands:
+                    if c in pitcher.columns:
+                        ser = ser.fillna(pd.to_numeric(pitcher[c], errors="coerce"))
+                pit_join[out_col] = ser
+            pit_join = pit_join.drop_duplicates(subset=["game_pk", "pitcher_id"], keep="last")
+            batter["opp_pitcher_id"] = pd.to_numeric(batter.get("opp_pitcher_id"), errors="coerce").astype("Int64")
+            batter = batter.merge(pit_join, left_on=["game_pk", "opp_pitcher_id"], right_on=["game_pk", "pitcher_id"], how="left")
+            batter = batter.drop(columns=["pitcher_id"], errors="ignore")
 
     batter = _derive_ab_pa_per_game(batter)
     batter["expected_batting_order_pa"] = pd.to_numeric(batter["lineup_slot"], errors="coerce").map(LINEUP_PA_MAP)
@@ -333,7 +401,11 @@ def main() -> None:
         s_df = s_df.drop_duplicates(subset=["game_pk", "batter_id"], keep="last")
 
         context_rates = {c: float(pd.to_numeric(s_df.get(c), errors="coerce").notna().mean()) if c in s_df.columns else 0.0 for c in context_cols}
-        logging.info("hit_prop_mart season=%s rows=%s context_non_null_rates=%s", season, len(s_df), context_rates)
+        numeric_cols = [c for c in s_df.columns if pd.api.types.is_numeric_dtype(s_df[c]) and c not in {"game_pk", "batter_id", "opp_pitcher_id", "season"}]
+        nn = {c: float(pd.to_numeric(s_df[c], errors="coerce").notna().mean()) for c in numeric_cols}
+        top_nn = sorted(nn.items(), key=lambda kv: kv[1], reverse=True)[:20]
+        logging.info("hit_prop_mart season=%s rows=%s feature_count=%s context_non_null_rates=%s", season, len(s_df), len(s_df.columns), context_rates)
+        logging.info("hit_prop_mart season=%s top20_feature_non_null_pct=%s", season, top_nn)
 
         out_season = by_season_dir / f"hit_prop_features_{season}.parquet"
         write_parquet(s_df, out_season)
@@ -345,7 +417,14 @@ def main() -> None:
         full = full.sort_values(full_sort_cols, kind="mergesort")
 
     full_context_rates = {c: float(pd.to_numeric(full.get(c), errors="coerce").notna().mean()) if c in full.columns else 0.0 for c in context_cols}
-    logging.info("hit_prop_mart full_rows=%s context_non_null_rates=%s", len(full), full_context_rates)
+    full_numeric = [c for c in full.columns if pd.api.types.is_numeric_dtype(full[c]) and c not in {"game_pk", "batter_id", "opp_pitcher_id", "season"}]
+    full_nn = {c: float(pd.to_numeric(full[c], errors="coerce").notna().mean()) for c in full_numeric}
+    top_full_nn = sorted(full_nn.items(), key=lambda kv: kv[1], reverse=True)[:30]
+    logging.info("hit_prop_mart full_rows=%s feature_count=%s context_non_null_rates=%s", len(full), len(full.columns), full_context_rates)
+    logging.info("hit_prop_mart top30_feature_non_null_pct=%s", top_full_nn)
+
+    if len(full.columns) <= 100:
+        raise ValueError(f"hit_prop mart too narrow: feature_count={len(full.columns)} expected>100")
 
     out_full = dirs["marts_dir"] / "hit_prop_features.parquet"
     write_parquet(full, out_full)
