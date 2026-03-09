@@ -242,10 +242,21 @@ def main() -> None:
         "lineup_confidence": pd.to_numeric(board["lineup_confidence"], errors="coerce"),
         "expected_ab_proxy": ab_proxy_series,
     }
-    X = pd.concat([X, pd.DataFrame(x_extra, index=X.index)], axis=1)
+    extra_df = pd.DataFrame(x_extra, index=X.index)
+    overlap = [c for c in extra_df.columns if c in X.columns]
+    if overlap:
+        X = X.drop(columns=overlap)
+    X = pd.concat([X, extra_df], axis=1)
+
+    dup_cols = X.columns[X.columns.duplicated()].tolist()
+    if dup_cols:
+        logging.warning("hit_prop live duplicate_columns_detected=%s", dup_cols)
+        X = X.loc[:, ~X.columns.duplicated(keep="last")].copy()
 
     # scoring matrix remains aligned to trained features only
     X_scoring = X.reindex(columns=feats, fill_value=np.nan)
+    logging.info("hit_prop live X_scoring_shape rows=%s cols=%s", X_scoring.shape[0], X_scoring.shape[1])
+    logging.info("hit_prop live scoring_feature_count=%s", len(feats))
 
     real_slot = int(pd.to_numeric(board.get("lineup_slot"), errors="coerce").notna().sum()) if "lineup_slot" in board.columns else 0
     fallback_conf_only = int(((pd.to_numeric(board.get("lineup_slot"), errors="coerce").isna()) & (pd.to_numeric(board.get("lineup_confidence"), errors="coerce").notna())).sum()) if "lineup_confidence" in board.columns else 0
