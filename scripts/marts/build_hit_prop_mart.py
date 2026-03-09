@@ -21,6 +21,57 @@ from src.utils.logging import configure_logging, log_header
 LINEUP_PA_MAP = {1: 4.65, 2: 4.55, 3: 4.45, 4: 4.35, 5: 4.25, 6: 4.10, 7: 3.95, 8: 3.80, 9: 3.70}
 
 
+SAFE_ID_CONTEXT_COLS = {
+    "game_pk", "game_date", "batter_id", "opp_pitcher_id", "season", "home_away", "park_id", "batter_team", "opponent_team"
+}
+SAFE_ENGINEERED_COLS = {
+    "lineup_slot", "expected_batting_order_pa", "lineup_confidence", "expected_ab_proxy", "park_factor_hits", "temperature", "weather_wind"
+}
+ROLL_SUFFIXES = ("_roll3", "_roll7", "_roll15", "_roll30")
+RAW_LEAKAGE_BASES = {
+    "h", "hr", "bb", "k", "hbp", "pitches", "swings", "whiffs", "contacts", "chases", "in_zone_pitches",
+    "release_speed_mean", "release_speed_max", "release_spin_rate_mean", "release_spin_rate_max",
+    "launch_speed_mean", "launch_speed_max", "launch_angle_mean", "launch_angle_max",
+    "chase_rate", "whiff_rate", "contact_rate", "swing_rate", "zone_swing_rate",
+}
+
+
+def _base_feature_name(col: str) -> str:
+    out = col
+    for prefix in ("bat_", "pit_", "diff_off_", "home_", "away_"):
+        if out.startswith(prefix):
+            out = out[len(prefix):]
+    return out
+
+
+def _is_rolling_feature(col: str) -> bool:
+    return col.endswith(ROLL_SUFFIXES)
+
+
+def _is_leakage_prone_raw(col: str) -> bool:
+    if _is_rolling_feature(col):
+        return False
+    return _base_feature_name(col) in RAW_LEAKAGE_BASES
+
+
+def _safe_hit_mart_columns(df: pd.DataFrame) -> tuple[list[str], list[str], list[str]]:
+    keep: list[str] = []
+    dropped_raw: list[str] = []
+    dropped_other: list[str] = []
+    for c in df.columns:
+        if c in SAFE_ID_CONTEXT_COLS or c in SAFE_ENGINEERED_COLS or c == "target_hit_1_plus":
+            keep.append(c)
+            continue
+        if _is_rolling_feature(c) or (c.startswith("pit_") and c.endswith("_roll30")):
+            keep.append(c)
+            continue
+        if _is_leakage_prone_raw(c):
+            dropped_raw.append(c)
+        else:
+            dropped_other.append(c)
+    return keep, dropped_raw, dropped_other
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build 1+ hit prop mart at batter-game grain.")
     p.add_argument("--season-start", type=int, required=True)
@@ -400,11 +451,14 @@ def main() -> None:
             s_df = s_df.merge(targets, on=["game_pk", "batter_id"], how="left")
         s_df = s_df.drop_duplicates(subset=["game_pk", "batter_id"], keep="last")
 
+        keep_cols, dropped_raw, dropped_other = _safe_hit_mart_columns(s_df)
+        s_df = s_df[[c for c in keep_cols if c in s_df.columns]].copy()
+
         context_rates = {c: float(pd.to_numeric(s_df.get(c), errors="coerce").notna().mean()) if c in s_df.columns else 0.0 for c in context_cols}
         numeric_cols = [c for c in s_df.columns if pd.api.types.is_numeric_dtype(s_df[c]) and c not in {"game_pk", "batter_id", "opp_pitcher_id", "season"}]
         nn = {c: float(pd.to_numeric(s_df[c], errors="coerce").notna().mean()) for c in numeric_cols}
         top_nn = sorted(nn.items(), key=lambda kv: kv[1], reverse=True)[:20]
-        logging.info("hit_prop_mart season=%s rows=%s feature_count=%s context_non_null_rates=%s", season, len(s_df), len(s_df.columns), context_rates)
+        logging.info("hit_prop_mart season=%s rows=%s feature_count=%s approved_rolling_features=%s dropped_leakage_raw=%s context_non_null_rates=%s", season, len(s_df), len(s_df.columns), sum(1 for c in s_df.columns if _is_rolling_feature(c)), len(dropped_raw), context_rates)
         logging.info("hit_prop_mart season=%s top20_feature_non_null_pct=%s", season, top_nn)
 
         out_season = by_season_dir / f"hit_prop_features_{season}.parquet"
@@ -424,7 +478,7 @@ def main() -> None:
     logging.info("hit_prop_mart top30_feature_non_null_pct=%s", top_full_nn)
 
     if len(full.columns) <= 100:
-        raise ValueError(f"hit_prop mart too narrow: feature_count={len(full.columns)} expected>100")
+        logging.warning("hit_prop mart feature_count=%s (<=100)", len(full.columns))
 
     out_full = dirs["marts_dir"] / "hit_prop_features.parquet"
     write_parquet(full, out_full)

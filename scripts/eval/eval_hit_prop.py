@@ -26,6 +26,16 @@ from src.utils.logging import configure_logging, log_header
 TARGET = "target_hit_1_plus"
 
 
+SAFE_ENGINEERED_COLS = {
+    "lineup_slot", "expected_batting_order_pa", "lineup_confidence", "expected_ab_proxy", "park_factor_hits", "temperature", "weather_wind"
+}
+ROLL_SUFFIXES = ("_roll3", "_roll7", "_roll15", "_roll30")
+
+
+def _is_safe_feature(col: str) -> bool:
+    return col in SAFE_ENGINEERED_COLS or col.endswith(ROLL_SUFFIXES)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate hit prop v1 model with season split.")
     p.add_argument("--train-start", type=int, required=True)
@@ -99,6 +109,10 @@ def main() -> None:
 
     excluded = {"game_pk", "batter_id", "opp_pitcher_id", "season", TARGET, "target_hit1p", "target_hit_1p"}
     numeric_features = [c for c in train.columns if pd.api.types.is_numeric_dtype(train[c]) and c not in excluded]
+    unsafe_features = [c for c in numeric_features if not _is_safe_feature(c)]
+    if unsafe_features:
+        logging.info("hit_prop eval leakage_guard dropped_unsafe_features_n=%s features=%s", len(unsafe_features), unsafe_features)
+    numeric_features = [c for c in numeric_features if _is_safe_feature(c)]
     feature_stats: list[tuple[str, int, float]] = []
     for c in numeric_features:
         nn = int(pd.to_numeric(train[c], errors="coerce").notna().sum())
