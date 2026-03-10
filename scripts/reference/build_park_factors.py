@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -19,21 +20,9 @@ from src.utils.logging import configure_logging, log_header
 
 HIT_EVENTS = {"single", "double", "triple", "home_run"}
 BIP_OUT_EVENTS = {
-    "field_out",
-    "force_out",
-    "grounded_into_double_play",
-    "double_play",
-    "triple_play",
-    "fielders_choice",
-    "fielders_choice_out",
-    "sac_fly",
-    "sac_fly_double_play",
-    "sac_bunt",
-    "sac_bunt_double_play",
-    "lineout",
-    "flyout",
-    "groundout",
-    "pop_out",
+    "field_out", "force_out", "grounded_into_double_play", "double_play", "triple_play",
+    "fielders_choice", "fielders_choice_out", "sac_fly", "sac_fly_double_play",
+    "sac_bunt", "sac_bunt_double_play", "lineout", "flyout", "groundout", "pop_out",
 }
 
 
@@ -57,15 +46,35 @@ def _pick(cols: list[str], cands: list[str]) -> str | None:
     return None
 
 
-def _safe_div(num: pd.Series | float, den: pd.Series | float) -> pd.Series | float:
+def _safe_div(num, den):
     num_s = pd.to_numeric(num, errors="coerce")
     den_s = pd.to_numeric(den, errors="coerce")
     return np.where(den_s > 0, num_s / den_s, np.nan)
 
 
-def _mode_or_na(s: pd.Series) -> object:
+def _mode_or_na(s: pd.Series):
     m = s.dropna().mode()
     return m.iloc[0] if len(m) else pd.NA
+
+
+def _norm_text(v: object) -> str:
+    txt = str(v).strip().lower()
+    txt = re.sub(r"[^a-z0-9]+", "_", txt)
+    txt = re.sub(r"_+", "_", txt).strip("_")
+    return txt or "unknown_park"
+
+
+def _build_norm_key(df: pd.DataFrame) -> pd.Series:
+    venue = pd.to_numeric(df.get("venue_id"), errors="coerce")
+    park = pd.to_numeric(df.get("park_id"), errors="coerce")
+    raw = df.get("canonical_park_key", pd.Series(pd.NA, index=df.index, dtype="object")).astype("string")
+    name = df.get("park_name", pd.Series(pd.NA, index=df.index, dtype="object")).map(_norm_text)
+    out = pd.Series(pd.NA, index=df.index, dtype="object")
+    out = out.where(~venue.notna(), "venue:" + venue.astype("Int64").astype(str))
+    out = out.fillna(pd.Series(np.where(park.notna(), "park:" + park.astype("Int64").astype(str), pd.NA), index=df.index))
+    out = out.fillna(raw.where(raw.notna() & (raw.str.strip() != "") & (raw.str.lower() != "nan")))
+    out = out.fillna("parkname:" + name.astype(str))
+    return out.astype(str)
 
 
 def _hard_hit_flag(df: pd.DataFrame) -> pd.Series:
@@ -76,8 +85,7 @@ def _hard_hit_flag(df: pd.DataFrame) -> pd.Series:
             return (hard > 0).astype(float)
     ls_col = _pick(list(df.columns), ["launch_speed", "launch_speed_mean", "launch_speed_mph"])
     if ls_col:
-        ls = pd.to_numeric(df[ls_col], errors="coerce")
-        return (ls >= 95.0).astype(float)
+        return (pd.to_numeric(df[ls_col], errors="coerce") >= 95.0).astype(float)
     return pd.Series(np.nan, index=df.index, dtype="float64")
 
 
@@ -95,7 +103,6 @@ def main() -> None:
     total_pa_rows = 0
     total_joined_rows = 0
     total_missing_game_pk = 0
-    total_missing_park = 0
 
     for season in range(args.season_start, args.season_end + 1):
         pa_path = dirs["processed_dir"] / "by_season" / f"pa_{season}.parquet"
@@ -103,7 +110,6 @@ def main() -> None:
         if not pa_path.exists() or not games_path.exists():
             logging.warning("season=%s skipped missing file pa_exists=%s games_exists=%s", season, pa_path.exists(), games_path.exists())
             continue
-
         try:
             pa = pd.read_parquet(pa_path)
             games = pd.read_parquet(games_path)
@@ -124,9 +130,9 @@ def main() -> None:
             logging.warning("season=%s skipped missing events/event_type in pa", season)
             continue
 
-        games_cols = [c for c in ["game_pk", "canonical_park_key", "park_id", "venue_id", "park_name"] if c in games.columns]
-        if "canonical_park_key" not in games_cols:
-            logging.warning("season=%s skipped missing canonical_park_key in games", season)
+        keep_games = [c for c in ["game_pk", "canonical_park_key", "park_id", "venue_id", "park_name"] if c in games.columns]
+        if len(keep_games) < 2:
+            logging.warning("season=%s skipped insufficient park identity columns in games", season)
             continue
 
         pa["game_pk"] = pd.to_numeric(pa["game_pk"], errors="coerce").astype("Int64")
@@ -135,42 +141,32 @@ def main() -> None:
         total_missing_game_pk += missing_game_pk
         pa = pa[pa["game_pk"].notna()].copy()
 
-        g = games[games_cols].drop_duplicates(subset=["game_pk"], keep="last")
-        joined = pa.merge(g, on="game_pk", how="left")
+        joined = pa.merge(games[keep_games].drop_duplicates(subset=["game_pk"], keep="last"), on="game_pk", how="left")
         joined_rows = len(joined)
         total_joined_rows += joined_rows
 
-        park_key = joined["canonical_park_key"].astype("string")
-        missing_park = park_key.isna() | (park_key.str.strip() == "") | (park_key.str.lower() == "nan")
-        missing_park_n = int(missing_park.sum())
-        total_missing_park += missing_park_n
-        pct_park = float((~missing_park).mean()) if joined_rows else 0.0
+        joined["canonical_park_key_norm"] = _build_norm_key(joined)
+        pct_norm = float(joined["canonical_park_key_norm"].notna().mean()) if joined_rows else 0.0
         logging.info(
-            "season=%s pa_rows=%s games_rows=%s joined_rows=%s pct_with_canonical_park_key=%.4f",
-            season,
-            pa_rows,
-            games_rows,
-            joined_rows,
-            pct_park,
+            "season=%s pa_rows=%s games_rows=%s joined_rows=%s pct_with_canonical_park_key_after_join=%.4f",
+            season, pa_rows, games_rows, joined_rows, pct_norm,
         )
 
-        joined = joined[~missing_park].copy()
+        joined = joined[joined["canonical_park_key_norm"].notna()].copy()
         if joined.empty:
             continue
 
         included_seasons.append(season)
         ev = joined[event_col].astype(str).str.lower().str.strip()
 
-        ls_col = _pick(list(joined.columns), ["launch_speed", "launch_speed_mean", "launch_speed_mph"])
-        la_col = _pick(list(joined.columns), ["launch_angle", "launch_angle_mean"])
-
         out = pd.DataFrame(index=joined.index)
-        out["canonical_park_key"] = joined["canonical_park_key"].astype(str)
+        out["canonical_park_key"] = joined.get("canonical_park_key", pd.NA)
+        out["canonical_park_key_norm"] = joined["canonical_park_key_norm"].astype(str)
         out["season"] = season
         out["game_pk"] = joined["game_pk"]
-        out["park_id"] = joined["park_id"] if "park_id" in joined.columns else pd.NA
-        out["venue_id"] = joined["venue_id"] if "venue_id" in joined.columns else pd.NA
-        out["park_name"] = joined["park_name"] if "park_name" in joined.columns else pd.NA
+        out["park_id"] = joined.get("park_id", pd.NA)
+        out["venue_id"] = joined.get("venue_id", pd.NA)
+        out["park_name"] = joined.get("park_name", pd.NA)
 
         out["pa_n"] = 1.0
         out["hit_n"] = ev.isin(HIT_EVENTS).astype(float)
@@ -186,17 +182,30 @@ def main() -> None:
         out["bip_n"] = (bip_hit > 0).astype(float) + ev.isin(BIP_OUT_EVENTS).astype(float)
         out["hit_on_bip_n"] = bip_hit
 
-        runs = pd.to_numeric(joined["rbi"], errors="coerce") if "rbi" in joined.columns else pd.Series(0.0, index=joined.index)
-        out["runs_n"] = runs.fillna(0.0)
-        out["rbi_n"] = runs.fillna(0.0)
+        # Run environment proxy: prefer RBI if present; fallback to positive delta_run_exp.
+        rbi_series = joined["rbi"] if "rbi" in joined.columns else pd.Series(np.nan, index=joined.index)
+        dre_series = joined["delta_run_exp"] if "delta_run_exp" in joined.columns else pd.Series(np.nan, index=joined.index)
+        rbi_raw = pd.to_numeric(rbi_series, errors="coerce")
+        dre_raw = pd.to_numeric(dre_series, errors="coerce")
+        rbi_sum = float(rbi_raw.fillna(0.0).sum())
+        has_rbi_signal = bool(rbi_raw.notna().any() and rbi_sum > 0)
+        if has_rbi_signal:
+            out["runs_proxy_n"] = rbi_raw.fillna(0.0)
+            out["rbi_n"] = rbi_raw.fillna(0.0)
+            out["runs_proxy_source"] = "rbi"
+        else:
+            # fallback run-environment proxy from positive change in run expectancy
+            run_proxy = np.clip(dre_raw.fillna(0.0), 0.0, None)
+            out["runs_proxy_n"] = run_proxy
+            out["rbi_n"] = np.nan
+            out["runs_proxy_source"] = "delta_run_exp_positive"
 
+        ls_col = _pick(list(joined.columns), ["launch_speed", "launch_speed_mean", "launch_speed_mph"])
+        la_col = _pick(list(joined.columns), ["launch_angle", "launch_angle_mean"])
         out["launch_speed_sum"] = pd.to_numeric(joined[ls_col], errors="coerce") if ls_col else np.nan
         out["launch_speed_obs_n"] = pd.to_numeric(joined[ls_col], errors="coerce").notna().astype(float) if ls_col else 0.0
         out["launch_angle_sum"] = pd.to_numeric(joined[la_col], errors="coerce") if la_col else np.nan
         out["launch_angle_obs_n"] = pd.to_numeric(joined[la_col], errors="coerce").notna().astype(float) if la_col else 0.0
-        out["hard_hit_n"] = _hard_hit_flag(joined)
-        out["hard_hit_obs_n"] = pd.to_numeric(out["hard_hit_n"], errors="coerce").notna().astype(float)
-        out["hard_hit_n"] = pd.to_numeric(out["hard_hit_n"], errors="coerce").fillna(0.0)
 
         frames.append(out)
 
@@ -205,7 +214,19 @@ def main() -> None:
 
     all_pa = pd.concat(frames, ignore_index=True, sort=False)
 
-    park = all_pa.groupby("canonical_park_key", as_index=False).agg(
+    raw_to_norm = all_pa[["canonical_park_key", "canonical_park_key_norm"]].dropna().drop_duplicates()
+    collapsed_n = int(max(0, raw_to_norm["canonical_park_key"].nunique() - raw_to_norm["canonical_park_key_norm"].nunique()))
+    examples = (
+        raw_to_norm.groupby("canonical_park_key_norm")["canonical_park_key"]
+        .nunique()
+        .reset_index(name="raw_key_n")
+        .query("raw_key_n > 1")
+        .head(10)
+        .to_dict(orient="records")
+    )
+
+    park = all_pa.groupby("canonical_park_key_norm", as_index=False).agg(
+        canonical_park_key=("canonical_park_key", _mode_or_na),
         representative_park_id=("park_id", _mode_or_na),
         representative_venue_id=("venue_id", _mode_or_na),
         representative_park_name=("park_name", _mode_or_na),
@@ -219,7 +240,7 @@ def main() -> None:
         three_b_n=("3b_n", "sum"),
         hr_n=("hr_n", "sum"),
         xbh_n=("xbh_n", "sum"),
-        runs_n=("runs_n", "sum"),
+        runs_proxy_n=("runs_proxy_n", "sum"),
         rbi_n=("rbi_n", "sum"),
         bb_n=("bb_n", "sum"),
         k_n=("k_n", "sum"),
@@ -228,6 +249,7 @@ def main() -> None:
         launch_speed_obs_n=("launch_speed_obs_n", "sum"),
         launch_angle_sum=("launch_angle_sum", "sum"),
         launch_angle_obs_n=("launch_angle_obs_n", "sum"),
+        runs_proxy_source=("runs_proxy_source", _mode_or_na),
     )
 
     lg_hits_pa = float(all_pa["hit_n"].sum() / max(1.0, all_pa["pa_n"].sum()))
@@ -236,8 +258,11 @@ def main() -> None:
     lg_3b_pa = float(all_pa["3b_n"].sum() / max(1.0, all_pa["pa_n"].sum()))
     lg_hr_pa = float(all_pa["hr_n"].sum() / max(1.0, all_pa["pa_n"].sum()))
     lg_xbh_pa = float(all_pa["xbh_n"].sum() / max(1.0, all_pa["pa_n"].sum()))
-    lg_runs_pa = float(all_pa["runs_n"].sum() / max(1.0, all_pa["pa_n"].sum()))
-    lg_rbi_pa = float(all_pa["rbi_n"].sum() / max(1.0, all_pa["pa_n"].sum()))
+    lg_runs_pa = float(all_pa["runs_proxy_n"].sum() / max(1.0, all_pa["pa_n"].sum()))
+
+    has_rbi = bool(pd.to_numeric(all_pa["rbi_n"], errors="coerce").notna().any() and pd.to_numeric(all_pa["rbi_n"], errors="coerce").fillna(0.0).sum() > 0)
+    lg_rbi_pa = float(pd.to_numeric(all_pa["rbi_n"], errors="coerce").fillna(0.0).sum() / max(1.0, all_pa["pa_n"].sum())) if has_rbi else np.nan
+
     lg_bb_pa = float(all_pa["bb_n"].sum() / max(1.0, all_pa["pa_n"].sum()))
     lg_k_pa = float(all_pa["k_n"].sum() / max(1.0, all_pa["pa_n"].sum()))
     lg_babip = float(all_pa["hit_on_bip_n"].sum() / max(1.0, all_pa["bip_n"].sum()))
@@ -250,25 +275,27 @@ def main() -> None:
     park["park_factor_3b_hist"] = _safe_div(_safe_div(park["three_b_n"], park["pa_n"]), lg_3b_pa)
     park["park_factor_hr_hist"] = _safe_div(_safe_div(park["hr_n"], park["pa_n"]), lg_hr_pa)
     park["park_factor_xbh_hist"] = _safe_div(_safe_div(park["xbh_n"], park["pa_n"]), lg_xbh_pa)
-    park["park_factor_runs_hist"] = _safe_div(_safe_div(park["runs_n"], park["pa_n"]), lg_runs_pa)
-    park["park_factor_rbi_hist"] = _safe_div(_safe_div(park["rbi_n"], park["pa_n"]), lg_rbi_pa)
+    park["park_factor_runs_hist"] = _safe_div(_safe_div(park["runs_proxy_n"], park["pa_n"]), lg_runs_pa)
+    if has_rbi and np.isfinite(lg_rbi_pa) and lg_rbi_pa > 0:
+        park["park_factor_rbi_hist"] = _safe_div(_safe_div(park["rbi_n"], park["pa_n"]), lg_rbi_pa)
     park["park_factor_bb_hist"] = _safe_div(_safe_div(park["bb_n"], park["pa_n"]), lg_bb_pa)
     park["park_factor_k_hist"] = _safe_div(_safe_div(park["k_n"], park["pa_n"]), lg_k_pa)
     park["park_factor_babip_hist"] = _safe_div(_safe_div(park["hit_on_bip_n"], park["bat_balls_in_play_n"]), lg_babip)
     park["park_factor_avg_launch_speed_hist"] = _safe_div(_safe_div(park["launch_speed_sum"], park["launch_speed_obs_n"]), lg_ls)
     park["park_factor_avg_launch_angle_hist"] = _safe_div(_safe_div(park["launch_angle_sum"], park["launch_angle_obs_n"]), lg_la)
 
-    weight_hits = park["pa_n"] / (park["pa_n"] + args.k_hits)
-    weight_hr = park["pa_n"] / (park["pa_n"] + args.k_hr)
-    weight_runs = park["pa_n"] / (park["pa_n"] + args.k_runs)
-    weight_xbh = park["pa_n"] / (park["pa_n"] + args.k_xbh)
-    park["park_factor_hits_hist_shrunk"] = (weight_hits * park["park_factor_hits_hist"]) + ((1.0 - weight_hits) * 1.0)
-    park["park_factor_hr_hist_shrunk"] = (weight_hr * park["park_factor_hr_hist"]) + ((1.0 - weight_hr) * 1.0)
-    park["park_factor_runs_hist_shrunk"] = (weight_runs * park["park_factor_runs_hist"]) + ((1.0 - weight_runs) * 1.0)
-    park["park_factor_xbh_hist_shrunk"] = (weight_xbh * park["park_factor_xbh_hist"]) + ((1.0 - weight_xbh) * 1.0)
+    w_hits = park["pa_n"] / (park["pa_n"] + args.k_hits)
+    w_hr = park["pa_n"] / (park["pa_n"] + args.k_hr)
+    w_runs = park["pa_n"] / (park["pa_n"] + args.k_runs)
+    w_xbh = park["pa_n"] / (park["pa_n"] + args.k_xbh)
+    park["park_factor_hits_hist_shrunk"] = (w_hits * park["park_factor_hits_hist"]) + (1.0 - w_hits)
+    park["park_factor_hr_hist_shrunk"] = (w_hr * park["park_factor_hr_hist"]) + (1.0 - w_hr)
+    park["park_factor_runs_hist_shrunk"] = (w_runs * park["park_factor_runs_hist"]) + (1.0 - w_runs)
+    park["park_factor_xbh_hist_shrunk"] = (w_xbh * park["park_factor_xbh_hist"]) + (1.0 - w_xbh)
 
     output_cols = [
         "canonical_park_key",
+        "canonical_park_key_norm",
         "representative_park_id",
         "representative_venue_id",
         "representative_park_name",
@@ -283,7 +310,6 @@ def main() -> None:
         "park_factor_hr_hist",
         "park_factor_xbh_hist",
         "park_factor_runs_hist",
-        "park_factor_rbi_hist",
         "park_factor_bb_hist",
         "park_factor_k_hist",
         "park_factor_babip_hist",
@@ -294,25 +320,25 @@ def main() -> None:
         "park_factor_runs_hist_shrunk",
         "park_factor_xbh_hist_shrunk",
     ]
+    if "park_factor_rbi_hist" in park.columns:
+        output_cols.insert(output_cols.index("park_factor_bb_hist"), "park_factor_rbi_hist")
+
     out = park[output_cols].copy()
 
     out_path = dirs["reference_dir"] / "parks.parquet"
     write_parquet(out, out_path)
 
     logging.info("park_factors seasons_included=%s", sorted(set(included_seasons)))
-    logging.info(
-        "park_factors totals pa_rows=%s joined_rows=%s missing_game_pk=%s missing_canonical_park_key=%s included_rows=%s",
-        total_pa_rows,
-        total_joined_rows,
-        total_missing_game_pk,
-        total_missing_park,
-        len(all_pa),
-    )
-    logging.info("park_factors unique_parks=%s", out["canonical_park_key"].nunique())
+    logging.info("park_factors totals pa_rows=%s joined_rows=%s missing_game_pk=%s included_rows=%s", total_pa_rows, total_joined_rows, total_missing_game_pk, len(all_pa))
+    logging.info("park_factors raw_to_norm_collapsed_count=%s", collapsed_n)
+    logging.info("park_factors raw_to_norm_multi_raw_examples=%s", examples)
+    logging.info("park_factors unique_normalized_parks=%s", out["canonical_park_key_norm"].nunique())
+
+    logging.info("park_factors run_proxy_source_by_park=%s", park[["canonical_park_key_norm", "runs_proxy_source"]].head(20).to_dict(orient="records"))
 
     for metric in ["park_factor_hits_hist_shrunk", "park_factor_hr_hist_shrunk", "park_factor_runs_hist_shrunk"]:
-        logging.info("park_factors top10_%s=%s", metric, out.nlargest(10, metric)[["canonical_park_key", metric, "pa_n"]].to_dict(orient="records"))
-        logging.info("park_factors bottom10_%s=%s", metric, out.nsmallest(10, metric)[["canonical_park_key", metric, "pa_n"]].to_dict(orient="records"))
+        logging.info("park_factors top10_%s=%s", metric, out.nlargest(10, metric)[["canonical_park_key_norm", metric, "pa_n"]].to_dict(orient="records"))
+        logging.info("park_factors bottom10_%s=%s", metric, out.nsmallest(10, metric)[["canonical_park_key_norm", metric, "pa_n"]].to_dict(orient="records"))
 
     null_rates = {c: float(out[c].isna().mean()) for c in out.columns}
     logging.info("park_factors null_rates=%s", null_rates)
