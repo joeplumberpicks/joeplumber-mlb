@@ -26,7 +26,8 @@ SAFE_ID_CONTEXT_COLS = {
 }
 SAFE_ENGINEERED_COLS = {
     "lineup_slot", "expected_batting_order_pa", "lineup_confidence", "expected_ab_proxy",
-    "park_factor_hits_hist", "park_factor_hits_2026_roll", "park_factor_hits_blend",
+    "park_factor_hits_hist_shrunk", "park_factor_runs_hist_shrunk", "park_factor_xbh_hist_shrunk",
+    "park_factor_babip_hist", "park_factor_avg_launch_speed_hist", "park_factor_avg_launch_angle_hist",
     "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"
 }
 ROLL_SUFFIXES = ("_roll3", "_roll7", "_roll15", "_roll30")
@@ -124,6 +125,26 @@ def _ensure_series(df: pd.DataFrame, col: str | None) -> pd.Series:
     if col is None or col not in df.columns:
         return pd.Series(np.nan, index=df.index, dtype="float64")
     return pd.to_numeric(df[col], errors="coerce")
+
+
+def _numeric_key(series: pd.Series, prefix: str) -> pd.Series:
+    out = pd.to_numeric(series, errors="coerce")
+    return out.map(lambda v: f"{prefix}:{int(v)}" if pd.notna(v) else pd.NA)
+
+
+def _build_park_join_key(df: pd.DataFrame) -> pd.Series:
+    out = pd.Series(pd.NA, index=df.index, dtype="object")
+    if "canonical_park_key_norm" in df.columns:
+        out = out.fillna(df["canonical_park_key_norm"].astype("string"))
+    for col in ("venue_id", "representative_venue_id"):
+        if col in df.columns:
+            out = out.fillna(_numeric_key(df[col], "venue"))
+    for col in ("park_id", "representative_park_id"):
+        if col in df.columns:
+            out = out.fillna(_numeric_key(df[col], "park"))
+    if "canonical_park_key" in df.columns:
+        out = out.fillna(df["canonical_park_key"].astype("string"))
+    return out.astype("string")
 
 
 def _ensure_season(df: pd.DataFrame) -> pd.Series:
@@ -238,33 +259,44 @@ def _context_from_spine(spine: pd.DataFrame) -> pd.DataFrame:
 def _join_optional_park_weather(batter: pd.DataFrame, dirs: dict[str, Path], spine: pd.DataFrame) -> pd.DataFrame:
     out = batter.copy()
 
-    join_key_col = _pick(list(out.columns), ["canonical_park_key", "venue_id", "park_id"])
+    join_key_col = _pick(list(out.columns), ["canonical_park_key_norm", "venue_id", "park_id", "canonical_park_key"])
     if join_key_col is None and not spine.empty:
-        spine_k = _pick(list(spine.columns), ["canonical_park_key", "venue_id", "park_id"])
+        spine_k = _pick(list(spine.columns), ["canonical_park_key_norm", "venue_id", "park_id", "canonical_park_key"])
         if spine_k and "game_pk" in spine.columns:
             sp = spine[["game_pk", spine_k]].copy().rename(columns={spine_k: "_park_join_key_raw"})
             sp["game_pk"] = pd.to_numeric(sp["game_pk"], errors="coerce").astype("Int64")
             out = out.merge(sp.drop_duplicates(subset=["game_pk"], keep="last"), on="game_pk", how="left")
             join_key_col = "_park_join_key_raw"
 
-    if join_key_col:
-        out["_park_join_key"] = out[join_key_col].astype(str)
+    out["_park_join_key"] = _build_park_join_key(out)
 
     hist_path = dirs["reference_dir"] / "parks.parquet"
-    if hist_path.exists() and "_park_join_key" in out.columns:
+    if hist_path.exists():
         try:
             parks = pd.read_parquet(hist_path)
-            pkey = _pick(list(parks.columns), ["canonical_park_key", "venue_id", "park_id"])
-            if pkey:
-                p = parks[[c for c in [pkey, "park_factor_hits_hist"] if c in parks.columns]].copy()
-                p["_park_join_key"] = p[pkey].astype(str)
-                out = out.merge(p.drop(columns=[pkey], errors="ignore").drop_duplicates(subset=["_park_join_key"], keep="last"), on="_park_join_key", how="left")
+            parks["_park_join_key"] = _build_park_join_key(parks)
+            park_features = [
+                "park_factor_hits_hist_shrunk",
+                "park_factor_runs_hist_shrunk",
+                "park_factor_xbh_hist_shrunk",
+                "park_factor_babip_hist",
+                "park_factor_avg_launch_speed_hist",
+                "park_factor_avg_launch_angle_hist",
+            ]
+            keep = [c for c in ["_park_join_key", "canonical_park_key"] + park_features if c in parks.columns]
+            if len(keep) <= 1:
+                logging.warning("parks.parquet exists but requested park feature columns were not found")
             else:
-                logging.warning("parks.parquet exists but no park join key found")
+                p = parks[keep].drop_duplicates(subset=["_park_join_key"], keep="last")
+                out = out.merge(p, on="_park_join_key", how="left", suffixes=("", "_parkref"))
+                if "canonical_park_key_parkref" in out.columns and "canonical_park_key" not in out.columns:
+                    out["canonical_park_key"] = out["canonical_park_key_parkref"]
+                out = out.drop(columns=[c for c in ["canonical_park_key_parkref"] if c in out.columns], errors="ignore")
+                logging.info("hit_prop_mart park_join join_key_used=canonical_park_key_norm>venue_id>park_id>canonical_park_key")
         except Exception:
             logging.exception("failed joining historical park factors; continuing")
     else:
-        logging.warning("optional historical parks table missing or join key unavailable: %s", hist_path)
+        logging.warning("optional historical parks table missing: %s", hist_path)
 
     dyn_path = dirs["reference_dir"] / "parks_dynamic_2026.parquet"
     if dyn_path.exists() and "_park_join_key" in out.columns:
@@ -299,7 +331,20 @@ def _join_optional_park_weather(batter: pd.DataFrame, dirs: dict[str, Path], spi
         logging.warning("optional weather table missing: %s", weather_path)
 
     out = out.drop(columns=["_park_join_key", "_park_join_key_raw"], errors="ignore")
-    for c in ["park_factor_hits_hist", "park_factor_hits_2026_roll", "park_factor_hits_blend", "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"]:
+    for c in [
+        "park_factor_hits_hist_shrunk",
+        "park_factor_runs_hist_shrunk",
+        "park_factor_xbh_hist_shrunk",
+        "park_factor_babip_hist",
+        "park_factor_avg_launch_speed_hist",
+        "park_factor_avg_launch_angle_hist",
+        "park_factor_hits_2026_roll",
+        "park_factor_hits_blend",
+        "temperature",
+        "wind_speed",
+        "weather_wind_out",
+        "weather_wind_in",
+    ]:
         if c not in out.columns:
             out[c] = np.nan
     return out
@@ -462,7 +507,12 @@ def main() -> None:
         "expected_ab_proxy",
         "bat_ab_per_game_roll15",
         "bat_pa_per_game_roll15",
-        "park_factor_hits_hist",
+        "park_factor_hits_hist_shrunk",
+        "park_factor_runs_hist_shrunk",
+        "park_factor_xbh_hist_shrunk",
+        "park_factor_babip_hist",
+        "park_factor_avg_launch_speed_hist",
+        "park_factor_avg_launch_angle_hist",
         "park_factor_hits_2026_roll",
         "park_factor_hits_blend",
         "temperature",
@@ -490,7 +540,7 @@ def main() -> None:
         sample_cols = [c for c in ["lineup_slot","expected_batting_order_pa","lineup_confidence","bat_ab_per_game_roll15","bat_pa_per_game_roll15","expected_ab_proxy"] if c in s_df.columns]
         if sample_cols:
             logging.info("hit_prop_mart season=%s sample_opportunity_rows=%s", season, s_df[sample_cols].head(5).to_dict(orient="records"))
-        sample_ctx_cols = [c for c in ["park_factor_hits_hist", "park_factor_hits_2026_roll", "park_factor_hits_blend", "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"] if c in s_df.columns]
+        sample_ctx_cols = [c for c in ["park_factor_hits_hist_shrunk", "park_factor_runs_hist_shrunk", "park_factor_xbh_hist_shrunk", "park_factor_babip_hist", "park_factor_avg_launch_speed_hist", "park_factor_avg_launch_angle_hist", "park_factor_hits_2026_roll", "park_factor_hits_blend", "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"] if c in s_df.columns]
         if sample_ctx_cols:
             logging.info("hit_prop_mart season=%s sample_context_rows=%s", season, s_df[sample_ctx_cols].head(5).to_dict(orient="records"))
 

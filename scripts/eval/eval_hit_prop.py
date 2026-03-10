@@ -27,7 +27,7 @@ TARGET = "target_hit_1_plus"
 
 
 SAFE_ENGINEERED_COLS = {
-    "lineup_slot", "expected_batting_order_pa", "lineup_confidence", "bat_ab_per_game_roll15", "bat_pa_per_game_roll15", "expected_ab_proxy", "park_factor_hits_hist", "park_factor_hits_2026_roll", "park_factor_hits_blend", "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"
+    "lineup_slot", "expected_batting_order_pa", "lineup_confidence", "bat_ab_per_game_roll15", "bat_pa_per_game_roll15", "expected_ab_proxy", "park_factor_hits_hist_shrunk", "park_factor_runs_hist_shrunk", "park_factor_xbh_hist_shrunk", "park_factor_babip_hist", "park_factor_avg_launch_speed_hist", "park_factor_avg_launch_angle_hist", "park_factor_hits_2026_roll", "park_factor_hits_blend", "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"
 }
 ROLL_SUFFIXES = ("_roll3", "_roll7", "_roll15", "_roll30")
 
@@ -130,6 +130,9 @@ def main() -> None:
     opp_feats = ["lineup_slot", "expected_batting_order_pa", "lineup_confidence", "bat_ab_per_game_roll15", "bat_pa_per_game_roll15", "expected_ab_proxy"]
     opp_survival = {f: (f in feats) for f in opp_feats}
     logging.info("hit_prop eval opportunity_feature_survival=%s", opp_survival)
+    park_feats = ["park_factor_hits_hist_shrunk", "park_factor_runs_hist_shrunk", "park_factor_xbh_hist_shrunk", "park_factor_babip_hist", "park_factor_avg_launch_speed_hist", "park_factor_avg_launch_angle_hist"]
+    park_survival = {f: (f in feats) for f in park_feats}
+    logging.info("hit_prop eval park_feature_survival=%s", park_survival)
     if not feats:
         raise ValueError("No numeric non-null features available for evaluation")
 
