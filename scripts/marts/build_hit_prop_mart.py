@@ -136,12 +136,11 @@ def _build_park_join_key(df: pd.DataFrame) -> pd.Series:
     out = pd.Series(pd.NA, index=df.index, dtype="object")
     if "canonical_park_key_norm" in df.columns:
         out = out.fillna(df["canonical_park_key_norm"].astype("string"))
-    for col in ("venue_id", "representative_venue_id"):
-        if col in df.columns:
-            out = out.fillna(_numeric_key(df[col], "venue"))
-    for col in ("park_id", "representative_park_id"):
-        if col in df.columns:
-            out = out.fillna(_numeric_key(df[col], "park"))
+    if "venue_id" in df.columns:
+        out = out.fillna(_numeric_key(df["venue_id"], "venue"))
+    if "park_id" in df.columns:
+        # Keep mart-side normalization aligned with current parks reference behavior.
+        out = out.fillna(_numeric_key(df["park_id"], "venue"))
     if "canonical_park_key" in df.columns:
         out = out.fillna(df["canonical_park_key"].astype("string"))
     return out.astype("string")
@@ -259,55 +258,127 @@ def _context_from_spine(spine: pd.DataFrame) -> pd.DataFrame:
 def _join_optional_park_weather(batter: pd.DataFrame, dirs: dict[str, Path], spine: pd.DataFrame) -> pd.DataFrame:
     out = batter.copy()
 
-    join_key_col = _pick(list(out.columns), ["canonical_park_key_norm", "venue_id", "park_id", "canonical_park_key"])
-    if join_key_col is None and not spine.empty:
-        spine_k = _pick(list(spine.columns), ["canonical_park_key_norm", "venue_id", "park_id", "canonical_park_key"])
-        if spine_k and "game_pk" in spine.columns:
-            sp = spine[["game_pk", spine_k]].copy().rename(columns={spine_k: "_park_join_key_raw"})
-            sp["game_pk"] = pd.to_numeric(sp["game_pk"], errors="coerce").astype("Int64")
-            out = out.merge(sp.drop_duplicates(subset=["game_pk"], keep="last"), on="game_pk", how="left")
-            join_key_col = "_park_join_key_raw"
-
-    out["_park_join_key"] = _build_park_join_key(out)
+    # Ensure mart-side normalized park identity exists before joining reference table.
+    out["canonical_park_key_norm"] = _build_park_join_key(out)
 
     hist_path = dirs["reference_dir"] / "parks.parquet"
+    park_features = [
+        "park_factor_hits_hist_shrunk",
+        "park_factor_runs_hist_shrunk",
+        "park_factor_xbh_hist_shrunk",
+        "park_factor_babip_hist",
+        "park_factor_avg_launch_speed_hist",
+        "park_factor_avg_launch_angle_hist",
+    ]
+
     if hist_path.exists():
         try:
             parks = pd.read_parquet(hist_path)
-            parks["_park_join_key"] = _build_park_join_key(parks)
-            park_features = [
-                "park_factor_hits_hist_shrunk",
-                "park_factor_runs_hist_shrunk",
-                "park_factor_xbh_hist_shrunk",
-                "park_factor_babip_hist",
-                "park_factor_avg_launch_speed_hist",
-                "park_factor_avg_launch_angle_hist",
-            ]
-            keep = [c for c in ["_park_join_key", "canonical_park_key"] + park_features if c in parks.columns]
-            if len(keep) <= 1:
-                logging.warning("parks.parquet exists but requested park feature columns were not found")
-            else:
-                p = parks[keep].drop_duplicates(subset=["_park_join_key"], keep="last")
-                out = out.merge(p, on="_park_join_key", how="left", suffixes=("", "_parkref"))
-                if "canonical_park_key_parkref" in out.columns and "canonical_park_key" not in out.columns:
-                    out["canonical_park_key"] = out["canonical_park_key_parkref"]
-                out = out.drop(columns=[c for c in ["canonical_park_key_parkref"] if c in out.columns], errors="ignore")
-                logging.info("hit_prop_mart park_join join_key_used=canonical_park_key_norm>venue_id>park_id>canonical_park_key")
+            parks = parks.copy()
+            parks["canonical_park_key_norm"] = _build_park_join_key(parks)
+            parks["_rep_venue_id_num"] = pd.to_numeric(parks.get("representative_venue_id"), errors="coerce")
+            parks["_rep_park_id_num"] = pd.to_numeric(parks.get("representative_park_id"), errors="coerce")
+            parks["_canonical_park_key_str"] = parks.get("canonical_park_key", pd.Series(pd.NA, index=parks.index)).astype("string")
+
+            out["_venue_id_num"] = pd.to_numeric(out.get("venue_id"), errors="coerce")
+            out["_park_id_num"] = pd.to_numeric(out.get("park_id"), errors="coerce")
+            out["_canonical_park_key_str"] = out.get("canonical_park_key", pd.Series(pd.NA, index=out.index)).astype("string")
+
+            mart_key_non_null = {
+                "canonical_park_key_norm": float(out["canonical_park_key_norm"].notna().mean()),
+                "venue_id": float(out["_venue_id_num"].notna().mean()),
+                "park_id": float(out["_park_id_num"].notna().mean()),
+                "canonical_park_key": float(out["_canonical_park_key_str"].notna().mean()),
+            }
+            logging.info("hit_prop_mart park_join mart_join_key_non_null_rates=%s", mart_key_non_null)
+            logging.info(
+                "hit_prop_mart park_join sample_mart_keys=%s",
+                out[[c for c in ["canonical_park_key_norm", "_venue_id_num", "_park_id_num", "_canonical_park_key_str"] if c in out.columns]]
+                .head(10)
+                .to_dict(orient="records"),
+            )
+            logging.info(
+                "hit_prop_mart park_join sample_park_keys=%s",
+                parks[[c for c in ["canonical_park_key_norm", "_rep_venue_id_num", "_rep_park_id_num", "_canonical_park_key_str"] if c in parks.columns]]
+                .head(10)
+                .to_dict(orient="records"),
+            )
+
+            for c in park_features:
+                if c not in out.columns:
+                    out[c] = np.nan
+            if "_park_join_path" not in out.columns:
+                out["_park_join_path"] = pd.NA
+
+            match_counts: dict[str, int] = {"canonical_park_key_norm": 0, "venue_id": 0, "park_id": 0, "canonical_park_key": 0}
+
+            def _fill_from_join(path_name: str, left_key: str, right_key: str) -> None:
+                nonlocal out, match_counts
+                if left_key not in out.columns or right_key not in parks.columns:
+                    logging.info("hit_prop_mart park_join path=%s skipped missing key(s) left=%s right=%s", path_name, left_key, right_key)
+                    return
+                need_mask = out[park_features].isna().all(axis=1)
+                left = out.loc[need_mask, [left_key]].copy()
+                left = left[left[left_key].notna()]
+                if left.empty:
+                    logging.info("hit_prop_mart park_join path=%s skipped no eligible mart rows", path_name)
+                    return
+                left = left.assign(_row_idx=left.index)
+
+                pcols = [right_key] + [c for c in park_features if c in parks.columns]
+                right = parks[pcols].copy().dropna(subset=[right_key]).drop_duplicates(subset=[right_key], keep="last")
+                merged = left.merge(right, left_on=left_key, right_on=right_key, how="left")
+                matched_mask = merged[[c for c in park_features if c in merged.columns]].notna().any(axis=1)
+                matched = int(matched_mask.sum())
+                logging.info(
+                    "hit_prop_mart park_join path=%s eligible_rows=%s matched_rows=%s post_merge_rows=%s",
+                    path_name,
+                    int(len(left)),
+                    matched,
+                    int(len(merged)),
+                )
+                if matched == 0:
+                    return
+                match_counts[path_name] += matched
+                matched_rows = merged.loc[matched_mask, "_row_idx"].astype(int)
+                for c in park_features:
+                    if c in merged.columns:
+                        vals = merged.set_index("_row_idx")[c]
+                        out.loc[matched_rows, c] = out.loc[matched_rows, c].fillna(pd.to_numeric(vals.loc[matched_rows], errors="coerce"))
+                out.loc[matched_rows, "_park_join_path"] = path_name
+
+            _fill_from_join("canonical_park_key_norm", "canonical_park_key_norm", "canonical_park_key_norm")
+            _fill_from_join("venue_id", "_venue_id_num", "_rep_venue_id_num")
+            _fill_from_join("park_id", "_park_id_num", "_rep_park_id_num")
+            _fill_from_join("canonical_park_key", "_canonical_park_key_str", "_canonical_park_key_str")
+
+            final_rates = {c: float(pd.to_numeric(out[c], errors="coerce").notna().mean()) for c in park_features if c in out.columns}
+            logging.info("hit_prop_mart park_join matched_rows_by_path=%s", match_counts)
+            logging.info("hit_prop_mart park_join final_park_feature_non_null_rates=%s", final_rates)
+            logging.info(
+                "hit_prop_mart park_join sample_joined_park_rows=%s",
+                out[[c for c in ["canonical_park_key_norm", "_venue_id_num", "_park_id_num", "_park_join_path"] + park_features if c in out.columns]]
+                .head(10)
+                .to_dict(orient="records"),
+            )
+            if all(final_rates.get(c, 0.0) == 0.0 for c in park_features):
+                logging.warning(
+                    "hit_prop_mart park_join parks.parquet loaded but all requested park features remained null; likely key mismatch between mart and parks identity columns"
+                )
         except Exception:
             logging.exception("failed joining historical park factors; continuing")
     else:
         logging.warning("optional historical parks table missing: %s", hist_path)
 
     dyn_path = dirs["reference_dir"] / "parks_dynamic_2026.parquet"
-    if dyn_path.exists() and "_park_join_key" in out.columns:
+    if dyn_path.exists() and "canonical_park_key_norm" in out.columns:
         try:
             dyn = pd.read_parquet(dyn_path)
-            pkey = _pick(list(dyn.columns), ["canonical_park_key", "venue_id", "park_id"])
-            if pkey:
-                keep = [c for c in [pkey, "park_factor_hits_2026_roll", "park_factor_hits_blend"] if c in dyn.columns]
-                d = dyn[keep].copy()
-                d["_park_join_key"] = d[pkey].astype(str)
-                out = out.merge(d.drop(columns=[pkey], errors="ignore").drop_duplicates(subset=["_park_join_key"], keep="last"), on="_park_join_key", how="left")
+            dyn["canonical_park_key_norm"] = _build_park_join_key(dyn)
+            keep = [c for c in ["canonical_park_key_norm", "park_factor_hits_2026_roll", "park_factor_hits_blend"] if c in dyn.columns]
+            if keep:
+                d = dyn[keep].drop_duplicates(subset=["canonical_park_key_norm"], keep="last")
+                out = out.merge(d, on="canonical_park_key_norm", how="left")
         except Exception:
             logging.exception("failed joining dynamic park factors; continuing")
     else:
@@ -330,7 +401,7 @@ def _join_optional_park_weather(batter: pd.DataFrame, dirs: dict[str, Path], spi
     else:
         logging.warning("optional weather table missing: %s", weather_path)
 
-    out = out.drop(columns=["_park_join_key", "_park_join_key_raw"], errors="ignore")
+    out = out.drop(columns=["_venue_id_num", "_park_id_num", "_canonical_park_key_str", "_park_join_path"], errors="ignore")
     for c in [
         "park_factor_hits_hist_shrunk",
         "park_factor_runs_hist_shrunk",
