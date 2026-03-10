@@ -28,6 +28,11 @@ SAFE_ENGINEERED_COLS = {
     "lineup_slot", "expected_batting_order_pa", "lineup_confidence", "expected_ab_proxy",
     "park_factor_hits_hist_shrunk", "park_factor_runs_hist_shrunk", "park_factor_xbh_hist_shrunk",
     "park_factor_babip_hist", "park_factor_avg_launch_speed_hist", "park_factor_avg_launch_angle_hist",
+    "park_factor_hits_2026_roll", "park_factor_hr_2026_roll", "park_factor_xbh_2026_roll", "park_factor_runs_2026_roll",
+    "park_factor_babip_2026_roll", "park_factor_avg_launch_speed_2026_roll", "park_factor_avg_launch_angle_2026_roll",
+    "park_factor_dynamic_weight", "park_factor_hist_weight", "dynamic_sample_confidence",
+    "park_factor_hits_blend", "park_factor_runs_blend", "park_factor_xbh_blend", "park_factor_babip_blend",
+    "park_factor_avg_launch_speed_blend", "park_factor_avg_launch_angle_blend",
     "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"
 }
 ROLL_SUFFIXES = ("_roll3", "_roll7", "_roll15", "_roll30")
@@ -374,11 +379,71 @@ def _join_optional_park_weather(batter: pd.DataFrame, dirs: dict[str, Path], spi
     if dyn_path.exists() and "canonical_park_key_norm" in out.columns:
         try:
             dyn = pd.read_parquet(dyn_path)
+            dyn = dyn.copy()
             dyn["canonical_park_key_norm"] = _build_park_join_key(dyn)
-            keep = [c for c in ["canonical_park_key_norm", "park_factor_hits_2026_roll", "park_factor_hits_blend"] if c in dyn.columns]
-            if keep:
-                d = dyn[keep].drop_duplicates(subset=["canonical_park_key_norm"], keep="last")
-                out = out.merge(d, on="canonical_park_key_norm", how="left")
+            dyn["game_date"] = pd.to_datetime(dyn.get("game_date"), errors="coerce").dt.normalize()
+            dyn["season"] = pd.to_numeric(dyn.get("season"), errors="coerce")
+
+            out["game_date"] = pd.to_datetime(out.get("game_date"), errors="coerce").dt.normalize()
+            if "season" not in out.columns or pd.to_numeric(out.get("season"), errors="coerce").isna().all():
+                out["season"] = pd.to_datetime(out.get("game_date"), errors="coerce").dt.year
+            out["season"] = pd.to_numeric(out.get("season"), errors="coerce")
+
+            dyn_cols = [
+                "park_factor_hits_2026_roll", "park_factor_hr_2026_roll", "park_factor_xbh_2026_roll", "park_factor_runs_2026_roll",
+                "park_factor_babip_2026_roll", "park_factor_avg_launch_speed_2026_roll", "park_factor_avg_launch_angle_2026_roll",
+                "park_factor_dynamic_weight", "park_factor_hist_weight", "dynamic_sample_confidence",
+            ]
+            keep = [c for c in ["season", "game_date", "canonical_park_key_norm"] + dyn_cols if c in dyn.columns]
+            if len(keep) < 4:
+                logging.warning("dynamic parks table exists but missing required join/value columns: %s", dyn_path)
+            else:
+                d = dyn[keep].dropna(subset=["game_date", "canonical_park_key_norm"]).drop_duplicates(
+                    subset=["season", "game_date", "canonical_park_key_norm"], keep="last"
+                )
+                pre_rows = len(out)
+                out = out.merge(d, on=["season", "game_date", "canonical_park_key_norm"], how="left")
+                matched_rows = int(out[[c for c in dyn_cols if c in out.columns]].notna().any(axis=1).sum())
+                logging.info(
+                    "hit_prop_mart dynamic_park_join found=%s join_key=season+game_date+canonical_park_key_norm pre_rows=%s post_rows=%s matched_rows=%s",
+                    dyn_path,
+                    pre_rows,
+                    len(out),
+                    matched_rows,
+                )
+
+                # Build blended context fields with robust fallback behavior.
+                blend_map = {
+                    "park_factor_hits_blend": ("park_factor_hits_hist_shrunk", "park_factor_hits_2026_roll"),
+                    "park_factor_runs_blend": ("park_factor_runs_hist_shrunk", "park_factor_runs_2026_roll"),
+                    "park_factor_xbh_blend": ("park_factor_xbh_hist_shrunk", "park_factor_xbh_2026_roll"),
+                    "park_factor_babip_blend": ("park_factor_babip_hist", "park_factor_babip_2026_roll"),
+                    "park_factor_avg_launch_speed_blend": ("park_factor_avg_launch_speed_hist", "park_factor_avg_launch_speed_2026_roll"),
+                    "park_factor_avg_launch_angle_blend": ("park_factor_avg_launch_angle_hist", "park_factor_avg_launch_angle_2026_roll"),
+                }
+                w_dyn = pd.to_numeric(out.get("park_factor_dynamic_weight"), errors="coerce")
+                w_hist = pd.to_numeric(out.get("park_factor_hist_weight"), errors="coerce")
+                w_dyn = w_dyn.fillna(0.0).clip(0.0, 1.0)
+                w_hist = w_hist.fillna(1.0 - w_dyn).clip(0.0, 1.0)
+
+                for blend_col, (hist_col, dyn_col) in blend_map.items():
+                    hist_v = pd.to_numeric(out.get(hist_col), errors="coerce")
+                    dyn_v = pd.to_numeric(out.get(dyn_col), errors="coerce")
+                    blended = (w_hist * hist_v) + (w_dyn * dyn_v)
+                    blended = blended.where(hist_v.notna() | dyn_v.notna(), np.nan)
+                    blended = blended.where(~(hist_v.notna() & dyn_v.isna()), hist_v)
+                    blended = blended.where(~(hist_v.isna() & dyn_v.notna()), dyn_v)
+                    out[blend_col] = blended
+
+                dyn_non_null = {c: float(pd.to_numeric(out.get(c), errors="coerce").notna().mean()) for c in dyn_cols if c in out.columns}
+                blend_cols = list(blend_map.keys())
+                blend_non_null = {c: float(pd.to_numeric(out.get(c), errors="coerce").notna().mean()) for c in blend_cols if c in out.columns}
+                logging.info("hit_prop_mart dynamic_park_join dynamic_non_null_rates=%s", dyn_non_null)
+                logging.info("hit_prop_mart dynamic_park_join blend_non_null_rates=%s", blend_non_null)
+                logging.info(
+                    "hit_prop_mart dynamic_park_join sample_rows=%s",
+                    out[[c for c in ["season", "game_date", "canonical_park_key_norm"] + dyn_cols + blend_cols if c in out.columns]].head(8).to_dict(orient="records"),
+                )
         except Exception:
             logging.exception("failed joining dynamic park factors; continuing")
     else:
@@ -410,7 +475,21 @@ def _join_optional_park_weather(batter: pd.DataFrame, dirs: dict[str, Path], spi
         "park_factor_avg_launch_speed_hist",
         "park_factor_avg_launch_angle_hist",
         "park_factor_hits_2026_roll",
+        "park_factor_hr_2026_roll",
+        "park_factor_xbh_2026_roll",
+        "park_factor_runs_2026_roll",
+        "park_factor_babip_2026_roll",
+        "park_factor_avg_launch_speed_2026_roll",
+        "park_factor_avg_launch_angle_2026_roll",
+        "park_factor_dynamic_weight",
+        "park_factor_hist_weight",
+        "dynamic_sample_confidence",
         "park_factor_hits_blend",
+        "park_factor_runs_blend",
+        "park_factor_xbh_blend",
+        "park_factor_babip_blend",
+        "park_factor_avg_launch_speed_blend",
+        "park_factor_avg_launch_angle_blend",
         "temperature",
         "wind_speed",
         "weather_wind_out",
@@ -585,7 +664,21 @@ def main() -> None:
         "park_factor_avg_launch_speed_hist",
         "park_factor_avg_launch_angle_hist",
         "park_factor_hits_2026_roll",
+        "park_factor_hr_2026_roll",
+        "park_factor_xbh_2026_roll",
+        "park_factor_runs_2026_roll",
+        "park_factor_babip_2026_roll",
+        "park_factor_avg_launch_speed_2026_roll",
+        "park_factor_avg_launch_angle_2026_roll",
+        "park_factor_dynamic_weight",
+        "park_factor_hist_weight",
+        "dynamic_sample_confidence",
         "park_factor_hits_blend",
+        "park_factor_runs_blend",
+        "park_factor_xbh_blend",
+        "park_factor_babip_blend",
+        "park_factor_avg_launch_speed_blend",
+        "park_factor_avg_launch_angle_blend",
         "temperature",
         "wind_speed",
         "weather_wind_out",
@@ -611,7 +704,7 @@ def main() -> None:
         sample_cols = [c for c in ["lineup_slot","expected_batting_order_pa","lineup_confidence","bat_ab_per_game_roll15","bat_pa_per_game_roll15","expected_ab_proxy"] if c in s_df.columns]
         if sample_cols:
             logging.info("hit_prop_mart season=%s sample_opportunity_rows=%s", season, s_df[sample_cols].head(5).to_dict(orient="records"))
-        sample_ctx_cols = [c for c in ["park_factor_hits_hist_shrunk", "park_factor_runs_hist_shrunk", "park_factor_xbh_hist_shrunk", "park_factor_babip_hist", "park_factor_avg_launch_speed_hist", "park_factor_avg_launch_angle_hist", "park_factor_hits_2026_roll", "park_factor_hits_blend", "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"] if c in s_df.columns]
+        sample_ctx_cols = [c for c in ["park_factor_hits_hist_shrunk", "park_factor_runs_hist_shrunk", "park_factor_xbh_hist_shrunk", "park_factor_babip_hist", "park_factor_avg_launch_speed_hist", "park_factor_avg_launch_angle_hist", "park_factor_hits_2026_roll", "park_factor_hr_2026_roll", "park_factor_xbh_2026_roll", "park_factor_runs_2026_roll", "park_factor_babip_2026_roll", "park_factor_avg_launch_speed_2026_roll", "park_factor_avg_launch_angle_2026_roll", "park_factor_dynamic_weight", "park_factor_hist_weight", "dynamic_sample_confidence", "park_factor_hits_blend", "park_factor_runs_blend", "park_factor_xbh_blend", "park_factor_babip_blend", "park_factor_avg_launch_speed_blend", "park_factor_avg_launch_angle_blend", "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"] if c in s_df.columns]
         if sample_ctx_cols:
             logging.info("hit_prop_mart season=%s sample_context_rows=%s", season, s_df[sample_ctx_cols].head(5).to_dict(orient="records"))
 
