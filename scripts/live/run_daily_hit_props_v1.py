@@ -63,6 +63,86 @@ def _lineup_conf(slot: pd.Series) -> pd.Series:
     return out
 
 
+def _normalize_live_lineups(
+    lu: pd.DataFrame,
+    team_games: pd.DataFrame,
+    source_label: str,
+    default_status: str,
+) -> pd.DataFrame:
+    if lu.empty:
+        return pd.DataFrame(columns=["game_pk", "batter_team", "batter_id", "player_name", "lineup_slot", "lineup_status", "lineup_source"])
+
+    game_pk_col = _pick(list(lu.columns), ["game_pk", "game_id"])
+    team_col = _pick(list(lu.columns), ["batter_team", "team", "team_abbrev", "team_name", "batting_team"])
+    bid_col = _pick(list(lu.columns), ["batter_id", "batter", "player_id"])
+    name_col = _pick(list(lu.columns), ["player_name", "batter_name", "name"])
+    slot_col = _pick(list(lu.columns), ["lineup_slot", "bat_order", "batting_order", "lineup_position", "order"])
+    status_col = _pick(list(lu.columns), ["lineup_status", "status"])
+
+    if team_col is None:
+        logging.warning("lineup source=%s missing team column; skipping", source_label)
+        return pd.DataFrame(columns=["game_pk", "batter_team", "batter_id", "player_name", "lineup_slot", "lineup_status", "lineup_source"])
+
+    out = pd.DataFrame(index=lu.index)
+    out["game_pk"] = pd.to_numeric(lu[game_pk_col], errors="coerce").astype("Int64") if game_pk_col else pd.Series(pd.NA, index=lu.index, dtype="Int64")
+    out["batter_team"] = lu[team_col].astype(str)
+    out["batter_id"] = pd.to_numeric(lu[bid_col], errors="coerce").astype("Int64") if bid_col else pd.Series(pd.NA, index=lu.index, dtype="Int64")
+    out["player_name"] = lu[name_col].astype(str) if name_col else out["batter_id"].astype(str)
+    out["lineup_slot"] = pd.to_numeric(lu[slot_col], errors="coerce") if slot_col else np.nan
+    out["lineup_status"] = lu[status_col].astype(str).str.lower() if status_col else default_status
+    out["lineup_source"] = source_label
+
+    if out["game_pk"].isna().any():
+        team_map = team_games[["game_pk", "batter_team"]].drop_duplicates()
+        missing = out["game_pk"].isna()
+        if missing.any():
+            fill_vals = out.loc[missing, ["batter_team"]].merge(team_map, on="batter_team", how="left")["game_pk"]
+            out.loc[missing, "game_pk"] = pd.to_numeric(fill_vals, errors="coerce").astype("Int64").values
+
+    out = out.dropna(subset=["game_pk", "batter_team", "player_name"]).copy()
+    out = out.drop_duplicates(subset=["game_pk", "batter_team", "player_name"], keep="last")
+    return out
+
+
+def _build_fallback_lineups(
+    batter: pd.DataFrame,
+    slate_date: pd.Timestamp,
+    season: int,
+    team_games: pd.DataFrame,
+) -> pd.DataFrame:
+    if batter.empty:
+        return pd.DataFrame(columns=["game_pk", "batter_team", "batter_id", "player_name", "lineup_slot", "lineup_status", "lineup_source"])
+
+    b = batter.copy()
+    b["game_date"] = pd.to_datetime(b.get("game_date"), errors="coerce")
+    b = b[b["game_date"] < slate_date].copy()
+    if b.empty:
+        return pd.DataFrame(columns=["game_pk", "batter_team", "batter_id", "player_name", "lineup_slot", "lineup_status", "lineup_source"])
+
+    team_col = _pick(list(b.columns), ["batter_team", "team", "team_abbrev", "team_name", "batting_team"])
+    bid_col = _pick(list(b.columns), ["batter_id", "batter", "player_id"])
+    name_col = _pick(list(b.columns), ["player_name", "batter_name", "name"])
+    score_col = _pick(list(b.columns), ["bat_pa_per_game_roll15", "bat_ab_per_game_roll15", "pa", "ab"])
+    season_col = pd.to_numeric(b.get("season"), errors="coerce") if "season" in b.columns else b["game_date"].dt.year
+    b["_season"] = season_col
+    b = b[pd.to_numeric(b["_season"], errors="coerce") <= season].copy()
+    if team_col is None or bid_col is None:
+        return pd.DataFrame(columns=["game_pk", "batter_team", "batter_id", "player_name", "lineup_slot", "lineup_status", "lineup_source"])
+
+    b["batter_team"] = b[team_col].astype(str)
+    b["batter_id"] = pd.to_numeric(b[bid_col], errors="coerce").astype("Int64")
+    b["player_name"] = b[name_col].astype(str) if name_col else b["batter_id"].astype(str)
+    b["_score"] = pd.to_numeric(b[score_col], errors="coerce") if score_col else np.nan
+    b = b.sort_values(["game_date"]).groupby(["batter_team", "batter_id"], as_index=False).tail(1)
+    b = b.sort_values(["batter_team", "_score", "player_name"], ascending=[True, False, True], kind="mergesort")
+    b["lineup_slot"] = b.groupby("batter_team").cumcount() + 1
+    b = b[b["lineup_slot"] <= 9].copy()
+    b = b.merge(team_games[["game_pk", "batter_team"]].drop_duplicates(), on="batter_team", how="inner")
+    b["lineup_status"] = "fallback"
+    b["lineup_source"] = "heuristic_recent_usage"
+    return b[["game_pk", "batter_team", "batter_id", "player_name", "lineup_slot", "lineup_status", "lineup_source"]]
+
+
 def main() -> None:
     args = parse_args()
     slate_date = pd.to_datetime(args.date, errors="raise")
@@ -81,7 +161,10 @@ def main() -> None:
         )
     bat_path = dirs["processed_dir"] / "batter_game_rolling.parquet"
     pit_path = dirs["processed_dir"] / "pitcher_game_rolling.parquet"
-    lineup_path = dirs["processed_dir"] / "live" / f"lineups_{args.season}_{args.date}.parquet"
+    live_dir = dirs["processed_dir"] / "live"
+    lineup_path = live_dir / f"lineups_{args.season}_{args.date}.parquet"
+    confirmed_lineup_path = live_dir / f"confirmed_lineups_{args.season}_{args.date}.parquet"
+    projected_lineup_path = live_dir / f"projected_lineups_{args.season}_{args.date}.parquet"
 
     spine = pd.read_parquet(spine_path).copy()
     batter = pd.read_parquet(bat_path).copy()
@@ -93,19 +176,14 @@ def main() -> None:
     weather_live_raw_path = dirs["raw_dir"] / "live" / f"weather_game_{args.season}_{args.date}.parquet"
     weather_fallback_path = dirs["processed_dir"] / "weather_game.parquet"
 
-    if not lineup_path.exists():
-        raise FileNotFoundError(
-            "Missing live lineup file. Build lineups first with scripts/live/build_live_lineups.py"
-        )
-    lu = pd.read_parquet(lineup_path).copy()
-    if len(lu) == 0:
-        raise ValueError(
-            "Live lineup file is empty. Build lineups first with scripts/live/build_live_lineups.py"
-        )
-
     game_cols = [c for c in ["game_pk", "away_team", "home_team", "home_sp_id", "away_sp_id", "temperature", "wind_speed", "park_factor_hits_blend", "park_factor_hits_hist", "venue_id", "canonical_park_key", "park_id"] if c in spine.columns]
     g = spine[game_cols].copy()
     g["game_pk"] = pd.to_numeric(g.get("game_pk"), errors="coerce").astype("Int64")
+    home_games = g.rename(columns={"home_team": "batter_team", "away_team": "opponent_team", "away_sp_id": "opp_pitcher_id"})
+    home_games["home_away"] = 1.0
+    away_games = g.rename(columns={"away_team": "batter_team", "home_team": "opponent_team", "home_sp_id": "opp_pitcher_id"})
+    away_games["home_away"] = 0.0
+    team_games = pd.concat([home_games, away_games], ignore_index=True, sort=False)
 
     weather_source_path: Path | None = None
     weather_source_kind = "none"
@@ -179,23 +257,64 @@ def main() -> None:
     else:
         logging.warning("hit_prop live optional dynamic parks table missing: %s", parks_dyn_path)
 
-    team_col = _pick(list(lu.columns), ["batter_team", "team", "team_abbrev", "team_name"])
-    bid_col = _pick(list(lu.columns), ["batter_id", "batter", "player_id"])
-    name_col = _pick(list(lu.columns), ["player_name", "batter_name", "name"])
-    slot_col = _pick(list(lu.columns), ["lineup_slot", "bat_order", "batting_order", "lineup_position", "order"])
+    confirmed = pd.DataFrame()
+    if confirmed_lineup_path.exists():
+        confirmed = _normalize_live_lineups(
+            pd.read_parquet(confirmed_lineup_path).copy(),
+            team_games=team_games,
+            source_label="confirmed_lineups",
+            default_status="confirmed",
+        )
 
-    lu["batter_team"] = lu[team_col]
-    lu["batter_id"] = pd.to_numeric(lu[bid_col], errors="coerce").astype("Int64")
-    lu["player_name"] = lu[name_col] if name_col else lu["batter_id"].astype(str)
-    lu["lineup_slot"] = pd.to_numeric(lu[slot_col], errors="coerce") if slot_col else np.nan
+    projected = pd.DataFrame()
+    if projected_lineup_path.exists():
+        projected = _normalize_live_lineups(
+            pd.read_parquet(projected_lineup_path).copy(),
+            team_games=team_games,
+            source_label="projected_lineups",
+            default_status="projected",
+        )
 
-    # attach games via team membership
-    home = g.rename(columns={"home_team": "batter_team", "away_team": "opponent_team", "away_sp_id": "opp_pitcher_id"})
-    home["home_away"] = 1.0
-    away = g.rename(columns={"away_team": "batter_team", "home_team": "opponent_team", "home_sp_id": "opp_pitcher_id"})
-    away["home_away"] = 0.0
-    team_games = pd.concat([home, away], ignore_index=True, sort=False)
-    board = lu.merge(team_games, on="batter_team", how="inner")
+    if confirmed.empty and projected.empty and lineup_path.exists():
+        projected = _normalize_live_lineups(
+            pd.read_parquet(lineup_path).copy(),
+            team_games=team_games,
+            source_label="lineups_compat",
+            default_status="projected",
+        )
+
+    confirmed_games = set(pd.to_numeric(confirmed.get("game_pk"), errors="coerce").dropna().astype(int).tolist()) if not confirmed.empty else set()
+    projected_use = projected[~pd.to_numeric(projected.get("game_pk"), errors="coerce").astype("Int64").isin(list(confirmed_games))].copy() if not projected.empty else pd.DataFrame()
+    selected = pd.concat([confirmed, projected_use], ignore_index=True, sort=False)
+
+    selected_games = set(pd.to_numeric(selected.get("game_pk"), errors="coerce").dropna().astype(int).tolist()) if not selected.empty else set()
+    slate_games = set(pd.to_numeric(g.get("game_pk"), errors="coerce").dropna().astype(int).tolist())
+    missing_games = sorted(slate_games - selected_games)
+    fallback = pd.DataFrame()
+    if missing_games:
+        fallback_all = _build_fallback_lineups(batter=batter, slate_date=slate_date, season=args.season, team_games=team_games)
+        if not fallback_all.empty:
+            fallback = fallback_all[pd.to_numeric(fallback_all["game_pk"], errors="coerce").astype("Int64").isin(missing_games)].copy()
+            selected = pd.concat([selected, fallback], ignore_index=True, sort=False)
+
+    if selected.empty:
+        raise ValueError(
+            "No lineup candidates were available from confirmed, projected, compatibility, or fallback sources."
+        )
+
+    logging.info(
+        "hit_prop live lineup_source_summary confirmed_rows=%s confirmed_games=%s projected_rows=%s projected_games_used=%s fallback_rows=%s fallback_games=%s total_rows=%s total_games=%s",
+        len(confirmed),
+        len(confirmed_games),
+        len(projected),
+        int(projected_use["game_pk"].nunique()) if not projected_use.empty else 0,
+        len(fallback),
+        int(fallback["game_pk"].nunique()) if not fallback.empty else 0,
+        len(selected),
+        int(selected["game_pk"].nunique()) if not selected.empty else 0,
+    )
+
+    board = selected.merge(team_games, on=["game_pk", "batter_team"], how="inner")
     if "park_factor_hits_blend" in board.columns:
         board["park_factor_hits_blend"] = pd.to_numeric(board["park_factor_hits_blend"], errors="coerce")
     if "park_factor_hits_hist" in board.columns:
