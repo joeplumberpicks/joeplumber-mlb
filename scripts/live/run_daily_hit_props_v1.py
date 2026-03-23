@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.reference.build_weather_game import normalize_weather_frame
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
 from src.utils.logging import configure_logging, log_header
@@ -88,7 +89,9 @@ def main() -> None:
 
     parks_path = dirs["reference_dir"] / "parks.parquet"
     parks_dyn_path = dirs["reference_dir"] / "parks_dynamic_2026.parquet"
-    weather_path = dirs["processed_dir"] / "weather_game.parquet"
+    weather_live_processed_path = dirs["processed_dir"] / "live" / f"weather_game_{args.season}_{args.date}.parquet"
+    weather_live_raw_path = dirs["raw_dir"] / "live" / f"weather_game_{args.season}_{args.date}.parquet"
+    weather_fallback_path = dirs["processed_dir"] / "weather_game.parquet"
 
     if not lineup_path.exists():
         raise FileNotFoundError(
@@ -104,33 +107,43 @@ def main() -> None:
     g = spine[game_cols].copy()
     g["game_pk"] = pd.to_numeric(g.get("game_pk"), errors="coerce").astype("Int64")
 
-    if weather_path.exists():
+    weather_source_path: Path | None = None
+    weather_source_kind = "none"
+    wg = pd.DataFrame()
+    if weather_live_processed_path.exists():
+        weather_source_path = weather_live_processed_path
+        weather_source_kind = "processed_live"
+    elif weather_live_raw_path.exists():
+        weather_source_path = weather_live_raw_path
+        weather_source_kind = "raw_live"
+    elif weather_fallback_path.exists():
+        weather_source_path = weather_fallback_path
+        weather_source_kind = "processed_fallback"
+
+    if weather_source_path is not None:
         try:
-            wg = pd.read_parquet(weather_path).copy()
+            wg = pd.read_parquet(weather_source_path).copy()
+            if weather_source_kind == "raw_live":
+                wg = normalize_weather_frame(wg, fallback_season=args.season)
+            logging.info("hit_prop live weather_source kind=%s path=%s rows=%s", weather_source_kind, weather_source_path, len(wg))
             if "game_pk" in wg.columns:
                 wg["game_pk"] = pd.to_numeric(wg["game_pk"], errors="coerce").astype("Int64")
-                tcol = _pick(list(wg.columns), ["temperature", "temp_f", "game_temp", "weather_temp"])
-                wcol = _pick(list(wg.columns), ["wind_speed", "weather_wind", "wind_mph", "wind"])
-                wout_col = _pick(list(wg.columns), ["weather_wind_out"])
-                win_col = _pick(list(wg.columns), ["weather_wind_in"])
-                keep = ["game_pk"] + ([tcol] if tcol else []) + ([wcol] if wcol else []) + ([wout_col] if wout_col else []) + ([win_col] if win_col else [])
-                g = g.merge(wg[keep].drop_duplicates(subset=["game_pk"], keep="last"), on="game_pk", how="left", suffixes=("", "_wg"))
-                if tcol:
-                    g["temperature"] = pd.to_numeric(g.get("temperature"), errors="coerce").fillna(pd.to_numeric(g.get(f"{tcol}_wg"), errors="coerce"))
-                    g = g.drop(columns=[f"{tcol}_wg"], errors="ignore")
-                if wcol:
-                    g["wind_speed"] = pd.to_numeric(g.get("wind_speed"), errors="coerce").fillna(pd.to_numeric(g.get(f"{wcol}_wg"), errors="coerce"))
-                    g = g.drop(columns=[f"{wcol}_wg"], errors="ignore")
-                if wout_col:
-                    g["weather_wind_out"] = pd.to_numeric(g.get("weather_wind_out"), errors="coerce").fillna(pd.to_numeric(g.get(f"{wout_col}_wg"), errors="coerce"))
-                    g = g.drop(columns=[f"{wout_col}_wg"], errors="ignore")
-                if win_col:
-                    g["weather_wind_in"] = pd.to_numeric(g.get("weather_wind_in"), errors="coerce").fillna(pd.to_numeric(g.get(f"{win_col}_wg"), errors="coerce"))
-                    g = g.drop(columns=[f"{win_col}_wg"], errors="ignore")
+                keep = [c for c in ["game_pk", "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"] if c in wg.columns]
+                if len(keep) > 1:
+                    g = g.merge(wg[keep].drop_duplicates(subset=["game_pk"], keep="last"), on="game_pk", how="left", suffixes=("", "_wg"))
+                    for c in ["temperature", "wind_speed", "weather_wind_out", "weather_wind_in"]:
+                        if f"{c}_wg" in g.columns:
+                            g[c] = pd.to_numeric(g.get(c), errors="coerce").fillna(pd.to_numeric(g.get(f"{c}_wg"), errors="coerce"))
+                            g = g.drop(columns=[f"{c}_wg"], errors="ignore")
         except Exception:
             logging.exception("hit_prop live optional weather join failed; continuing")
     else:
-        logging.warning("hit_prop live optional weather table missing: %s", weather_path)
+        logging.warning(
+            "hit_prop live optional weather table missing checked processed_live=%s raw_live=%s fallback=%s",
+            weather_live_processed_path,
+            weather_live_raw_path,
+            weather_fallback_path,
+        )
 
     if parks_path.exists():
         try:
