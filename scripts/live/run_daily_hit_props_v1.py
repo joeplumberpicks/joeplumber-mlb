@@ -22,6 +22,78 @@ from src.utils.logging import configure_logging, log_header
 GRADE_THRESHOLDS = [("A+", 0.70), ("A", 0.67), ("A-", 0.64), ("B+", 0.61), ("B", 0.58), ("B-", 0.55), ("C+", 0.52)]
 LINEUP_PA_MAP = {1: 4.65, 2: 4.55, 3: 4.45, 4: 4.35, 5: 4.25, 6: 4.10, 7: 3.95, 8: 3.80, 9: 3.70}
 LINEUP_JUNK_TOKENS = ["watch", "tickets", "alerts", "lineup has not been posted", "era"]
+TEAM_TO_CANONICAL = {
+    "ARI": "ARIZONA DIAMONDBACKS",
+    "ARIZONA DIAMONDBACKS": "ARIZONA DIAMONDBACKS",
+    "ATL": "ATLANTA BRAVES",
+    "ATLANTA BRAVES": "ATLANTA BRAVES",
+    "BAL": "BALTIMORE ORIOLES",
+    "BALTIMORE ORIOLES": "BALTIMORE ORIOLES",
+    "BOS": "BOSTON RED SOX",
+    "BOSTON RED SOX": "BOSTON RED SOX",
+    "CHC": "CHICAGO CUBS",
+    "CHICAGO CUBS": "CHICAGO CUBS",
+    "CWS": "CHICAGO WHITE SOX",
+    "CHW": "CHICAGO WHITE SOX",
+    "CHICAGO WHITE SOX": "CHICAGO WHITE SOX",
+    "CIN": "CINCINNATI REDS",
+    "CINCINNATI REDS": "CINCINNATI REDS",
+    "CLE": "CLEVELAND GUARDIANS",
+    "CLEVELAND GUARDIANS": "CLEVELAND GUARDIANS",
+    "COL": "COLORADO ROCKIES",
+    "COLORADO ROCKIES": "COLORADO ROCKIES",
+    "DET": "DETROIT TIGERS",
+    "DETROIT TIGERS": "DETROIT TIGERS",
+    "HOU": "HOUSTON ASTROS",
+    "HOUSTON ASTROS": "HOUSTON ASTROS",
+    "KC": "KANSAS CITY ROYALS",
+    "KCR": "KANSAS CITY ROYALS",
+    "KANSAS CITY ROYALS": "KANSAS CITY ROYALS",
+    "LAA": "LOS ANGELES ANGELS",
+    "ANA": "LOS ANGELES ANGELS",
+    "LOS ANGELES ANGELS": "LOS ANGELES ANGELS",
+    "LAD": "LOS ANGELES DODGERS",
+    "LOS ANGELES DODGERS": "LOS ANGELES DODGERS",
+    "MIA": "MIAMI MARLINS",
+    "FLA": "MIAMI MARLINS",
+    "MIAMI MARLINS": "MIAMI MARLINS",
+    "MIL": "MILWAUKEE BREWERS",
+    "MILWAUKEE BREWERS": "MILWAUKEE BREWERS",
+    "MIN": "MINNESOTA TWINS",
+    "MINNESOTA TWINS": "MINNESOTA TWINS",
+    "NYM": "NEW YORK METS",
+    "NEW YORK METS": "NEW YORK METS",
+    "NYY": "NEW YORK YANKEES",
+    "NEW YORK YANKEES": "NEW YORK YANKEES",
+    "ATH": "OAKLAND ATHLETICS",
+    "OAKLAND ATHLETICS": "OAKLAND ATHLETICS",
+    "PHI": "PHILADELPHIA PHILLIES",
+    "PHILADELPHIA PHILLIES": "PHILADELPHIA PHILLIES",
+    "PIT": "PITTSBURGH PIRATES",
+    "PITTSBURGH PIRATES": "PITTSBURGH PIRATES",
+    "SD": "SAN DIEGO PADRES",
+    "SDP": "SAN DIEGO PADRES",
+    "SAN DIEGO PADRES": "SAN DIEGO PADRES",
+    "SF": "SAN FRANCISCO GIANTS",
+    "SFG": "SAN FRANCISCO GIANTS",
+    "SAN FRANCISCO GIANTS": "SAN FRANCISCO GIANTS",
+    "SEA": "SEATTLE MARINERS",
+    "SEATTLE MARINERS": "SEATTLE MARINERS",
+    "STL": "ST. LOUIS CARDINALS",
+    "SLN": "ST. LOUIS CARDINALS",
+    "ST. LOUIS CARDINALS": "ST. LOUIS CARDINALS",
+    "ST LOUIS CARDINALS": "ST. LOUIS CARDINALS",
+    "TB": "TAMPA BAY RAYS",
+    "TBR": "TAMPA BAY RAYS",
+    "TAMPA BAY RAYS": "TAMPA BAY RAYS",
+    "TEX": "TEXAS RANGERS",
+    "TEXAS RANGERS": "TEXAS RANGERS",
+    "TOR": "TORONTO BLUE JAYS",
+    "TORONTO BLUE JAYS": "TORONTO BLUE JAYS",
+    "WSH": "WASHINGTON NATIONALS",
+    "WSN": "WASHINGTON NATIONALS",
+    "WASHINGTON NATIONALS": "WASHINGTON NATIONALS",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,6 +147,13 @@ def _is_junk_name(name: str) -> bool:
     if " pm " in f" {s} " or " am " in f" {s} " or " et" in f" {s} ":
         return True
     return False
+
+
+def _normalize_team_canonical(team_val: object) -> str | None:
+    tok = str(team_val or "").strip().upper()
+    if not tok:
+        return None
+    return TEAM_TO_CANONICAL.get(tok)
 
 
 def _validate_lineup_rows(df: pd.DataFrame, label: str) -> pd.DataFrame:
@@ -166,7 +245,8 @@ def _build_fallback_lineups(
     if chosen_season is not None:
         b = b[pd.to_numeric(b["_season"], errors="coerce") == chosen_season].copy()
 
-    b["batter_team"] = b[team_col].astype(str).str.upper()
+    b["batter_team"] = b[team_col].astype(str).str.upper().str.strip()
+    b["batter_team_canonical"] = b["batter_team"].map(_normalize_team_canonical)
     b["batter_id"] = pd.to_numeric(b[bid_col], errors="coerce").astype("Int64")
     b["player_name"] = b[name_col].astype(str) if name_col else b["batter_id"].astype(str)
     b["_pa"] = pd.to_numeric(b[pa_col], errors="coerce") if pa_col else np.nan
@@ -176,16 +256,37 @@ def _build_fallback_lineups(
     b = b.groupby(["batter_team", "batter_id"], as_index=False).head(1)
 
     slate_team_map = team_games[["game_pk", "batter_team"]].drop_duplicates().copy()
-    slate_team_map["batter_team"] = slate_team_map["batter_team"].astype(str).str.upper()
-    slate_teams = sorted(set(slate_team_map["batter_team"].astype(str).tolist()))
+    slate_team_map["batter_team"] = slate_team_map["batter_team"].astype(str).str.upper().str.strip()
+    slate_team_map["batter_team_canonical"] = slate_team_map["batter_team"].map(_normalize_team_canonical)
+    if "opponent_team" in team_games.columns:
+        slate_teams_long = (
+            team_games[["batter_team", "opponent_team"]]
+            .melt(value_name="slate_team_raw")
+            .drop(columns=["variable"], errors="ignore")
+        )
+    else:
+        slate_teams_long = team_games[["batter_team"]].rename(columns={"batter_team": "slate_team_raw"})
+    slate_teams_long["slate_team_canonical"] = slate_teams_long["slate_team_raw"].astype(str).str.upper().str.strip().map(_normalize_team_canonical)
+    slate_team_canonical = sorted(slate_teams_long["slate_team_canonical"].dropna().unique().tolist())
     logging.info(
-        "fallback diagnostics batter_history_rows=%s unique_batter_teams=%s slate_teams=%s",
+        "fallback diagnostics batter_history_rows=%s batter_team_raw_unique=%s batter_team_canonical_unique=%s slate_team_canonical=%s",
         len(b),
-        int(b["batter_team"].nunique()) if len(b) else 0,
-        slate_teams,
+        sorted(b["batter_team"].dropna().astype(str).unique().tolist()),
+        sorted(b["batter_team_canonical"].dropna().astype(str).unique().tolist()),
+        slate_team_canonical,
     )
-    b = b[b["batter_team"].isin(slate_teams)].copy()
+    b = b[b["batter_team_canonical"].isin(slate_team_canonical)].copy()
     logging.info("fallback diagnostics rows_after_slate_team_filter=%s", len(b))
+    if b.empty:
+        batter_raw_teams = sorted(batter[team_col].astype(str).str.upper().str.strip().dropna().unique().tolist())
+        batter_canonical = sorted(pd.Series(batter_raw_teams).map(_normalize_team_canonical).dropna().unique().tolist())
+        mapping_failures = sorted(pd.Series(batter_raw_teams)[pd.Series(batter_raw_teams).map(_normalize_team_canonical).isna()].unique().tolist())
+        raise ValueError(
+            "Fallback lineup canonical team match produced zero rows. "
+            f"raw_batter_teams={batter_raw_teams} canonical_batter_teams={batter_canonical} "
+            f"slate_team_canonical={slate_team_canonical} mapping_failures={mapping_failures}"
+        )
+    b["batter_team"] = b["batter_team_canonical"]
     b = b.sort_values(["batter_team", "game_date", "_pa", "_old_slot"], ascending=[True, False, False, True], kind="mergesort")
     b["lineup_slot"] = b.groupby("batter_team").cumcount() + 1
     b = b[b["lineup_slot"] <= 9].copy()
@@ -204,7 +305,8 @@ def _build_fallback_lineups(
         game_col = "game_pk"
 
     if "game_pk" in team_games.columns and not team_games.empty:
-        mapped = b.merge(slate_team_map, on="batter_team", how="left", suffixes=("", "_mapped"))
+        canonical_game_map = slate_team_map[["game_pk", "batter_team_canonical"]].drop_duplicates().rename(columns={"game_pk": "game_pk_mapped"})
+        mapped = b.merge(canonical_game_map, on="batter_team_canonical", how="left")
         mapped["game_pk"] = mapped["game_pk_mapped"].where(mapped["game_pk_mapped"].notna(), mapped[game_col] if game_col in mapped.columns else pd.NA)
         b = mapped.drop(columns=["game_pk_mapped"], errors="ignore")
         game_col = "game_pk"
