@@ -23,6 +23,7 @@ SOURCE_NAME = "rotowire"
 SOURCE_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
 SOURCE_URL_FALLBACK = "https://www.rotowire.com/baseball/daily-lineups.php?date=tomorrow"
 POS_SET = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH"}
+UI_BLOCKLIST = {"watch now", "tickets", "alerts"}
 TEAM_NAME_TO_ABBR = {
     "angels": "LAA",
     "astros": "HOU",
@@ -321,6 +322,82 @@ def _parse_rotowire_cards(soup: BeautifulSoup, aliases: dict[str, str]) -> pd.Da
     return pd.DataFrame(rows)
 
 
+def _parse_hitter_row_text(raw_text: str) -> tuple[str, str, str | None] | None:
+    t = str(raw_text).strip()
+    if not t:
+        return None
+    if any(x in t.lower() for x in UI_BLOCKLIST):
+        return None
+    if re.search(r"\(\d{1,3}-\d{1,3}\)", t):
+        return None
+    if re.search(r"\b\d{1,2}:\d{2}\s*(AM|PM)\s*ET\b", t, flags=re.IGNORECASE):
+        return None
+    m = re.match(r"^(C|1B|2B|3B|SS|LF|CF|RF|DH)\s+(.+?)(?:\s+([LRS]))?$", t)
+    if not m:
+        return None
+    pos = m.group(1)
+    name = (m.group(2) or "").strip()
+    bats = (m.group(3) or "").strip().upper() or None
+    if not name:
+        return None
+    if any(x in name.lower() for x in UI_BLOCKLIST):
+        return None
+    if re.fullmatch(r"[A-Z]{2,4}", name):
+        return None
+    return pos, name, bats
+
+
+def _filter_valid_hitter_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    raw_counts = df.groupby("batter_team").size().to_dict()
+    parsed_rows: list[dict[str, object]] = []
+    rejected: list[str] = []
+    for _, row in df.iterrows():
+        team = str(row.get("batter_team", "")).strip().upper()
+        pos = str(row.get("position", "")).strip().upper()
+        name = str(row.get("player_name", "")).strip()
+        bats_existing = str(row.get("bats", "")).strip().upper()
+        text = f"{pos} {name}".strip() if pos in POS_SET else name
+        parsed = _parse_hitter_row_text(text)
+        if parsed is None:
+            rejected.append(text)
+            continue
+        p_pos, p_name, p_bats = parsed
+        parsed_rows.append(
+            {
+                "batter_team": team,
+                "position": p_pos,
+                "player_name": p_name,
+                "bats": p_bats or (bats_existing if bats_existing in {"L", "R", "S"} else None),
+            }
+        )
+    clean = pd.DataFrame(parsed_rows)
+    if clean.empty:
+        logging.info("rotowire hitter row diagnostics raw_rows_by_team=%s filtered_rows_by_team=%s rejected_sample=%s", raw_counts, {}, rejected[:10])
+        raise ValueError("Parsed rows exist but no valid hitter rows detected — parser likely misaligned with HTML structure")
+
+    clean = clean.dropna(subset=["batter_team", "player_name", "position"]).copy()
+    clean = clean[clean["position"].isin(POS_SET)].copy()
+    clean["lineup_slot"] = clean.groupby("batter_team").cumcount() + 1
+    clean = clean[clean["lineup_slot"] <= 9].copy()
+    filtered_counts = clean.groupby("batter_team").size().to_dict()
+    bad_teams = [t for t, n in filtered_counts.items() if n < 5]
+    for t in bad_teams:
+        logging.warning("dropping team due to low valid hitter rows team=%s rows=%s", t, filtered_counts.get(t))
+    if bad_teams:
+        clean = clean[~clean["batter_team"].isin(bad_teams)].copy()
+        filtered_counts = clean.groupby("batter_team").size().to_dict() if len(clean) else {}
+
+    logging.info(
+        "rotowire hitter row diagnostics raw_rows_by_team=%s filtered_rows_by_team=%s rejected_sample=%s",
+        raw_counts,
+        filtered_counts,
+        rejected[:10],
+    )
+    return clean
+
+
 def _scrape_rotowire_projected(url: str, aliases: dict[str, str]) -> tuple[pd.DataFrame, str, dict[str, object]]:
     html, fetch_diag = _fetch_rotowire_html(url)
     soup = BeautifulSoup(html, "html.parser")
@@ -416,9 +493,9 @@ def _scrape_rotowire_projected(url: str, aliases: dict[str, str]) -> tuple[pd.Da
     out = _parse_rotowire_cards(soup, aliases)
     if out.empty:
         out = pd.DataFrame(rows)
+    out = _filter_valid_hitter_rows(out)
     out = out.dropna(subset=["batter_team", "player_name"]).copy()
     out["batter_team"] = out["batter_team"].astype(str).str.upper()
-    out = out[out.groupby("batter_team").cumcount() < 9].copy()
     parsed_teams = sorted(out["batter_team"].dropna().astype(str).unique().tolist()) if len(out) else []
     logging.info(
         "rotowire parser diagnostics game_container_count=%s team_container_count=%s parsed_row_count=%s parsed_team_count=%s lineup_rows_by_team=%s lineup_rows_by_game=%s",
@@ -541,6 +618,11 @@ def main() -> None:
             "source_timestamp",
         ]
     ].drop_duplicates(subset=["game_pk", "batter_team", "player_name"], keep="first")
+
+    out = out.dropna(subset=["player_name"]).copy()
+    out = out[out["position"].isin(POS_SET)].copy()
+    ui_mask = out["player_name"].str.lower().str.contains("|".join(UI_BLOCKLIST), regex=True, na=False)
+    out = out[~ui_mask].copy()
     logging.info(
         "projected_lineups prewrite total_rows=%s unique_games=%s unique_teams=%s sample_rows=%s",
         len(out),
