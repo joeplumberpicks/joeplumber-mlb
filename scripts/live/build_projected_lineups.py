@@ -142,27 +142,84 @@ def _extract_team_abbr(team_token: str, aliases: dict[str, str]) -> str | None:
     return None
 
 
-def _scrape_rotowire_projected(date_str: str, aliases: dict[str, str]) -> pd.DataFrame:
+def _fetch_rotowire_html(date_str: str, html_snapshot_path: Path) -> tuple[str, dict[str, object]]:
     resp = requests.get(SOURCE_URL, params={"date": date_str, "site": "Yahoo"}, timeout=30)
     resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    html = resp.text
+    html_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    html_snapshot_path.write_text(html, encoding="utf-8")
+
+    content_len = len(html)
+    checks = {
+        "Expected Lineup": "Expected Lineup" in html,
+        "Starting Pitcher Intel": "Starting Pitcher Intel" in html,
+        "NYY": "NYY" in html,
+        "SF": "SF" in html,
+        "Aaron Judge": "Aaron Judge" in html,
+    }
+    logging.info(
+        "rotowire fetch status=%s final_url=%s content_length=%s key_checks=%s",
+        resp.status_code,
+        resp.url,
+        content_len,
+        checks,
+    )
+    if content_len < 50_000:
+        logging.warning("rotowire fetch content appears short content_length=%s", content_len)
+    return html, {
+        "status_code": resp.status_code,
+        "final_url": resp.url,
+        "content_length": content_len,
+        "contains_expected_lineup": checks["Expected Lineup"],
+        "contains_starting_pitcher_intel": checks["Starting Pitcher Intel"],
+        "contains_nyy": checks["NYY"],
+        "contains_sf": checks["SF"],
+        "contains_aaron_judge": checks["Aaron Judge"],
+    }
+
+
+def _scrape_rotowire_projected(date_str: str, aliases: dict[str, str], html_snapshot_path: Path) -> tuple[pd.DataFrame, dict[str, object]]:
+    html, fetch_diag = _fetch_rotowire_html(date_str, html_snapshot_path=html_snapshot_path)
+    soup = BeautifulSoup(html, "html.parser")
     lines = [s.strip() for s in soup.stripped_strings if s and s.strip()]
+    visible_text = "\n".join(lines)
+
+    game_container_selectors = [
+        "div.lineup.is-mlb",
+        "div.lineup",
+        "div[class*='lineup__box']",
+        "div[class*='lineup-card']",
+        "section[class*='lineup']",
+    ]
+    team_container_selectors = [
+        "div.lineup__team",
+        "div[class*='lineup__team']",
+        "div[class*='team']",
+        "span[class*='team']",
+    ]
+    game_container_count = len({id(node) for sel in game_container_selectors for node in soup.select(sel)})
+    team_container_count = len({id(node) for sel in team_container_selectors for node in soup.select(sel)})
 
     rows: list[dict[str, object]] = []
     current_team: str | None = None
     pending_pos: str | None = None
     current_slot = 0
+    current_game = -1
 
     matchup_pat = re.compile(r"^[A-Za-z .'-]+ \(\d+-\d+\)\s+[A-Za-z .'-]+ \(\d+-\d+\)$")
     hand_pat = re.compile(r"^[RLS]$")
+    status_pat = {"Unknown Lineup", "Expected Lineup", "Confirmed Lineup"}
+    team_lineup_row_counts: dict[str, int] = {}
+    game_lineup_row_counts: dict[int, int] = {}
 
     for idx, line in enumerate(lines):
         if matchup_pat.match(line):
+            current_game += 1
             current_team = None
             pending_pos = None
             current_slot = 0
             continue
-        if line in {"Unknown Lineup", "Expected Lineup", "Confirmed Lineup"}:
+        if line in status_pat:
             # team abbreviation usually appears in the few prior tokens
             for back in range(1, 8):
                 j = idx - back
@@ -208,15 +265,38 @@ def _scrape_rotowire_projected(date_str: str, aliases: dict[str, str]) -> pd.Dat
                 "position": pending_pos,
             }
         )
+        team_lineup_row_counts[current_team] = team_lineup_row_counts.get(current_team, 0) + 1
+        if current_game >= 0:
+            game_lineup_row_counts[current_game] = game_lineup_row_counts.get(current_game, 0) + 1
         pending_pos = None
 
     out = pd.DataFrame(rows)
-    if out.empty:
-        raise ValueError("No projected lineup hitters parsed from source page.")
     out = out.dropna(subset=["batter_team", "player_name"]).copy()
     out["batter_team"] = out["batter_team"].astype(str).str.upper()
     out = out[out.groupby("batter_team").cumcount() < 9].copy()
-    return out
+    parsed_teams = sorted(out["batter_team"].dropna().astype(str).unique().tolist()) if len(out) else []
+    logging.info(
+        "rotowire parser diagnostics game_container_count=%s team_container_count=%s parsed_row_count=%s parsed_team_count=%s lineup_rows_by_team=%s lineup_rows_by_game=%s",
+        game_container_count,
+        team_container_count,
+        len(out),
+        len(parsed_teams),
+        team_lineup_row_counts,
+        game_lineup_row_counts,
+    )
+    logging.info("rotowire parser parsed_teams=%s", parsed_teams)
+
+    diag = {
+        **fetch_diag,
+        "game_container_count": game_container_count,
+        "team_container_count": team_container_count,
+        "lineup_rows_by_team": team_lineup_row_counts,
+        "lineup_rows_by_game": game_lineup_row_counts,
+        "parsed_teams": parsed_teams,
+        "visible_contains_expected_lineup": "Expected Lineup" in visible_text,
+        "visible_contains_starting_pitcher_intel": "Starting Pitcher Intel" in visible_text,
+    }
+    return out, diag
 
 
 def main() -> None:
@@ -247,7 +327,17 @@ def main() -> None:
     team_games["batter_team"] = team_games["batter_team"].astype(str).str.upper()
     aliases = _team_aliases(spine)
 
-    raw = _scrape_rotowire_projected(args.date, aliases)
+    html_snapshot_path = dirs["logs_dir"] / f"projected_lineups_rotowire_{args.season}_{args.date}.html"
+    raw, scrape_diag = _scrape_rotowire_projected(args.date, aliases, html_snapshot_path=html_snapshot_path)
+    logging.info("rotowire html_snapshot=%s", html_snapshot_path)
+    logging.info("rotowire parsed teams before slate filtering=%s", sorted(raw["batter_team"].dropna().astype(str).unique().tolist()) if len(raw) else [])
+
+    scraped_teams = set(raw["batter_team"].dropna().astype(str).str.upper().unique().tolist()) if len(raw) else set()
+    slate_teams = set(team_games["batter_team"].dropna().astype(str).str.upper().unique().tolist()) if len(team_games) else set()
+    unmatched_scraped = sorted(scraped_teams - slate_teams)
+    unmatched_slate = sorted(slate_teams - scraped_teams)
+    logging.info("rotowire team matching unmatched_scraped=%s unmatched_slate=%s", unmatched_scraped, unmatched_slate)
+
     out = raw.merge(team_games[["game_pk", "batter_team"]].drop_duplicates(), on="batter_team", how="inner")
     out["game_date"] = args.date
     out["batter_id"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
@@ -272,6 +362,24 @@ def main() -> None:
             "source_timestamp",
         ]
     ].drop_duplicates(subset=["game_pk", "batter_team", "player_name"], keep="first")
+    logging.info(
+        "projected_lineups prewrite total_rows=%s unique_games=%s unique_teams=%s sample_rows=%s",
+        len(out),
+        int(out["game_pk"].nunique()) if len(out) else 0,
+        int(out["batter_team"].nunique()) if len(out) else 0,
+        out.head(10).to_dict(orient="records"),
+    )
+
+    if out.empty:
+        raise ValueError(
+            "Projected lineup scrape parsed zero rows after filtering. "
+            f"status_code={scrape_diag.get('status_code')} "
+            f"content_length={scrape_diag.get('content_length')} "
+            f"game_container_count={scrape_diag.get('game_container_count')} "
+            f"contains_expected_lineup={scrape_diag.get('contains_expected_lineup')} "
+            f"contains_nyy={scrape_diag.get('contains_nyy')} "
+            f"contains_sf={scrape_diag.get('contains_sf')}"
+        )
 
     out_path = dirs["processed_dir"] / "live" / f"projected_lineups_{args.season}_{args.date}.parquet"
     out_path.parent.mkdir(parents=True, exist_ok=True)
