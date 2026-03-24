@@ -21,6 +21,7 @@ from src.utils.logging import configure_logging, log_header
 
 SOURCE_NAME = "rotowire"
 SOURCE_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
+SOURCE_URL_FALLBACK = "https://www.rotowire.com/baseball/daily-lineups.php?date=tomorrow"
 POS_SET = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH"}
 TEAM_NAME_TO_ABBR = {
     "angels": "LAA",
@@ -53,6 +54,73 @@ TEAM_NAME_TO_ABBR = {
     "twins": "MIN",
     "white sox": "CWS",
     "yankees": "NYY",
+}
+ABBR_TO_CANONICAL = {
+    "ARI": "ARIZONA DIAMONDBACKS",
+    "ATL": "ATLANTA BRAVES",
+    "BAL": "BALTIMORE ORIOLES",
+    "BOS": "BOSTON RED SOX",
+    "CHC": "CHICAGO CUBS",
+    "CWS": "CHICAGO WHITE SOX",
+    "CIN": "CINCINNATI REDS",
+    "CLE": "CLEVELAND GUARDIANS",
+    "COL": "COLORADO ROCKIES",
+    "DET": "DETROIT TIGERS",
+    "HOU": "HOUSTON ASTROS",
+    "KC": "KANSAS CITY ROYALS",
+    "LAA": "LOS ANGELES ANGELS",
+    "LAD": "LOS ANGELES DODGERS",
+    "MIA": "MIAMI MARLINS",
+    "MIL": "MILWAUKEE BREWERS",
+    "MIN": "MINNESOTA TWINS",
+    "NYM": "NEW YORK METS",
+    "NYY": "NEW YORK YANKEES",
+    "ATH": "OAKLAND ATHLETICS",
+    "PHI": "PHILADELPHIA PHILLIES",
+    "PIT": "PITTSBURGH PIRATES",
+    "SD": "SAN DIEGO PADRES",
+    "SF": "SAN FRANCISCO GIANTS",
+    "SFG": "SAN FRANCISCO GIANTS",
+    "SEA": "SEATTLE MARINERS",
+    "STL": "ST. LOUIS CARDINALS",
+    "TB": "TAMPA BAY RAYS",
+    "TBR": "TAMPA BAY RAYS",
+    "TEX": "TEXAS RANGERS",
+    "TOR": "TORONTO BLUE JAYS",
+    "WSH": "WASHINGTON NATIONALS",
+}
+NAME_TO_CANONICAL = {
+    "ARIZONA DIAMONDBACKS": "ARIZONA DIAMONDBACKS",
+    "ATLANTA BRAVES": "ATLANTA BRAVES",
+    "BALTIMORE ORIOLES": "BALTIMORE ORIOLES",
+    "BOSTON RED SOX": "BOSTON RED SOX",
+    "CHICAGO CUBS": "CHICAGO CUBS",
+    "CHICAGO WHITE SOX": "CHICAGO WHITE SOX",
+    "CINCINNATI REDS": "CINCINNATI REDS",
+    "CLEVELAND GUARDIANS": "CLEVELAND GUARDIANS",
+    "COLORADO ROCKIES": "COLORADO ROCKIES",
+    "DETROIT TIGERS": "DETROIT TIGERS",
+    "HOUSTON ASTROS": "HOUSTON ASTROS",
+    "KANSAS CITY ROYALS": "KANSAS CITY ROYALS",
+    "LOS ANGELES ANGELS": "LOS ANGELES ANGELS",
+    "LOS ANGELES DODGERS": "LOS ANGELES DODGERS",
+    "MIAMI MARLINS": "MIAMI MARLINS",
+    "MILWAUKEE BREWERS": "MILWAUKEE BREWERS",
+    "MINNESOTA TWINS": "MINNESOTA TWINS",
+    "NEW YORK METS": "NEW YORK METS",
+    "NEW YORK YANKEES": "NEW YORK YANKEES",
+    "OAKLAND ATHLETICS": "OAKLAND ATHLETICS",
+    "PHILADELPHIA PHILLIES": "PHILADELPHIA PHILLIES",
+    "PITTSBURGH PIRATES": "PITTSBURGH PIRATES",
+    "SAN DIEGO PADRES": "SAN DIEGO PADRES",
+    "SAN FRANCISCO GIANTS": "SAN FRANCISCO GIANTS",
+    "SEATTLE MARINERS": "SEATTLE MARINERS",
+    "ST. LOUIS CARDINALS": "ST. LOUIS CARDINALS",
+    "ST LOUIS CARDINALS": "ST. LOUIS CARDINALS",
+    "TAMPA BAY RAYS": "TAMPA BAY RAYS",
+    "TEXAS RANGERS": "TEXAS RANGERS",
+    "TORONTO BLUE JAYS": "TORONTO BLUE JAYS",
+    "WASHINGTON NATIONALS": "WASHINGTON NATIONALS",
 }
 
 
@@ -142,13 +210,25 @@ def _extract_team_abbr(team_token: str, aliases: dict[str, str]) -> str | None:
     return None
 
 
-def _fetch_rotowire_html(date_str: str, html_snapshot_path: Path) -> tuple[str, dict[str, object]]:
-    resp = requests.get(SOURCE_URL, params={"date": date_str, "site": "Yahoo"}, timeout=30)
+def _to_canonical_team(team_token: str) -> str | None:
+    tok = str(team_token).strip().upper()
+    if not tok:
+        return None
+    if tok in ABBR_TO_CANONICAL:
+        return ABBR_TO_CANONICAL[tok]
+    if tok in NAME_TO_CANONICAL:
+        return NAME_TO_CANONICAL[tok]
+    tok_clean = re.sub(r"[^A-Z ]+", " ", tok)
+    tok_clean = re.sub(r"\s+", " ", tok_clean).strip()
+    if tok_clean in NAME_TO_CANONICAL:
+        return NAME_TO_CANONICAL[tok_clean]
+    return None
+
+
+def _fetch_rotowire_html(url: str) -> tuple[str, dict[str, object]]:
+    resp = requests.get(url, timeout=30)
     resp.raise_for_status()
     html = resp.text
-    html_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-    html_snapshot_path.write_text(html, encoding="utf-8")
-
     content_len = len(html)
     checks = {
         "Expected Lineup": "Expected Lineup" in html,
@@ -158,7 +238,8 @@ def _fetch_rotowire_html(date_str: str, html_snapshot_path: Path) -> tuple[str, 
         "Aaron Judge": "Aaron Judge" in html,
     }
     logging.info(
-        "rotowire fetch status=%s final_url=%s content_length=%s key_checks=%s",
+        "rotowire fetch url=%s status=%s final_url=%s content_length=%s key_checks=%s",
+        url,
         resp.status_code,
         resp.url,
         content_len,
@@ -178,8 +259,70 @@ def _fetch_rotowire_html(date_str: str, html_snapshot_path: Path) -> tuple[str, 
     }
 
 
-def _scrape_rotowire_projected(date_str: str, aliases: dict[str, str], html_snapshot_path: Path) -> tuple[pd.DataFrame, dict[str, object]]:
-    html, fetch_diag = _fetch_rotowire_html(date_str, html_snapshot_path=html_snapshot_path)
+def _parse_team_from_text(text: str, aliases: dict[str, str]) -> str | None:
+    for token in re.split(r"\s+|\||-|/", text):
+        abbr = _extract_team_abbr(token.strip(), aliases)
+        if abbr:
+            return abbr
+    return _extract_team_abbr(text, aliases)
+
+
+def _parse_rotowire_cards(soup: BeautifulSoup, aliases: dict[str, str]) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    card_selectors = [
+        "div.lineup.is-mlb",
+        "div.lineup",
+        "div[class*='lineup__box']",
+        "div[class*='lineup-card']",
+        "section[class*='lineup']",
+    ]
+    cards: list[object] = []
+    for sel in card_selectors:
+        cards.extend(list(soup.select(sel)))
+    seen = set()
+    uniq_cards = []
+    for c in cards:
+        cid = id(c)
+        if cid not in seen:
+            seen.add(cid)
+            uniq_cards.append(c)
+    for card in uniq_cards:
+        card_lines = [t.strip() for t in card.stripped_strings if t and t.strip()]
+        if not card_lines:
+            continue
+        team = _parse_team_from_text(" ".join(card_lines[:12]), aliases)
+        if team is None:
+            continue
+        slot = 0
+        pending_pos: str | None = None
+        for line in card_lines:
+            if line in POS_SET:
+                pending_pos = line
+                continue
+            if re.fullmatch(r"[RLS]", line):
+                continue
+            if line in {"Expected Lineup", "Confirmed Lineup", "Unknown Lineup"}:
+                continue
+            if line.startswith("Starting Pitcher Intel") or line.startswith("Umpire:"):
+                break
+            if slot >= 9:
+                break
+            if re.fullmatch(r"\d{1,2}", line):
+                continue
+            if len(line) <= 1:
+                continue
+            if any(k in line for k in ["LINE", "O/U", " mph "]):
+                continue
+            if line.upper() in ABBR_TO_CANONICAL:
+                continue
+            slot += 1
+            rows.append({"batter_team": team, "player_name": line, "lineup_slot": slot, "position": pending_pos})
+            pending_pos = None
+    return pd.DataFrame(rows)
+
+
+def _scrape_rotowire_projected(url: str, aliases: dict[str, str]) -> tuple[pd.DataFrame, str, dict[str, object]]:
+    html, fetch_diag = _fetch_rotowire_html(url)
     soup = BeautifulSoup(html, "html.parser")
     lines = [s.strip() for s in soup.stripped_strings if s and s.strip()]
     visible_text = "\n".join(lines)
@@ -270,7 +413,9 @@ def _scrape_rotowire_projected(date_str: str, aliases: dict[str, str], html_snap
             game_lineup_row_counts[current_game] = game_lineup_row_counts.get(current_game, 0) + 1
         pending_pos = None
 
-    out = pd.DataFrame(rows)
+    out = _parse_rotowire_cards(soup, aliases)
+    if out.empty:
+        out = pd.DataFrame(rows)
     out = out.dropna(subset=["batter_team", "player_name"]).copy()
     out["batter_team"] = out["batter_team"].astype(str).str.upper()
     out = out[out.groupby("batter_team").cumcount() < 9].copy()
@@ -296,7 +441,7 @@ def _scrape_rotowire_projected(date_str: str, aliases: dict[str, str], html_snap
         "visible_contains_expected_lineup": "Expected Lineup" in visible_text,
         "visible_contains_starting_pitcher_intel": "Starting Pitcher Intel" in visible_text,
     }
-    return out, diag
+    return out, html, diag
 
 
 def main() -> None:
@@ -327,18 +472,52 @@ def main() -> None:
     team_games["batter_team"] = team_games["batter_team"].astype(str).str.upper()
     aliases = _team_aliases(spine)
 
+    raw, html_used, scrape_diag = _scrape_rotowire_projected(SOURCE_URL, aliases)
+    used_url = SOURCE_URL
+    if raw.empty:
+        logging.warning("rotowire primary URL parsed zero rows; retrying fallback URL=%s", SOURCE_URL_FALLBACK)
+        raw, html_used, scrape_diag = _scrape_rotowire_projected(SOURCE_URL_FALLBACK, aliases)
+        used_url = SOURCE_URL_FALLBACK
     html_snapshot_path = dirs["logs_dir"] / f"projected_lineups_rotowire_{args.season}_{args.date}.html"
-    raw, scrape_diag = _scrape_rotowire_projected(args.date, aliases, html_snapshot_path=html_snapshot_path)
+    html_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    html_snapshot_path.write_text(html_used, encoding="utf-8")
     logging.info("rotowire html_snapshot=%s", html_snapshot_path)
+    logging.info("rotowire url_used_for_rows=%s parsed_rows=%s", used_url, len(raw))
     logging.info("rotowire parsed teams before slate filtering=%s", sorted(raw["batter_team"].dropna().astype(str).unique().tolist()) if len(raw) else [])
 
+    raw["canonical_team"] = raw["batter_team"].map(_to_canonical_team)
+    team_games["canonical_team"] = team_games["batter_team"].map(_to_canonical_team)
     scraped_teams = set(raw["batter_team"].dropna().astype(str).str.upper().unique().tolist()) if len(raw) else set()
+    scraped_canonical = set(raw["canonical_team"].dropna().astype(str).unique().tolist()) if len(raw) else set()
     slate_teams = set(team_games["batter_team"].dropna().astype(str).str.upper().unique().tolist()) if len(team_games) else set()
+    slate_canonical = set(team_games["canonical_team"].dropna().astype(str).unique().tolist()) if len(team_games) else set()
     unmatched_scraped = sorted(scraped_teams - slate_teams)
-    unmatched_slate = sorted(slate_teams - scraped_teams)
-    logging.info("rotowire team matching unmatched_scraped=%s unmatched_slate=%s", unmatched_scraped, unmatched_slate)
+    unmatched_canonical = sorted(scraped_canonical - slate_canonical)
+    logging.info(
+        "rotowire team diagnostics parsed_raw_teams=%s parsed_canonical_teams=%s slate_canonical_teams=%s unmatched_raw_teams=%s unmatched_canonical_teams=%s sample_rows=%s",
+        sorted(scraped_teams),
+        sorted(scraped_canonical),
+        sorted(slate_canonical),
+        unmatched_scraped,
+        unmatched_canonical,
+        raw.head(10).to_dict(orient="records") if len(raw) else [],
+    )
 
-    out = raw.merge(team_games[["game_pk", "batter_team"]].drop_duplicates(), on="batter_team", how="inner")
+    filtered = raw[raw["canonical_team"].isin(slate_canonical)].copy()
+    if len(raw) > 0 and filtered.empty:
+        raise ValueError(
+            "Rotowire parsed rows but canonical slate filtering removed all rows. "
+            f"parsed_raw_teams={sorted(scraped_teams)} "
+            f"parsed_canonical_teams={sorted(scraped_canonical)} "
+            f"slate_canonical_teams={sorted(slate_canonical)} "
+            f"unmatched_canonical_teams={unmatched_canonical}"
+        )
+    out = filtered.merge(
+        team_games[["game_pk", "batter_team", "canonical_team"]].drop_duplicates(),
+        on="canonical_team",
+        how="inner",
+        suffixes=("_scraped", ""),
+    )
     out["game_date"] = args.date
     out["batter_id"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
     out["bats"] = pd.NA
