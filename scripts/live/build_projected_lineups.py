@@ -322,27 +322,52 @@ def _parse_rotowire_cards(soup: BeautifulSoup, aliases: dict[str, str]) -> pd.Da
     return pd.DataFrame(rows)
 
 
-def _parse_hitter_row_text(raw_text: str) -> tuple[str, str, str | None] | None:
+def _parse_hitter_row_text(raw_text: str) -> tuple[str | None, str, str | None] | None:
     t = str(raw_text).strip()
     if not t:
         return None
-    if any(x in t.lower() for x in UI_BLOCKLIST):
+    t_low = t.lower()
+    if any(x in t_low for x in UI_BLOCKLIST):
         return None
-    if re.search(r"\(\d{1,3}-\d{1,3}\)", t):
+    if re.search(r"\(\d{1,3}-\d{1,3}\)", t_low):
         return None
     if re.search(r"\b\d{1,2}:\d{2}\s*(AM|PM)\s*ET\b", t, flags=re.IGNORECASE):
         return None
-    m = re.match(r"^(C|1B|2B|3B|SS|LF|CF|RF|DH)\s+(.+?)(?:\s+([LRS]))?$", t)
-    if not m:
+    if " pm " in f" {t_low} " or " am " in f" {t_low} " or " et" in f" {t_low} ":
         return None
-    pos = m.group(1)
-    name = (m.group(2) or "").strip()
-    bats = (m.group(3) or "").strip().upper() or None
-    if not name:
+    if re.fullmatch(r"\d+", t):
+        return None
+    if re.fullmatch(r"[A-Z]{2,4}", t):
+        return None
+
+    # remove leading batting-order integer if present
+    t = re.sub(r"^\d{1,2}\s+", "", t).strip()
+    if not t:
+        return None
+
+    pos: str | None = None
+    toks = t.split()
+    if toks and toks[0].upper() in POS_SET:
+        pos = toks[0].upper()
+        toks = toks[1:]
+    if not toks:
+        return None
+
+    bats: str | None = None
+    if toks and toks[-1].upper() in {"L", "R", "S"}:
+        bats = toks[-1].upper()
+        toks = toks[:-1]
+    if not toks:
+        return None
+
+    name = " ".join(toks).strip()
+    if len(name.split()) < 2:
         return None
     if any(x in name.lower() for x in UI_BLOCKLIST):
         return None
-    if re.fullmatch(r"[A-Z]{2,4}", name):
+    if re.fullmatch(r"\d+", name):
+        return None
+    if re.fullmatch(r"[A-Z ]{2,}", name) and len(name.split()) <= 3:
         return None
     return pos, name, bats
 
@@ -358,7 +383,7 @@ def _filter_valid_hitter_rows(df: pd.DataFrame) -> pd.DataFrame:
         pos = str(row.get("position", "")).strip().upper()
         name = str(row.get("player_name", "")).strip()
         bats_existing = str(row.get("bats", "")).strip().upper()
-        text = f"{pos} {name}".strip() if pos in POS_SET else name
+        text = f"{pos} {name}".strip() if pos else name
         parsed = _parse_hitter_row_text(text)
         if parsed is None:
             rejected.append(text)
@@ -377,23 +402,19 @@ def _filter_valid_hitter_rows(df: pd.DataFrame) -> pd.DataFrame:
         logging.info("rotowire hitter row diagnostics raw_rows_by_team=%s filtered_rows_by_team=%s rejected_sample=%s", raw_counts, {}, rejected[:10])
         raise ValueError("Parsed rows exist but no valid hitter rows detected — parser likely misaligned with HTML structure")
 
-    clean = clean.dropna(subset=["batter_team", "player_name", "position"]).copy()
-    clean = clean[clean["position"].isin(POS_SET)].copy()
+    clean = clean.dropna(subset=["batter_team", "player_name"]).copy()
+    clean["position"] = clean["position"].where(clean["position"].isin(POS_SET), None)
     clean["lineup_slot"] = clean.groupby("batter_team").cumcount() + 1
     clean = clean[clean["lineup_slot"] <= 9].copy()
     filtered_counts = clean.groupby("batter_team").size().to_dict()
-    bad_teams = [t for t, n in filtered_counts.items() if n < 5]
-    for t in bad_teams:
-        logging.warning("dropping team due to low valid hitter rows team=%s rows=%s", t, filtered_counts.get(t))
-    if bad_teams:
-        clean = clean[~clean["batter_team"].isin(bad_teams)].copy()
-        filtered_counts = clean.groupby("batter_team").size().to_dict() if len(clean) else {}
+    final_counts = clean.groupby("batter_team").size().to_dict()
 
     logging.info(
-        "rotowire hitter row diagnostics raw_rows_by_team=%s filtered_rows_by_team=%s rejected_sample=%s",
+        "rotowire hitter row diagnostics raw_rows_by_team=%s kept_rows_by_team=%s rejected_sample=%s final_rows_by_team=%s",
         raw_counts,
         filtered_counts,
         rejected[:10],
+        final_counts,
     )
     return clean
 
@@ -620,7 +641,6 @@ def main() -> None:
     ].drop_duplicates(subset=["game_pk", "batter_team", "player_name"], keep="first")
 
     out = out.dropna(subset=["player_name"]).copy()
-    out = out[out["position"].isin(POS_SET)].copy()
     ui_mask = out["player_name"].str.lower().str.contains("|".join(UI_BLOCKLIST), regex=True, na=False)
     out = out[~ui_mask].copy()
     logging.info(
