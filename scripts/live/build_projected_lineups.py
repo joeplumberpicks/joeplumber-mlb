@@ -287,6 +287,8 @@ def _parse_rotowire_cards(soup: BeautifulSoup, aliases: dict[str, str]) -> pd.Da
         if cid not in seen:
             seen.add(cid)
             uniq_cards.append(c)
+    raw_nodes_scanned = 0
+    lineup_nodes_found = 0
     for card in uniq_cards:
         card_lines = [t.strip() for t in card.stripped_strings if t and t.strip()]
         if not card_lines:
@@ -294,31 +296,23 @@ def _parse_rotowire_cards(soup: BeautifulSoup, aliases: dict[str, str]) -> pd.Da
         team = _parse_team_from_text(" ".join(card_lines[:12]), aliases)
         if team is None:
             continue
+        lineup_nodes = card.select(
+            "ul[class*='lineup'] li, ol[class*='lineup'] li, div[class*='lineup__list'] div, div[class*='lineup__player'], table[class*='lineup'] tr"
+        )
+        raw_nodes_scanned += len(lineup_nodes)
+        lineup_nodes_found += len(lineup_nodes)
         slot = 0
-        pending_pos: str | None = None
-        for line in card_lines:
-            if line in POS_SET:
-                pending_pos = line
+        for node in lineup_nodes:
+            line = " ".join([s.strip() for s in node.stripped_strings if s and s.strip()])
+            if not line:
                 continue
-            if re.fullmatch(r"[RLS]", line):
+            if "starting pitcher" in line.lower() or "pitcher intel" in line.lower() or "era" in line.lower():
                 continue
-            if line in {"Expected Lineup", "Confirmed Lineup", "Unknown Lineup"}:
-                continue
-            if line.startswith("Starting Pitcher Intel") or line.startswith("Umpire:"):
-                break
             if slot >= 9:
                 break
-            if re.fullmatch(r"\d{1,2}", line):
-                continue
-            if len(line) <= 1:
-                continue
-            if any(k in line for k in ["LINE", "O/U", " mph "]):
-                continue
-            if line.upper() in ABBR_TO_CANONICAL:
-                continue
             slot += 1
-            rows.append({"batter_team": team, "player_name": line, "lineup_slot": slot, "position": pending_pos})
-            pending_pos = None
+            rows.append({"batter_team": team, "player_name": line, "lineup_slot": slot, "position": None})
+    logging.info("rotowire parser nodes raw_nodes_scanned=%s lineup_nodes_found=%s game_cards=%s", raw_nodes_scanned, lineup_nodes_found, len(uniq_cards))
     return pd.DataFrame(rows)
 
 
@@ -328,6 +322,10 @@ def _parse_hitter_row_text(raw_text: str) -> tuple[str | None, str, str | None] 
         return None
     t_low = t.lower()
     if any(x in t_low for x in UI_BLOCKLIST):
+        return None
+    if "lineup has not been posted" in t_low:
+        return None
+    if "era" in t_low:
         return None
     if re.search(r"\(\d{1,3}-\d{1,3}\)", t_low):
         return None
@@ -369,6 +367,8 @@ def _parse_hitter_row_text(raw_text: str) -> tuple[str | None, str, str | None] 
         return None
     if re.fullmatch(r"[A-Z ]{2,}", name) and len(name.split()) <= 3:
         return None
+    if _to_canonical_team(name) is not None:
+        return None
     return pos, name, bats
 
 
@@ -399,14 +399,19 @@ def _filter_valid_hitter_rows(df: pd.DataFrame) -> pd.DataFrame:
         )
     clean = pd.DataFrame(parsed_rows)
     if clean.empty:
-        logging.info("rotowire hitter row diagnostics raw_rows_by_team=%s filtered_rows_by_team=%s rejected_sample=%s", raw_counts, {}, rejected[:10])
-        raise ValueError("Parsed rows exist but no valid hitter rows detected — parser likely misaligned with HTML structure")
+        logging.info("rotowire hitter row diagnostics raw_rows_by_team=%s kept_rows_by_team=%s rejected_sample=%s final_rows_by_team=%s", raw_counts, {}, rejected[:10], {})
+        return clean
 
     clean = clean.dropna(subset=["batter_team", "player_name"]).copy()
     clean["position"] = clean["position"].where(clean["position"].isin(POS_SET), None)
     clean["lineup_slot"] = clean.groupby("batter_team").cumcount() + 1
     clean = clean[clean["lineup_slot"] <= 9].copy()
     filtered_counts = clean.groupby("batter_team").size().to_dict()
+    bad_teams = [team for team, ct in filtered_counts.items() if ct < 5]
+    if bad_teams:
+        logging.warning("rotowire dropping teams with <5 valid hitters teams=%s", bad_teams)
+        clean = clean[~clean["batter_team"].isin(bad_teams)].copy()
+        filtered_counts = clean.groupby("batter_team").size().to_dict() if len(clean) else {}
     final_counts = clean.groupby("batter_team").size().to_dict()
 
     logging.info(
@@ -652,14 +657,12 @@ def main() -> None:
     )
 
     if out.empty:
-        raise ValueError(
-            "Projected lineup scrape parsed zero rows after filtering. "
-            f"status_code={scrape_diag.get('status_code')} "
-            f"content_length={scrape_diag.get('content_length')} "
-            f"game_container_count={scrape_diag.get('game_container_count')} "
-            f"contains_expected_lineup={scrape_diag.get('contains_expected_lineup')} "
-            f"contains_nyy={scrape_diag.get('contains_nyy')} "
-            f"contains_sf={scrape_diag.get('contains_sf')}"
+        logging.warning(
+            "projected lineups unavailable; writing empty parquet for fallback usage status_code=%s content_length=%s game_container_count=%s contains_expected_lineup=%s",
+            scrape_diag.get("status_code"),
+            scrape_diag.get("content_length"),
+            scrape_diag.get("game_container_count"),
+            scrape_diag.get("contains_expected_lineup"),
         )
 
     out_path = dirs["processed_dir"] / "live" / f"projected_lineups_{args.season}_{args.date}.parquet"

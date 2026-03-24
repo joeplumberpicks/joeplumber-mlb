@@ -21,6 +21,7 @@ from src.utils.logging import configure_logging, log_header
 
 GRADE_THRESHOLDS = [("A+", 0.70), ("A", 0.67), ("A-", 0.64), ("B+", 0.61), ("B", 0.58), ("B-", 0.55), ("C+", 0.52)]
 LINEUP_PA_MAP = {1: 4.65, 2: 4.55, 3: 4.45, 4: 4.35, 5: 4.25, 6: 4.10, 7: 3.95, 8: 3.80, 9: 3.70}
+LINEUP_JUNK_TOKENS = ["watch", "tickets", "alerts", "lineup has not been posted", "era"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,6 +62,36 @@ def _lineup_conf(slot: pd.Series) -> pd.Series:
     out = out.where(~s.between(6, 7), 0.92)
     out = out.where(~s.between(8, 9), 0.85)
     return out
+
+
+def _is_junk_name(name: str) -> bool:
+    s = str(name or "").strip().lower()
+    if not s:
+        return True
+    if any(t in s for t in LINEUP_JUNK_TOKENS):
+        return True
+    if "(" in s and "-" in s and ")" in s:
+        return True
+    if " pm " in f" {s} " or " am " in f" {s} " or " et" in f" {s} ":
+        return True
+    return False
+
+
+def _validate_lineup_rows(df: pd.DataFrame, label: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    v = df.copy()
+    v["player_name"] = v["player_name"].astype(str)
+    v = v[~v["player_name"].map(_is_junk_name)].copy()
+    v = v[v["player_name"].str.split().str.len().fillna(0) >= 2].copy()
+    per_team = v.groupby("batter_team").size()
+    keep_teams = per_team[per_team >= 5].index.astype(str).tolist()
+    dropped_teams = sorted(set(v["batter_team"].astype(str).unique().tolist()) - set(keep_teams))
+    if dropped_teams:
+        logging.warning("lineup validation dropped teams label=%s teams=%s reason=lt5_valid_hitters", label, dropped_teams)
+    v = v[v["batter_team"].astype(str).isin(keep_teams)].copy()
+    logging.info("lineup validation label=%s input_rows=%s output_rows=%s kept_teams=%s", label, len(df), len(v), sorted(set(keep_teams)))
+    return v
 
 
 def _normalize_live_lineups(
@@ -124,23 +155,42 @@ def _build_fallback_lineups(
     team_col = _pick(list(b.columns), ["batter_team", "team", "team_abbrev", "team_name", "batting_team"])
     bid_col = _pick(list(b.columns), ["batter_id", "batter", "player_id"])
     name_col = _pick(list(b.columns), ["player_name", "batter_name", "name"])
-    score_col = _pick(list(b.columns), ["bat_pa_per_game_roll15", "bat_ab_per_game_roll15", "pa", "ab"])
+    pa_col = _pick(list(b.columns), ["bat_pa_per_game_roll15", "pa", "bat_pa_roll15", "bat_ab_per_game_roll15", "ab"])
+    old_slot_col = _pick(list(b.columns), ["lineup_slot", "bat_order", "batting_order", "order", "lineup_position"])
     season_col = pd.to_numeric(b.get("season"), errors="coerce") if "season" in b.columns else pd.to_datetime(b.get("game_date"), errors="coerce").dt.year
     b["_season"] = season_col
-    b = b[pd.to_numeric(b["_season"], errors="coerce") <= season].copy()
     if team_col is None or bid_col is None:
         return empty
+    available_seasons = sorted(pd.to_numeric(b["_season"], errors="coerce").dropna().astype(int).unique().tolist())
+    chosen_season = season if season in available_seasons else (max(available_seasons) if available_seasons else None)
+    if chosen_season is not None:
+        b = b[pd.to_numeric(b["_season"], errors="coerce") == chosen_season].copy()
 
-    b["batter_team"] = b[team_col].astype(str)
+    b["batter_team"] = b[team_col].astype(str).str.upper()
     b["batter_id"] = pd.to_numeric(b[bid_col], errors="coerce").astype("Int64")
     b["player_name"] = b[name_col].astype(str) if name_col else b["batter_id"].astype(str)
-    b["_score"] = pd.to_numeric(b[score_col], errors="coerce") if score_col else np.nan
-    sort_cols = [c for c in ["game_date"] if c in b.columns]
-    b = b.sort_values(sort_cols) if sort_cols else b
-    b = b.groupby(["batter_team", "batter_id"], as_index=False).tail(1)
-    b = b.sort_values(["batter_team", "_score", "player_name"], ascending=[True, False, True], kind="mergesort")
+    b["_pa"] = pd.to_numeric(b[pa_col], errors="coerce") if pa_col else np.nan
+    b["_old_slot"] = pd.to_numeric(b[old_slot_col], errors="coerce") if old_slot_col else np.nan
+    b["game_date"] = pd.to_datetime(b.get("game_date"), errors="coerce")
+    b = b.sort_values(["game_date", "_pa"], ascending=[False, False], kind="mergesort")
+    b = b.groupby(["batter_team", "batter_id"], as_index=False).head(1)
+
+    slate_team_map = team_games[["game_pk", "batter_team"]].drop_duplicates().copy()
+    slate_team_map["batter_team"] = slate_team_map["batter_team"].astype(str).str.upper()
+    slate_teams = sorted(set(slate_team_map["batter_team"].astype(str).tolist()))
+    logging.info(
+        "fallback diagnostics batter_history_rows=%s unique_batter_teams=%s slate_teams=%s",
+        len(b),
+        int(b["batter_team"].nunique()) if len(b) else 0,
+        slate_teams,
+    )
+    b = b[b["batter_team"].isin(slate_teams)].copy()
+    logging.info("fallback diagnostics rows_after_slate_team_filter=%s", len(b))
+    b = b.sort_values(["batter_team", "game_date", "_pa", "_old_slot"], ascending=[True, False, False, True], kind="mergesort")
     b["lineup_slot"] = b.groupby("batter_team").cumcount() + 1
     b = b[b["lineup_slot"] <= 9].copy()
+    per_team = b.groupby("batter_team").size().to_dict() if len(b) else {}
+    logging.info("fallback diagnostics rows_selected_per_team=%s", per_team)
 
     if "game_pk" in b.columns:
         game_col = "game_pk"
@@ -154,7 +204,7 @@ def _build_fallback_lineups(
         game_col = "game_pk"
 
     if "game_pk" in team_games.columns and not team_games.empty:
-        mapped = b.merge(team_games[["game_pk", "batter_team"]].drop_duplicates(), on="batter_team", how="left", suffixes=("", "_mapped"))
+        mapped = b.merge(slate_team_map, on="batter_team", how="left", suffixes=("", "_mapped"))
         mapped["game_pk"] = mapped["game_pk_mapped"].where(mapped["game_pk_mapped"].notna(), mapped[game_col] if game_col in mapped.columns else pd.NA)
         b = mapped.drop(columns=["game_pk_mapped"], errors="ignore")
         game_col = "game_pk"
@@ -170,6 +220,7 @@ def _build_fallback_lineups(
     if "game_pk" not in out.columns:
         out["game_pk"] = pd.NA
     out = out[[c for c in ["game_pk", "batter_team", "batter_id", "player_name", "lineup_slot", "lineup_status", "lineup_source"] if c in out.columns]]
+    logging.info("fallback diagnostics final_fallback_row_count=%s", len(out))
     return out
 
 
@@ -304,6 +355,7 @@ def main() -> None:
             source_label="projected_lineups",
             default_status="projected",
         )
+        projected = _validate_lineup_rows(projected, label="projected_lineups")
 
     if confirmed.empty and projected.empty and lineup_path.exists():
         projected = _normalize_live_lineups(
@@ -312,6 +364,7 @@ def main() -> None:
             source_label="lineups_compat",
             default_status="projected",
         )
+        projected = _validate_lineup_rows(projected, label="lineups_compat")
 
     confirmed_games = set(pd.to_numeric(confirmed.get("game_pk"), errors="coerce").dropna().astype(int).tolist()) if not confirmed.empty else set()
     projected_use = projected[~pd.to_numeric(projected.get("game_pk"), errors="coerce").astype("Int64").isin(list(confirmed_games))].copy() if not projected.empty else pd.DataFrame()
@@ -332,8 +385,17 @@ def main() -> None:
             selected = pd.concat([selected, fallback], ignore_index=True, sort=False)
 
     if selected.empty:
+        batter_team_col = _pick(list(batter.columns), ["batter_team", "team", "team_abbrev", "team_name", "batting_team"])
+        batter_teams_available = (
+            sorted(batter[batter_team_col].astype(str).str.upper().dropna().unique().tolist())
+            if (batter_team_col is not None and not batter.empty)
+            else []
+        )
+        slate_team_list = sorted(team_games["batter_team"].astype(str).str.upper().dropna().unique().tolist())
         raise ValueError(
-            "No lineup candidates were available from confirmed, projected, compatibility, or fallback sources."
+            "No lineup candidates were available from confirmed, projected, compatibility, or fallback sources. "
+            f"confirmed_rows={len(confirmed)} projected_rows={len(projected_use)} fallback_rows={len(fallback)} "
+            f"slate_teams={slate_team_list} batter_teams_available={batter_teams_available}"
         )
 
     logging.info(
