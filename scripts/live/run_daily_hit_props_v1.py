@@ -347,6 +347,20 @@ def main() -> None:
         len(selected),
         int(selected["game_pk"].nunique()) if not selected.empty else 0,
     )
+    logging.info("hit_prop live confirmed_lineup_rows=%s", len(confirmed))
+    logging.info("hit_prop live projected_lineup_rows=%s", len(projected_use))
+    logging.info("hit_prop live fallback_lineup_rows=%s", len(fallback))
+    logging.info("hit_prop live final_lineup_candidate_rows=%s", len(selected))
+    if not selected.empty and {"game_pk", "lineup_source"}.issubset(selected.columns):
+        per_game = (
+            selected[["game_pk", "lineup_source"]]
+            .dropna(subset=["game_pk"])
+            .astype({"lineup_source": str})
+            .groupby("game_pk")["lineup_source"]
+            .agg(lambda s: ",".join(sorted(set(s))))
+            .to_dict()
+        )
+        logging.info("hit_prop live lineup_source_by_game=%s", per_game)
 
     board = selected.merge(team_games, on=["game_pk", "batter_team"], how="inner")
     if "park_factor_hits_blend" in board.columns:
