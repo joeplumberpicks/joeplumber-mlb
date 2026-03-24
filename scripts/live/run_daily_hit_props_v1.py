@@ -110,37 +110,67 @@ def _build_fallback_lineups(
     season: int,
     team_games: pd.DataFrame,
 ) -> pd.DataFrame:
+    empty = pd.DataFrame(columns=["game_pk", "batter_team", "batter_id", "player_name", "lineup_slot", "lineup_status", "lineup_source"])
     if batter.empty:
-        return pd.DataFrame(columns=["game_pk", "batter_team", "batter_id", "player_name", "lineup_slot", "lineup_status", "lineup_source"])
+        return empty
 
     b = batter.copy()
-    b["game_date"] = pd.to_datetime(b.get("game_date"), errors="coerce")
-    b = b[b["game_date"] < slate_date].copy()
+    if "game_date" in b.columns:
+        b["game_date"] = pd.to_datetime(b.get("game_date"), errors="coerce")
+        b = b[b["game_date"] < slate_date].copy()
     if b.empty:
-        return pd.DataFrame(columns=["game_pk", "batter_team", "batter_id", "player_name", "lineup_slot", "lineup_status", "lineup_source"])
+        return empty
 
     team_col = _pick(list(b.columns), ["batter_team", "team", "team_abbrev", "team_name", "batting_team"])
     bid_col = _pick(list(b.columns), ["batter_id", "batter", "player_id"])
     name_col = _pick(list(b.columns), ["player_name", "batter_name", "name"])
     score_col = _pick(list(b.columns), ["bat_pa_per_game_roll15", "bat_ab_per_game_roll15", "pa", "ab"])
-    season_col = pd.to_numeric(b.get("season"), errors="coerce") if "season" in b.columns else b["game_date"].dt.year
+    season_col = pd.to_numeric(b.get("season"), errors="coerce") if "season" in b.columns else pd.to_datetime(b.get("game_date"), errors="coerce").dt.year
     b["_season"] = season_col
     b = b[pd.to_numeric(b["_season"], errors="coerce") <= season].copy()
     if team_col is None or bid_col is None:
-        return pd.DataFrame(columns=["game_pk", "batter_team", "batter_id", "player_name", "lineup_slot", "lineup_status", "lineup_source"])
+        return empty
 
     b["batter_team"] = b[team_col].astype(str)
     b["batter_id"] = pd.to_numeric(b[bid_col], errors="coerce").astype("Int64")
     b["player_name"] = b[name_col].astype(str) if name_col else b["batter_id"].astype(str)
     b["_score"] = pd.to_numeric(b[score_col], errors="coerce") if score_col else np.nan
-    b = b.sort_values(["game_date"]).groupby(["batter_team", "batter_id"], as_index=False).tail(1)
+    sort_cols = [c for c in ["game_date"] if c in b.columns]
+    b = b.sort_values(sort_cols) if sort_cols else b
+    b = b.groupby(["batter_team", "batter_id"], as_index=False).tail(1)
     b = b.sort_values(["batter_team", "_score", "player_name"], ascending=[True, False, True], kind="mergesort")
     b["lineup_slot"] = b.groupby("batter_team").cumcount() + 1
     b = b[b["lineup_slot"] <= 9].copy()
-    b = b.merge(team_games[["game_pk", "batter_team"]].drop_duplicates(), on="batter_team", how="inner")
+
+    if "game_pk" in b.columns:
+        game_col = "game_pk"
+    elif "game_id" in b.columns:
+        game_col = "game_id"
+    else:
+        game_col = None
+
+    if game_col is None:
+        b["game_pk"] = b["batter_team"].astype(str) + "_" + str(slate_date.date())
+        game_col = "game_pk"
+
+    if "game_pk" in team_games.columns and not team_games.empty:
+        mapped = b.merge(team_games[["game_pk", "batter_team"]].drop_duplicates(), on="batter_team", how="left", suffixes=("", "_mapped"))
+        mapped["game_pk"] = mapped["game_pk_mapped"].where(mapped["game_pk_mapped"].notna(), mapped[game_col] if game_col in mapped.columns else pd.NA)
+        b = mapped.drop(columns=["game_pk_mapped"], errors="ignore")
+        game_col = "game_pk"
+
+    b["lineup_slot"] = pd.to_numeric(b.get("lineup_slot"), errors="coerce").fillna(5)
     b["lineup_status"] = "fallback"
-    b["lineup_source"] = "heuristic_recent_usage"
-    return b[["game_pk", "batter_team", "batter_id", "player_name", "lineup_slot", "lineup_status", "lineup_source"]]
+    b["lineup_source"] = "fallback"
+    cols = [game_col, "batter_team", "batter_id", "player_name", "lineup_slot", "lineup_status", "lineup_source"]
+    cols = [c for c in cols if c in b.columns]
+    out = b[cols].copy()
+    if game_col in out.columns and game_col != "game_pk":
+        out = out.rename(columns={game_col: "game_pk"})
+    if "game_pk" not in out.columns:
+        out["game_pk"] = pd.NA
+    out = out[[c for c in ["game_pk", "batter_team", "batter_id", "player_name", "lineup_slot", "lineup_status", "lineup_source"] if c in out.columns]]
+    return out
 
 
 def main() -> None:
@@ -292,6 +322,10 @@ def main() -> None:
     missing_games = sorted(slate_games - selected_games)
     fallback = pd.DataFrame()
     if missing_games:
+        if confirmed.empty and projected.empty:
+            logging.info("Using fallback lineup builder (no confirmed or projected lineups found)")
+        else:
+            logging.info("Using fallback lineup builder for games missing both confirmed and projected lineups")
         fallback_all = _build_fallback_lineups(batter=batter, slate_date=slate_date, season=args.season, team_games=team_games)
         if not fallback_all.empty:
             fallback = fallback_all[pd.to_numeric(fallback_all["game_pk"], errors="coerce").astype("Int64").isin(missing_games)].copy()
