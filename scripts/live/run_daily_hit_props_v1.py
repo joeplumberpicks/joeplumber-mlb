@@ -538,15 +538,51 @@ def main() -> None:
             f"lineup_batter_id_sample={lineup_batter_sample} feature_batter_id_sample={feature_batter_sample} "
             f"lineup_batter_id_dtype={df_lineups['batter_id'].dtype} feature_batter_id_dtype={df_features['batter_id'].dtype}"
         )
-    df_joined = df_lineups.merge(df_features[["batter_id"]].drop_duplicates(), on=["batter_id"], how="inner")
-    logging.info(
-        "hit_prop live batter_id join diagnostics joined_row_count=%s unique_batter_id_count=%s",
-        len(df_joined),
-        int(df_joined["batter_id"].nunique()) if "batter_id" in df_joined.columns else 0,
-    )
+    feature_season_col = _pick(list(df_features.columns), ["season", "_season"])
+    if feature_season_col is not None:
+        df_features["_feature_season"] = pd.to_numeric(df_features[feature_season_col], errors="coerce")
+    elif "game_date" in df_features.columns:
+        df_features["_feature_season"] = pd.to_datetime(df_features["game_date"], errors="coerce").dt.year
+    else:
+        df_features["_feature_season"] = np.nan
+    df_features["_feature_game_date"] = pd.to_datetime(df_features.get("game_date"), errors="coerce")
+
+    df_joined = df_lineups[["batter_id"]].dropna().drop_duplicates().merge(df_features, on=["batter_id"], how="inner")
     if df_joined.empty:
         raise ValueError("No matching batter_id between lineup and feature mart")
-    selected = selected[pd.to_numeric(selected["batter_id"], errors="coerce").isin(df_joined["batter_id"].dropna().unique().tolist())].copy()
+    df_joined["_season_is_current"] = (pd.to_numeric(df_joined["_feature_season"], errors="coerce") == args.season).astype(int)
+    joined_candidate_row_count = len(df_joined)
+    current_season_candidate_count = int(df_joined["_season_is_current"].sum())
+    df_joined = df_joined.sort_values(
+        ["batter_id", "_season_is_current", "_feature_season", "_feature_game_date"],
+        ascending=[True, False, False, False],
+        kind="mergesort",
+    )
+    df_selected_features = df_joined.drop_duplicates(subset=["batter_id"], keep="first").copy()
+    previous_season_fallback_count = int((pd.to_numeric(df_selected_features["_feature_season"], errors="coerce") != args.season).sum())
+    final_selected_scoring_row_count = len(df_selected_features)
+    sample_selected = (
+        df_selected_features[["batter_id", "_feature_season"]]
+        .head(10)
+        .to_dict("records")
+    )
+    logging.info(
+        "hit_prop live feature_row_selection joined_candidate_row_count=%s current_season_candidate_count=%s previous_season_fallback_count=%s final_selected_scoring_row_count=%s sample_batter_season=%s",
+        joined_candidate_row_count,
+        current_season_candidate_count,
+        previous_season_fallback_count,
+        final_selected_scoring_row_count,
+        sample_selected,
+    )
+    if previous_season_fallback_count > 0:
+        logging.info(
+            "Opening Day / early-season fallback engaged: using most recent historical feature rows where current-season rows are unavailable."
+        )
+    if final_selected_scoring_row_count == 0:
+        raise ValueError("No matching batter_id between lineup and feature mart")
+
+    selected = selected[pd.to_numeric(selected["batter_id"], errors="coerce").isin(df_selected_features["batter_id"].dropna().unique().tolist())].copy()
+    selected_feature_by_batter = df_selected_features.set_index("batter_id")
 
     logging.info(
         "hit_prop live lineup_source_summary confirmed_rows=%s confirmed_games=%s projected_rows=%s projected_games_used=%s fallback_rows=%s fallback_games=%s total_rows=%s total_games=%s",
@@ -608,9 +644,10 @@ def main() -> None:
 
     for c in feats:
         if c.startswith("bat_"):
+            best = board["batter_id"].map(selected_feature_by_batter[c]) if (not selected_feature_by_batter.empty and c in selected_feature_by_batter.columns) else pd.Series(np.nan, index=board.index)
             cur = board["batter_id"].map(cur_latest[c]) if (not cur_latest.empty and c in cur_latest.columns) else pd.Series(np.nan, index=board.index)
             prv = board["batter_id"].map(prev_latest[c]) if (not prev_latest.empty and c in prev_latest.columns) else pd.Series(np.nan, index=board.index)
-            X[c] = np.where(use_prev, prv, cur)
+            X[c] = pd.to_numeric(best, errors="coerce").where(pd.to_numeric(best, errors="coerce").notna(), np.where(use_prev, prv, cur))
         elif c in board.columns:
             X[c] = pd.to_numeric(board[c], errors="coerce")
 
@@ -663,6 +700,14 @@ def main() -> None:
 
     # scoring matrix remains aligned to trained features only
     X_scoring = X.reindex(columns=feats, fill_value=np.nan)
+    available_feature_count = len([c for c in feats if c in selected_feature_by_batter.columns])
+    missing_feature_count = len(feats) - available_feature_count
+    logging.info(
+        "hit_prop live feature_availability expected_feature_count=%s available_feature_count=%s missing_feature_count=%s",
+        len(feats),
+        available_feature_count,
+        missing_feature_count,
+    )
     if X_scoring.shape[0] == 0:
         fallback_row_count = len(fallback) if "fallback" in locals() else 0
         fallback_non_null_batter_id_count = (
