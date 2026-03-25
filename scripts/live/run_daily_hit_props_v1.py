@@ -510,6 +510,44 @@ def main() -> None:
             f"slate_teams={slate_team_list} batter_teams_available={batter_teams_available}"
         )
 
+    hitter_props_features_path = dirs["marts_dir"] / "hitter_props_features.parquet"
+    if not hitter_props_features_path.exists():
+        raise FileNotFoundError(f"hitter feature mart not found: {hitter_props_features_path}")
+    df_features = pd.read_parquet(hitter_props_features_path).copy()
+    df_lineups = selected.copy()
+    if "batter_id" not in df_lineups.columns:
+        raise ValueError("lineup candidates missing batter_id column before hitter feature join diagnostics")
+    if "batter_id" not in df_features.columns:
+        raise ValueError("hitter feature mart missing batter_id column")
+    df_lineups["batter_id"] = pd.to_numeric(df_lineups["batter_id"], errors="coerce")
+    df_features["batter_id"] = pd.to_numeric(df_features["batter_id"], errors="coerce")
+    lineup_batter_sample = df_lineups["batter_id"].dropna().head(10).tolist()
+    feature_batter_sample = df_features["batter_id"].dropna().head(10).tolist()
+    lineup_batter_set = set(df_lineups["batter_id"].dropna().tolist())
+    feature_batter_set = set(df_features["batter_id"].dropna().tolist())
+    intersection = lineup_batter_set & feature_batter_set
+    logging.info(
+        "hit_prop live batter_id diagnostics lineup_sample=%s feature_sample=%s intersection_count=%s",
+        lineup_batter_sample,
+        feature_batter_sample,
+        len(intersection),
+    )
+    if len(intersection) == 0:
+        raise ValueError(
+            "No overlapping batter_id values between lineups and hitter feature mart. "
+            f"lineup_batter_id_sample={lineup_batter_sample} feature_batter_id_sample={feature_batter_sample} "
+            f"lineup_batter_id_dtype={df_lineups['batter_id'].dtype} feature_batter_id_dtype={df_features['batter_id'].dtype}"
+        )
+    df_joined = df_lineups.merge(df_features[["batter_id"]].drop_duplicates(), on=["batter_id"], how="inner")
+    logging.info(
+        "hit_prop live batter_id join diagnostics joined_row_count=%s unique_batter_id_count=%s",
+        len(df_joined),
+        int(df_joined["batter_id"].nunique()) if "batter_id" in df_joined.columns else 0,
+    )
+    if df_joined.empty:
+        raise ValueError("No matching batter_id between lineup and feature mart")
+    selected = selected[pd.to_numeric(selected["batter_id"], errors="coerce").isin(df_joined["batter_id"].dropna().unique().tolist())].copy()
+
     logging.info(
         "hit_prop live lineup_source_summary confirmed_rows=%s confirmed_games=%s projected_rows=%s projected_games_used=%s fallback_rows=%s fallback_games=%s total_rows=%s total_games=%s",
         len(confirmed),
