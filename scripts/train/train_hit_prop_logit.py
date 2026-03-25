@@ -22,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
 from src.utils.logging import configure_logging, log_header
+from src.props.hitter_prop_common import LIVE_ONLY_FEATURE_NAMES
 
 TARGET = "target_hit_1_plus"
 
@@ -93,10 +94,13 @@ def main() -> None:
 
     excluded = {"game_pk", "batter_id", "opp_pitcher_id", "season", TARGET, "target_hit1p", "target_hit_1p"}
     numeric_features = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in excluded]
-    unsafe_features = [c for c in numeric_features if not _is_safe_feature(c)]
+    live_only_features = [c for c in numeric_features if c in LIVE_ONLY_FEATURE_NAMES]
+    unsafe_features = [c for c in numeric_features if (not _is_safe_feature(c)) or (c in LIVE_ONLY_FEATURE_NAMES)]
     if unsafe_features:
         logging.info("hit_prop train leakage_guard dropped_unsafe_features_n=%s features=%s", len(unsafe_features), unsafe_features)
+    logging.info("hit_prop train dropped_live_only_features_n=%s features=%s", len(live_only_features), live_only_features)
     numeric_features = [c for c in numeric_features if _is_safe_feature(c)]
+    numeric_features = [c for c in numeric_features if c not in LIVE_ONLY_FEATURE_NAMES]
     feature_stats: list[tuple[str, int, float]] = []
     for c in numeric_features:
         nn = int(pd.to_numeric(df[c], errors="coerce").notna().sum())
@@ -142,6 +146,9 @@ def main() -> None:
         "train_end": args.train_end,
         "trained_at": ts,
         "n_rows": int(len(df)),
+        "historical_feature_count": int(len(features)),
+        "live_only_features_excluded_count": int(len(live_only_features)),
+        "live_only_features_excluded": live_only_features,
         "dropped_all_null_features": dropped_all_null,
     }
     joblib.dump(bundle, model_path)

@@ -17,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.reference.build_weather_game import normalize_weather_frame
+from src.props.hitter_prop_common import poisson_prob_at_least
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
 from src.utils.logging import configure_logging, log_header
@@ -99,7 +100,7 @@ TEAM_TO_CANONICAL = {
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run daily 1+ hit props board v1.")
+    p = argparse.ArgumentParser(description="Run daily TB props board v1.")
     p.add_argument("--season", type=int, required=True)
     p.add_argument("--date", required=True)
     p.add_argument("--min-current-games", type=int, default=5)
@@ -123,9 +124,9 @@ def _grade(p: float) -> str:
 
 
 def _latest_model(models_dir: Path) -> Path:
-    c = sorted((models_dir / "hit_prop").glob("hit_prop_logit_*.joblib"))
+    c = sorted((models_dir / "tb_prop").glob("tb_prop_poisson_*.joblib"))
     if not c:
-        raise FileNotFoundError(f"no hit prop model in {models_dir / 'hit_prop'}")
+        raise FileNotFoundError(f"no tb prop model in {models_dir / 'tb_prop'}")
     return c[-1]
 
 
@@ -374,8 +375,8 @@ def main() -> None:
     config_path = (repo_root / args.config).resolve() if not args.config.is_absolute() else args.config.resolve()
     config = load_config(config_path)
     dirs = resolve_data_dirs(config=config, prefer_drive=True)
-    configure_logging(dirs["logs_dir"] / "run_daily_hit_props_v1.log")
-    log_header("scripts/live/run_daily_hit_props_v1.py", repo_root, config_path, dirs)
+    configure_logging(dirs["logs_dir"] / "run_daily_tb_props_v1.log")
+    log_header("scripts/live/run_daily_tb_props_v1.py", repo_root, config_path, dirs)
 
     spine_path = dirs["processed_dir"] / "live" / f"model_spine_game_{args.season}_{args.date}.parquet"
     if not spine_path.exists():
@@ -426,7 +427,7 @@ def main() -> None:
             wg = pd.read_parquet(weather_source_path).copy()
             if weather_source_kind == "raw_live":
                 wg = normalize_weather_frame(wg, fallback_season=args.season)
-            logging.info("hit_prop live weather_source kind=%s path=%s rows=%s", weather_source_kind, weather_source_path, len(wg))
+            logging.info("tb_prop live weather_source kind=%s path=%s rows=%s", weather_source_kind, weather_source_path, len(wg))
             if "game_pk" in wg.columns:
                 wg["game_pk"] = pd.to_numeric(wg["game_pk"], errors="coerce").astype("Int64")
                 keep = [c for c in ["game_pk", "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"] if c in wg.columns]
@@ -437,10 +438,10 @@ def main() -> None:
                             g[c] = pd.to_numeric(g.get(c), errors="coerce").fillna(pd.to_numeric(g.get(f"{c}_wg"), errors="coerce"))
                             g = g.drop(columns=[f"{c}_wg"], errors="ignore")
         except Exception:
-            logging.exception("hit_prop live optional weather join failed; continuing")
+            logging.exception("tb_prop live optional weather join failed; continuing")
     else:
         logging.warning(
-            "hit_prop live optional weather table missing checked processed_live=%s raw_live=%s fallback=%s",
+            "tb_prop live optional weather table missing checked processed_live=%s raw_live=%s fallback=%s",
             weather_live_processed_path,
             weather_live_raw_path,
             weather_fallback_path,
@@ -459,9 +460,9 @@ def main() -> None:
                     g["park_factor_hits_hist"] = pd.to_numeric(g.get("park_factor_hits_hist"), errors="coerce").fillna(pd.to_numeric(g.get("park_factor_hits_hist_p"), errors="coerce"))
                     g = g.drop(columns=["_park_join_key", "park_factor_hits_hist_p"], errors="ignore")
         except Exception:
-            logging.exception("hit_prop live optional parks join failed; continuing")
+            logging.exception("tb_prop live optional parks join failed; continuing")
     else:
-        logging.warning("hit_prop live optional parks table missing: %s", parks_path)
+        logging.warning("tb_prop live optional parks table missing: %s", parks_path)
 
 
     if parks_dyn_path.exists():
@@ -476,9 +477,9 @@ def main() -> None:
                 g = g.merge(pdyn[keep].drop_duplicates(subset=["_park_join_key"], keep="last"), on="_park_join_key", how="left")
                 g = g.drop(columns=["_park_join_key"], errors="ignore")
         except Exception:
-            logging.exception("hit_prop live optional dynamic parks join failed; continuing")
+            logging.exception("tb_prop live optional dynamic parks join failed; continuing")
     else:
-        logging.warning("hit_prop live optional dynamic parks table missing: %s", parks_dyn_path)
+        logging.warning("tb_prop live optional dynamic parks table missing: %s", parks_dyn_path)
 
     confirmed = pd.DataFrame()
     if confirmed_lineup_path.exists():
@@ -541,23 +542,23 @@ def main() -> None:
         )
 
     by_season_dir = dirs["marts_dir"] / "by_season"
-    feature_files = sorted(glob.glob(str(by_season_dir / "hitter_props_features_*.parquet")))
+    feature_files = sorted(glob.glob(str(by_season_dir / "tb_prop_features_*.parquet")))
     if len(feature_files) == 0:
-        feature_files = sorted(glob.glob(str(dirs["marts_dir"] / "hitter_props_features_*.parquet")))
+        feature_files = sorted(glob.glob(str(dirs["marts_dir"] / "tb_prop_features_*.parquet")))
     if len(feature_files) == 0:
-        raise ValueError("No hitter_props_features_* files found")
+        raise ValueError("No tb_prop_features_* files found")
     df_features = pd.concat([pd.read_parquet(fp).copy() for fp in feature_files], ignore_index=True, sort=False)
-    logging.info("hit_prop live feature_files_loaded=%s", feature_files)
-    logging.info("hit_prop live feature_rows_total=%s", len(df_features))
+    logging.info("tb_prop live feature_files_loaded=%s", feature_files)
+    logging.info("tb_prop live feature_rows_total=%s", len(df_features))
     if "season" in df_features.columns:
-        logging.info("hit_prop live feature_counts_by_season=%s", df_features["season"].value_counts(dropna=False).to_dict())
+        logging.info("tb_prop live feature_counts_by_season=%s", df_features["season"].value_counts(dropna=False).to_dict())
     elif "_season" in df_features.columns:
-        logging.info("hit_prop live feature_counts_by_season=%s", df_features["_season"].value_counts(dropna=False).to_dict())
+        logging.info("tb_prop live feature_counts_by_season=%s", df_features["_season"].value_counts(dropna=False).to_dict())
     df_lineups = selected.copy()
     if "batter_id" not in df_lineups.columns:
         raise ValueError("lineup candidates missing batter_id column before hitter feature join diagnostics")
     if "batter_id" not in df_features.columns:
-        raise ValueError("hitter feature mart missing batter_id column")
+        raise ValueError("tb feature mart missing batter_id column")
     df_lineups["batter_id"] = pd.to_numeric(df_lineups["batter_id"], errors="coerce")
     df_features["batter_id"] = pd.to_numeric(df_features["batter_id"], errors="coerce")
     lineup_batter_sample = df_lineups["batter_id"].dropna().head(10).tolist()
@@ -566,14 +567,14 @@ def main() -> None:
     feature_batter_set = set(df_features["batter_id"].dropna().tolist())
     intersection = lineup_batter_set & feature_batter_set
     logging.info(
-        "hit_prop live batter_id diagnostics lineup_sample=%s feature_sample=%s intersection_count=%s",
+        "tb_prop live batter_id diagnostics lineup_sample=%s feature_sample=%s intersection_count=%s",
         lineup_batter_sample,
         feature_batter_sample,
         len(intersection),
     )
     if len(intersection) == 0:
         raise ValueError(
-            "No overlapping batter_id values between lineups and hitter feature mart. "
+            "No overlapping batter_id values between lineups and tb feature mart. "
             f"lineup_batter_id_sample={lineup_batter_sample} feature_batter_id_sample={feature_batter_sample} "
             f"lineup_batter_id_dtype={df_lineups['batter_id'].dtype} feature_batter_id_dtype={df_features['batter_id'].dtype}"
         )
@@ -589,7 +590,7 @@ def main() -> None:
 
     df_joined = df_lineups[["batter_id"]].dropna().drop_duplicates().merge(df_features, on=["batter_id"], how="inner")
     if df_joined.empty:
-        raise ValueError("No batter_id overlap between lineups and hitter feature mart")
+        raise ValueError("No batter_id overlap between lineups and tb feature mart")
     df_joined["_season_priority"] = np.select(
         [
             pd.to_numeric(df_joined["_feature_season"], errors="coerce") == args.season,
@@ -622,7 +623,7 @@ def main() -> None:
         .to_dict("records")
     )
     logging.info(
-        "hit_prop live feature_row_selection joined_candidate_row_count=%s candidate_counts_by_season=%s selected_current_season_count=%s selected_previous_season_count=%s selected_older_fallback_count=%s final_selected_scoring_row_count=%s sample_batter_season=%s",
+        "tb_prop live feature_row_selection joined_candidate_row_count=%s candidate_counts_by_season=%s selected_current_season_count=%s selected_previous_season_count=%s selected_older_fallback_count=%s final_selected_scoring_row_count=%s sample_batter_season=%s",
         joined_candidate_row_count,
         candidate_counts_by_season,
         selected_current_season_count,
@@ -651,7 +652,7 @@ def main() -> None:
         feature_name_map = pd.Series(dtype="object")
 
     logging.info(
-        "hit_prop live lineup_source_summary confirmed_rows=%s confirmed_games=%s projected_rows=%s projected_games_used=%s fallback_rows=%s fallback_games=%s total_rows=%s total_games=%s",
+        "tb_prop live lineup_source_summary confirmed_rows=%s confirmed_games=%s projected_rows=%s projected_games_used=%s fallback_rows=%s fallback_games=%s total_rows=%s total_games=%s",
         len(confirmed),
         len(confirmed_games),
         len(projected),
@@ -661,10 +662,10 @@ def main() -> None:
         len(selected),
         int(selected["game_pk"].nunique()) if not selected.empty else 0,
     )
-    logging.info("hit_prop live confirmed_lineup_rows=%s", len(confirmed))
-    logging.info("hit_prop live projected_lineup_rows=%s", len(projected_use))
-    logging.info("hit_prop live fallback_lineup_rows=%s", len(fallback))
-    logging.info("hit_prop live final_lineup_candidate_rows=%s", len(selected))
+    logging.info("tb_prop live confirmed_lineup_rows=%s", len(confirmed))
+    logging.info("tb_prop live projected_lineup_rows=%s", len(projected_use))
+    logging.info("tb_prop live fallback_lineup_rows=%s", len(fallback))
+    logging.info("tb_prop live final_lineup_candidate_rows=%s", len(selected))
     if not selected.empty and {"game_pk", "lineup_source"}.issubset(selected.columns):
         per_game = (
             selected[["game_pk", "lineup_source"]]
@@ -674,11 +675,11 @@ def main() -> None:
             .agg(lambda s: ",".join(sorted(set(s))))
             .to_dict()
         )
-        logging.info("hit_prop live lineup_source_by_game=%s", per_game)
+        logging.info("tb_prop live lineup_source_by_game=%s", per_game)
 
     row_count_before_team_join = len(df_scoring)
     df_scoring = df_scoring.merge(team_games, on=["game_pk", "batter_team"], how="left")
-    logging.info("hit_prop live post_selection_team_merge row_count_before=%s row_count_after=%s", row_count_before_team_join, len(df_scoring))
+    logging.info("tb_prop live post_selection_team_merge row_count_before=%s row_count_after=%s", row_count_before_team_join, len(df_scoring))
     if "park_factor_hits_blend" in df_scoring.columns:
         df_scoring["park_factor_hits_blend"] = pd.to_numeric(df_scoring["park_factor_hits_blend"], errors="coerce")
     if "park_factor_hits_hist" in df_scoring.columns:
@@ -703,7 +704,7 @@ def main() -> None:
 
     row_count_before_cur_merge = len(df_scoring)
     df_scoring = df_scoring.merge(cur_ct.reset_index(), on="batter_id", how="left")
-    logging.info("hit_prop live post_selection_batter_merge row_count_before=%s row_count_after=%s", row_count_before_cur_merge, len(df_scoring))
+    logging.info("tb_prop live post_selection_batter_merge row_count_before=%s row_count_after=%s", row_count_before_cur_merge, len(df_scoring))
     if df_selected_features["_feature_season"].eq(args.season).any():
         use_prev = pd.to_numeric(df_scoring["_cur_n"], errors="coerce").fillna(0) < args.min_current_games
     else:
@@ -738,7 +739,7 @@ def main() -> None:
         p_prev = pitcher[pd.to_numeric(pitcher["_season"], errors="coerce") == (args.season - 1)].sort_values("game_date").groupby("pitcher_id").tail(1).set_index("pitcher_id")
         row_count_before_pitcher_merge = len(df_scoring)
         df_scoring = df_scoring.merge(p_cur_ct.reset_index(), left_on="opp_pitcher_id", right_on="pitcher_id", how="left")
-        logging.info("hit_prop live post_selection_pitcher_merge row_count_before=%s row_count_after=%s", row_count_before_pitcher_merge, len(df_scoring))
+        logging.info("tb_prop live post_selection_pitcher_merge row_count_before=%s row_count_after=%s", row_count_before_pitcher_merge, len(df_scoring))
         use_prev_p = pd.to_numeric(df_scoring["_p_cur_n"], errors="coerce").fillna(0) < args.min_current_games
         for c in feats:
             if c.startswith("pit_"):
@@ -771,7 +772,7 @@ def main() -> None:
 
     dup_cols = X.columns[X.columns.duplicated()].tolist()
     if dup_cols:
-        logging.warning("hit_prop live duplicate_columns_detected=%s", dup_cols)
+        logging.warning("tb_prop live duplicate_columns_detected=%s", dup_cols)
         X = X.loc[:, ~X.columns.duplicated(keep="last")].copy()
 
     # scoring matrix remains aligned to trained features only
@@ -786,23 +787,23 @@ def main() -> None:
     X_scoring = X[available_features].copy()
     X_scoring = X_scoring.reindex(columns=feats, fill_value=np.nan)
     logging.info(
-        "hit_prop live feature_availability expected_feature_count=%s available_feature_count=%s missing_feature_count=%s sample_missing_features=%s",
+        "tb_prop live feature_availability expected_feature_count=%s available_feature_count=%s missing_feature_count=%s sample_missing_features=%s",
         len(feats),
         available_feature_count,
         missing_feature_count,
         missing_features[:10],
     )
     logging.info(
-        "hit_prop live season_match_counts current=%s previous=%s older=%s",
+        "tb_prop live season_match_counts current=%s previous=%s older=%s",
         selected_current_season_count,
         selected_previous_season_count,
         selected_older_fallback_count,
     )
-    logging.info("hit_prop live scoring_dataframe_rows=%s", len(df_scoring))
+    logging.info("tb_prop live scoring_dataframe_rows=%s", len(df_scoring))
     if X_scoring.shape[0] == 0:
         raise ValueError("Scoring dataframe unexpectedly empty after selection stage")
-    logging.info("hit_prop live X_scoring_shape rows=%s cols=%s", X_scoring.shape[0], X_scoring.shape[1])
-    logging.info("hit_prop live scoring_feature_count=%s", len(feats))
+    logging.info("tb_prop live X_scoring_shape rows=%s cols=%s", X_scoring.shape[0], X_scoring.shape[1])
+    logging.info("tb_prop live scoring_feature_count=%s", len(feats))
 
     real_slot = int(pd.to_numeric(df_scoring.get("lineup_slot"), errors="coerce").notna().sum()) if "lineup_slot" in df_scoring.columns else 0
     fallback_conf_only = int(((pd.to_numeric(df_scoring.get("lineup_slot"), errors="coerce").isna()) & (pd.to_numeric(df_scoring.get("lineup_confidence"), errors="coerce").notna())).sum()) if "lineup_confidence" in df_scoring.columns else 0
@@ -811,29 +812,39 @@ def main() -> None:
     else:
         expected_ab_proxy = pd.Series(np.nan, index=X.index, dtype="float64")
     ab_non_null = int(expected_ab_proxy.notna().sum())
-    logging.info("hit_prop live lineup_slot_real_count=%s", real_slot)
-    logging.info("hit_prop live lineup_confidence_fallback_only_count=%s", fallback_conf_only)
-    logging.info("hit_prop live expected_ab_proxy_non_null_count=%s", ab_non_null)
+    lineup_slot_coverage = float(pd.to_numeric(df_scoring.get("lineup_slot"), errors="coerce").notna().mean()) if len(df_scoring) else 0.0
+    expected_ab_proxy_coverage = float(expected_ab_proxy.notna().mean()) if len(expected_ab_proxy) else 0.0
+    logging.info("tb_prop live lineup_slot_real_count=%s", real_slot)
+    logging.info("tb_prop live lineup_confidence_fallback_only_count=%s", fallback_conf_only)
+    logging.info("tb_prop live expected_ab_proxy_non_null_count=%s", ab_non_null)
+    logging.info("tb_prop live lineup_slot_coverage=%.4f expected_ab_proxy_coverage=%.4f", lineup_slot_coverage, expected_ab_proxy_coverage)
+    logging.info("tb_prop live live_added_missing_columns_count=%s", missing_feature_count)
 
-    base_hit_probability = model.predict_proba(X_scoring)[:, 1]
+    expected_tb = np.clip(model.predict(X_scoring), 1e-8, None)
+    expected_tb_live = np.clip(
+        expected_tb * (1.0 + 0.06 * (expected_ab_proxy.fillna(4.1) - 4.1)),
+        1e-8,
+        None,
+    )
     weather_adj_multiplier = np.ones(len(df_scoring), dtype="float64")
     if "weather_wind_out" in df_scoring.columns:
-        weather_adj_multiplier = weather_adj_multiplier + 0.01 * pd.to_numeric(df_scoring["weather_wind_out"], errors="coerce").fillna(0.0).to_numpy()
+        weather_adj_multiplier = weather_adj_multiplier + 0.015 * pd.to_numeric(df_scoring["weather_wind_out"], errors="coerce").fillna(0.0).to_numpy()
     if "weather_wind_in" in df_scoring.columns:
-        weather_adj_multiplier = weather_adj_multiplier - 0.01 * pd.to_numeric(df_scoring["weather_wind_in"], errors="coerce").fillna(0.0).to_numpy()
+        weather_adj_multiplier = weather_adj_multiplier - 0.015 * pd.to_numeric(df_scoring["weather_wind_in"], errors="coerce").fillna(0.0).to_numpy()
     if "temperature" in df_scoring.columns:
         temp_delta = (pd.to_numeric(df_scoring["temperature"], errors="coerce").fillna(72.0) - 72.0).to_numpy()
-        weather_adj_multiplier = weather_adj_multiplier + 0.001 * np.clip(temp_delta, -15, 15)
-    weather_adj_multiplier = np.clip(weather_adj_multiplier, 0.96, 1.04)
-    lineup_adjustment_multiplier = 1.0 + 0.015 * (expected_ab_proxy.fillna(4.1) - 4.1)
-    live_adjustment_multiplier = np.clip(lineup_adjustment_multiplier * weather_adj_multiplier, 0.92, 1.08)
-    live_adjusted_hit_probability = np.clip(
-        base_hit_probability * live_adjustment_multiplier,
-        0.01,
-        0.99,
-    )
-    avg_adjustment = float(np.mean(live_adjusted_hit_probability - base_hit_probability)) if len(base_hit_probability) else 0.0
-    logging.info("hit_prop live average_adjustment_applied=%.6f", avg_adjustment)
+        weather_adj_multiplier = weather_adj_multiplier + 0.0015 * np.clip(temp_delta, -15, 15)
+    weather_adj_multiplier = np.clip(weather_adj_multiplier, 0.95, 1.05)
+    expected_tb_live = np.clip(expected_tb_live * weather_adj_multiplier, 1e-8, None)
+    lineup_status = df_scoring.get("lineup_status", pd.Series("", index=df_scoring.index, dtype="object")).astype(str).str.lower()
+    confirmed_boost = np.where(lineup_status.eq("confirmed"), 1.01, 1.0)
+    expected_tb_live = np.clip(expected_tb_live * confirmed_boost, 1e-8, None)
+    lineup_adjustment_multiplier = (1.0 + 0.06 * (expected_ab_proxy.fillna(4.1) - 4.1)) * confirmed_boost
+    live_adjustment_multiplier = lineup_adjustment_multiplier * weather_adj_multiplier
+    base_tb2_probability = poisson_prob_at_least(expected_tb, threshold=2)
+    live_adjusted_tb2_probability = poisson_prob_at_least(expected_tb_live, threshold=2)
+    avg_adjustment = float(np.mean(live_adjusted_tb2_probability - base_tb2_probability)) if len(base_tb2_probability) else 0.0
+    logging.info("tb_prop live average_adjustment_applied=%.6f", avg_adjustment)
 
     # layered player-name resolution: existing non-numeric -> players.parquet -> rolling history -> optional web -> batter_id
     existing_name = _non_numeric_name(df_scoring.get("player_name", pd.Series("", index=df_scoring.index, dtype="object")))
@@ -918,39 +929,55 @@ def main() -> None:
     df_scoring["player_name"] = df_scoring["player_name"].fillna(df_scoring["batter_id"].astype(str))
     unresolved_batter_id_count = int(df_scoring["player_name"].astype(str).str.isnumeric().sum())
     logging.info(
-        "hit_prop live player_name_resolution_non_numeric_count=%s unresolved_batter_id_count=%s",
+        "tb_prop live player_name_resolution_non_numeric_count=%s unresolved_batter_id_count=%s",
         int((~df_scoring["player_name"].astype(str).str.isnumeric()).sum()),
         unresolved_batter_id_count,
     )
 
-    out = df_scoring[[c for c in ["player_name", "batter_id", "batter_team", "opponent_team", "lineup_slot", "expected_batting_order_pa", "lineup_confidence"] if c in df_scoring.columns]].copy()
-    out["bat_ab_per_game_roll15"] = pd.to_numeric(X["bat_ab_per_game_roll15"], errors="coerce") if "bat_ab_per_game_roll15" in X.columns else pd.Series(np.nan, index=out.index, dtype="float64")
-    out["expected_ab_proxy"] = expected_ab_proxy
-    out["base_hit_probability"] = base_hit_probability
-    out["live_adjusted_hit_probability"] = live_adjusted_hit_probability
+    out = df_scoring[
+        [
+            c
+            for c in [
+                "game_pk",
+                "game_date",
+                "batter_team",
+                "opponent_team",
+                "player_name",
+                "batter_id",
+                "lineup_slot",
+                "lineup_status",
+                "lineup_source",
+            ]
+            if c in df_scoring.columns
+        ]
+    ].copy()
+    out["expected_tb"] = expected_tb
+    out["expected_tb_live"] = expected_tb_live
+    out["base_tb2_probability"] = base_tb2_probability
+    out["live_adjusted_tb2_probability"] = live_adjusted_tb2_probability
     out["model_feature_count"] = int(len(feats))
     out["model_feature_match_count"] = int(available_feature_count)
     out["season_source_used"] = pd.to_numeric(out["batter_id"], errors="coerce").map(season_source_map).fillna(pd.NA)
     out["live_adjustment_multiplier"] = live_adjustment_multiplier
     out["weather_adjustment_applied"] = (np.abs(weather_adj_multiplier - 1.0) > 1e-9).astype(int)
     out["lineup_adjustment_applied"] = (np.abs(lineup_adjustment_multiplier - 1.0) > 1e-9).astype(int)
-    out["grade"] = out["live_adjusted_hit_probability"].map(_grade)
+    out["grade"] = out["live_adjusted_tb2_probability"].map(_grade)
     logging.info(
-        "hit_prop live board_identity non_null_player_name_count=%s non_null_batter_id_count=%s sample_rows=%s",
+        "tb_prop live board_identity non_null_player_name_count=%s non_null_batter_id_count=%s sample_rows=%s",
         int(out["player_name"].astype(str).str.strip().ne("").sum()) if "player_name" in out.columns else 0,
         int(pd.to_numeric(out.get("batter_id"), errors="coerce").notna().sum()) if "batter_id" in out.columns else 0,
-        out[[c for c in ["player_name", "batter_id", "live_adjusted_hit_probability"] if c in out.columns]].head(5).to_dict("records"),
+        out[[c for c in ["player_name", "batter_id", "live_adjusted_tb2_probability"] if c in out.columns]].head(5).to_dict("records"),
     )
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out_dir = dirs["outputs_dir"] / "hit_prop"
+    out_dir = dirs["outputs_dir"] / "tb_prop"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"hit_prop_board_{args.season}_{args.date}_{ts}.csv"
-    out.sort_values("live_adjusted_hit_probability", ascending=False, kind="mergesort").to_csv(out_path, index=False)
+    out_path = out_dir / f"tb_prop_board_{args.season}_{args.date}_{ts}.csv"
+    out.sort_values("live_adjusted_tb2_probability", ascending=False, kind="mergesort").to_csv(out_path, index=False)
 
-    print("\nJOE PLUMBER 1+ HIT BOARD")
-    for _, r in out.sort_values("live_adjusted_hit_probability", ascending=False, kind="mergesort").head(30).iterrows():
-        print(f"{str(r.get('player_name','')):<24} {100*float(r['live_adjusted_hit_probability']):>5.1f}%  {r['grade']}")
+    print("\nJOE PLUMBER TB BOARD")
+    for _, r in out.sort_values("live_adjusted_tb2_probability", ascending=False, kind="mergesort").head(30).iterrows():
+        print(f"{str(r.get('player_name','')):<24} {100*float(r['live_adjusted_tb2_probability']):>5.1f}%  {r['grade']}")
     print(f"\nboard_out={out_path}")
 
 
