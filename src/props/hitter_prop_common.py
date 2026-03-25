@@ -6,7 +6,8 @@ import numpy as np
 import pandas as pd
 
 SAFE_ENGINEERED_COLS = {
-    "lineup_slot", "expected_batting_order_pa", "lineup_confidence", "bat_ab_per_game_roll15", "bat_pa_per_game_roll15", "expected_ab_proxy",
+    "lineup_slot", "lineup_slot_numeric", "lineup_bucket_top", "lineup_bucket_mid", "lineup_bucket_bottom",
+    "expected_batting_order_pa", "lineup_confidence", "bat_ab_per_game_roll15", "bat_pa_per_game_roll15", "expected_ab_proxy",
     "park_factor_hits_hist_shrunk", "park_factor_runs_hist_shrunk", "park_factor_xbh_hist_shrunk", "park_factor_babip_hist", "park_factor_avg_launch_speed_hist", "park_factor_avg_launch_angle_hist",
     "park_factor_hits_2026_roll", "park_factor_hr_2026_roll", "park_factor_xbh_2026_roll", "park_factor_runs_2026_roll", "park_factor_babip_2026_roll", "park_factor_avg_launch_speed_2026_roll", "park_factor_avg_launch_angle_2026_roll",
     "park_factor_dynamic_weight", "park_factor_hist_weight", "dynamic_sample_confidence",
@@ -14,6 +15,7 @@ SAFE_ENGINEERED_COLS = {
     "temperature", "wind_speed", "weather_wind_out", "weather_wind_in",
 }
 ROLL_SUFFIXES = ("_roll3", "_roll7", "_roll15", "_roll30")
+LINEUP_PA_MAP = {1: 4.65, 2: 4.55, 3: 4.45, 4: 4.35, 5: 4.25, 6: 4.10, 7: 3.95, 8: 3.80, 9: 3.70}
 
 
 def season_series(df: pd.DataFrame) -> pd.Series:
@@ -50,6 +52,17 @@ def select_safe_numeric_features(
             dropped_all_null.append(c)
 
     return keep, unsafe_features, dropped_all_null
+
+
+def coerce_lineup_slot_numeric(df: pd.DataFrame) -> pd.Series:
+    for c in ["lineup_slot_numeric", "lineup_slot", "bat_order", "batting_order", "lineup_position", "order"]:
+        if c in df.columns:
+            return pd.to_numeric(df[c], errors="coerce")
+    return pd.Series(np.nan, index=df.index, dtype="float64")
+
+
+def lineup_expected_pa_from_slot(slot: pd.Series) -> pd.Series:
+    return pd.to_numeric(slot, errors="coerce").map(LINEUP_PA_MAP)
 
 
 def poisson_prob_at_least(mu: float | pd.Series | np.ndarray, threshold: int) -> float | pd.Series | np.ndarray:

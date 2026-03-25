@@ -19,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.props.hitter_prop_common import filter_season_range, poisson_prob_at_least, season_series, select_safe_numeric_features
+from src.props.hitter_prop_common import coerce_lineup_slot_numeric, filter_season_range, poisson_prob_at_least, season_series, select_safe_numeric_features
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
 from src.utils.logging import configure_logging, log_header
@@ -51,6 +51,17 @@ def _cal_bins(y_tb2: pd.Series, p_tb2: pd.Series, bins: int = 10) -> pd.DataFram
     )
 
 
+def _qstats(arr: np.ndarray) -> dict[str, float]:
+    if len(arr) == 0:
+        return {}
+    return {
+        "p10": float(np.quantile(arr, 0.10)),
+        "p50": float(np.quantile(arr, 0.50)),
+        "p90": float(np.quantile(arr, 0.90)),
+        "p99": float(np.quantile(arr, 0.99)),
+    }
+
+
 def main() -> None:
     args = parse_args()
     repo_root = get_repo_root()
@@ -63,6 +74,7 @@ def main() -> None:
 
     mart_path = dirs["marts_dir"] / "tb_prop_features.parquet"
     df = pd.read_parquet(mart_path).copy()
+    df["lineup_slot_numeric"] = coerce_lineup_slot_numeric(df)
     if TARGET not in df.columns:
         raise ValueError("Missing target_tb in mart")
 
@@ -93,6 +105,9 @@ def main() -> None:
 
     expected_tb = np.clip(pipe.predict(X_test), 1e-8, None)
     tb2_prob = poisson_prob_at_least(expected_tb, threshold=2)
+    naive_mu = float(np.clip(y_train.mean(), 1e-8, None))
+    naive_expected_tb = np.full(shape=len(y_test), fill_value=naive_mu, dtype=float)
+    naive_tb2_prob = poisson_prob_at_least(naive_expected_tb, threshold=2)
 
     scored = test.copy()
     scored["expected_tb"] = expected_tb
@@ -101,16 +116,28 @@ def main() -> None:
 
     top_cut = np.quantile(tb2_prob, 0.9) if len(tb2_prob) else 1.0
     top_decile = scored[scored["tb_2_plus_probability"] >= top_cut]
+    naive_top_cut = np.quantile(naive_tb2_prob, 0.9) if len(naive_tb2_prob) else 1.0
+    naive_top_decile = scored[pd.Series(naive_tb2_prob, index=scored.index) >= naive_top_cut]
+    model_dev = float(mean_poisson_deviance(y_test, expected_tb))
+    naive_dev = float(mean_poisson_deviance(y_test, naive_expected_tb))
+    top_decile_rate = float(pd.to_numeric(top_decile["target_tb_2_plus"], errors="coerce").mean()) if len(top_decile) else None
+    naive_top_decile_rate = float(pd.to_numeric(naive_top_decile["target_tb_2_plus"], errors="coerce").mean()) if len(naive_top_decile) else None
 
     metrics = {
         "mae": float(mean_absolute_error(y_test, expected_tb)),
         "rmse": float(np.sqrt(mean_squared_error(y_test, expected_tb))),
-        "mean_poisson_deviance": float(mean_poisson_deviance(y_test, expected_tb)),
+        "mean_poisson_deviance": model_dev,
+        "mean_poisson_deviance_naive": naive_dev,
+        "mean_poisson_deviance_lift_vs_naive": float(naive_dev - model_dev),
         "tb_2_plus_rate_test": float((y_test >= 2).mean()),
-        "top_decile_tb_2_plus_rate": float(pd.to_numeric(top_decile["target_tb_2_plus"], errors="coerce").mean()) if len(top_decile) else None,
+        "top_decile_tb_2_plus_rate": top_decile_rate,
+        "top_decile_tb_2_plus_rate_naive": naive_top_decile_rate,
+        "top_decile_tb_2_plus_rate_lift_vs_naive": (top_decile_rate - naive_top_decile_rate) if (top_decile_rate is not None and naive_top_decile_rate is not None) else None,
         "n_train": int(len(train)),
         "n_test": int(len(test)),
         "feature_count": int(len(feats)),
+        "expected_tb_quantiles": _qstats(expected_tb),
+        "tb2_probability_quantiles": _qstats(np.asarray(tb2_prob, dtype=float)),
     }
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -137,6 +164,7 @@ def main() -> None:
     scored.to_csv(scored_path, index=False)
 
     logging.info("eval_tb_prop complete metrics=%s", metrics)
+    logging.info("eval_tb_prop board_separation expected_tb=%s tb2_probability=%s", metrics["expected_tb_quantiles"], metrics["tb2_probability_quantiles"])
     print(f"eval_json={json_path}")
 
 

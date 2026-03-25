@@ -616,6 +616,7 @@ def main() -> None:
         ).sum()
     )
     final_selected_scoring_row_count = len(df_selected_features)
+    season_source_map = df_selected_features.set_index("batter_id")["_feature_season"] if "_feature_season" in df_selected_features.columns else pd.Series(dtype="float64")
     sample_selected = (
         df_selected_features[["batter_id", "_feature_season"]]
         .head(10)
@@ -792,6 +793,12 @@ def main() -> None:
         missing_feature_count,
         missing_features[:10],
     )
+    logging.info(
+        "tb_prop live season_match_counts current=%s previous=%s older=%s",
+        selected_current_season_count,
+        selected_previous_season_count,
+        selected_older_fallback_count,
+    )
     logging.info("tb_prop live scoring_dataframe_rows=%s", len(df_scoring))
     if X_scoring.shape[0] == 0:
         raise ValueError("Scoring dataframe unexpectedly empty after selection stage")
@@ -805,9 +812,13 @@ def main() -> None:
     else:
         expected_ab_proxy = pd.Series(np.nan, index=X.index, dtype="float64")
     ab_non_null = int(expected_ab_proxy.notna().sum())
+    lineup_slot_coverage = float(pd.to_numeric(df_scoring.get("lineup_slot"), errors="coerce").notna().mean()) if len(df_scoring) else 0.0
+    expected_ab_proxy_coverage = float(expected_ab_proxy.notna().mean()) if len(expected_ab_proxy) else 0.0
     logging.info("tb_prop live lineup_slot_real_count=%s", real_slot)
     logging.info("tb_prop live lineup_confidence_fallback_only_count=%s", fallback_conf_only)
     logging.info("tb_prop live expected_ab_proxy_non_null_count=%s", ab_non_null)
+    logging.info("tb_prop live lineup_slot_coverage=%.4f expected_ab_proxy_coverage=%.4f", lineup_slot_coverage, expected_ab_proxy_coverage)
+    logging.info("tb_prop live live_added_missing_columns_count=%s", missing_feature_count)
 
     expected_tb = np.clip(model.predict(X_scoring), 1e-8, None)
     expected_tb_live = np.clip(
@@ -815,6 +826,9 @@ def main() -> None:
         1e-8,
         None,
     )
+    lineup_status = df_scoring.get("lineup_status", pd.Series("", index=df_scoring.index, dtype="object")).astype(str).str.lower()
+    confirmed_boost = np.where(lineup_status.eq("confirmed"), 1.01, 1.0)
+    expected_tb_live = np.clip(expected_tb_live * confirmed_boost, 1e-8, None)
     base_tb2_probability = poisson_prob_at_least(expected_tb, threshold=2)
     live_adjusted_tb2_probability = poisson_prob_at_least(expected_tb_live, threshold=2)
     avg_adjustment = float(np.mean(live_adjusted_tb2_probability - base_tb2_probability)) if len(base_tb2_probability) else 0.0
@@ -929,6 +943,9 @@ def main() -> None:
     out["expected_tb_live"] = expected_tb_live
     out["base_tb2_probability"] = base_tb2_probability
     out["live_adjusted_tb2_probability"] = live_adjusted_tb2_probability
+    out["model_feature_count"] = int(len(feats))
+    out["model_feature_match_count"] = int(available_feature_count)
+    out["season_source_used"] = pd.to_numeric(out["batter_id"], errors="coerce").map(season_source_map).fillna(pd.NA)
     out["grade"] = out["live_adjusted_tb2_probability"].map(_grade)
     logging.info(
         "tb_prop live board_identity non_null_player_name_count=%s non_null_batter_id_count=%s sample_rows=%s",
