@@ -252,6 +252,7 @@ def _build_fallback_lineups(
     b["_pa"] = pd.to_numeric(b[pa_col], errors="coerce") if pa_col else np.nan
     b["_old_slot"] = pd.to_numeric(b[old_slot_col], errors="coerce") if old_slot_col else np.nan
     b["game_date"] = pd.to_datetime(b.get("game_date"), errors="coerce")
+    b = b[b["batter_id"].notna()].copy()
     b = b.sort_values(["game_date", "_pa"], ascending=[False, False], kind="mergesort")
     b = b.groupby(["batter_team", "batter_id"], as_index=False).head(1)
 
@@ -322,6 +323,15 @@ def _build_fallback_lineups(
     if "game_pk" not in out.columns:
         out["game_pk"] = pd.NA
     out = out[[c for c in ["game_pk", "batter_team", "batter_id", "player_name", "lineup_slot", "lineup_status", "lineup_source"] if c in out.columns]]
+    out["batter_id"] = pd.to_numeric(out.get("batter_id"), errors="coerce").astype("Int64")
+    out["player_name"] = out["player_name"].astype(str).where(out["player_name"].astype(str).str.strip() != "", out["batter_id"].astype(str))
+    non_null_batter_id_count = int(out["batter_id"].notna().sum()) if "batter_id" in out.columns else 0
+    unique_batter_id_count = int(out["batter_id"].dropna().nunique()) if "batter_id" in out.columns else 0
+    logging.info(
+        "fallback diagnostics non_null_batter_id_count=%s unique_batter_id_count=%s",
+        non_null_batter_id_count,
+        unique_batter_id_count,
+    )
     logging.info("fallback diagnostics final_fallback_row_count=%s", len(out))
     return out
 
@@ -615,6 +625,21 @@ def main() -> None:
 
     # scoring matrix remains aligned to trained features only
     X_scoring = X.reindex(columns=feats, fill_value=np.nan)
+    if X_scoring.shape[0] == 0:
+        fallback_row_count = len(fallback) if "fallback" in locals() else 0
+        fallback_non_null_batter_id_count = (
+            int(pd.to_numeric(fallback.get("batter_id"), errors="coerce").notna().sum())
+            if (isinstance(fallback, pd.DataFrame) and not fallback.empty and "batter_id" in fallback.columns)
+            else 0
+        )
+        feature_join_row_count = len(board)
+        logging.error(
+            "hit_prop live empty_X_scoring fallback_row_count=%s non_null_batter_id_count=%s feature_join_row_count=%s",
+            fallback_row_count,
+            fallback_non_null_batter_id_count,
+            feature_join_row_count,
+        )
+        raise ValueError("Fallback produced lineup rows but no feature matches found. Likely batter_id mismatch.")
     logging.info("hit_prop live X_scoring_shape rows=%s cols=%s", X_scoring.shape[0], X_scoring.shape[1])
     logging.info("hit_prop live scoring_feature_count=%s", len(feats))
 
