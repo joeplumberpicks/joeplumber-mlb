@@ -90,26 +90,40 @@ def _add_tb_features(df: pd.DataFrame) -> pd.DataFrame:
     _coalesce_numeric(out, "weather_wind_in", ["weather_wind_in", "wind_in", "wind_in_flag"])
 
     # TB-oriented rolling proxies
-    _coalesce_numeric(out, "tb_hits_roll15", ["bat_h_roll15", "h_roll15"])
-    _coalesce_numeric(out, "tb_hr_roll15", ["bat_hr_roll15", "hr_roll15"])
-    _coalesce_numeric(out, "tb_2b_roll15", ["bat_double_roll15", "double_roll15", "bat_2b_roll15", "2b_roll15"])
-    _coalesce_numeric(out, "tb_3b_roll15", ["bat_triple_roll15", "triple_roll15", "bat_3b_roll15", "3b_roll15"])
-    _coalesce_numeric(out, "tb_ab_roll15", ["bat_ab_roll15", "ab_roll15", "at_bats_roll15"])
+    _coalesce_numeric(out, "tb_hits_roll15", ["bat_h_roll15", "h_roll15", "bat_hits_roll15", "hits_roll15"])
+    _coalesce_numeric(out, "tb_hr_roll15", ["bat_hr_roll15", "hr_roll15", "bat_home_runs_roll15", "home_runs_roll15"])
+    _coalesce_numeric(out, "tb_2b_roll15", ["bat_double_roll15", "double_roll15", "bat_2b_roll15", "2b_roll15", "bat_doubles_roll15", "doubles_roll15"])
+    _coalesce_numeric(out, "tb_3b_roll15", ["bat_triple_roll15", "triple_roll15", "bat_3b_roll15", "3b_roll15", "bat_triples_roll15", "triples_roll15"])
+    _coalesce_numeric(out, "tb_ab_roll15", ["bat_ab_roll15", "ab_roll15", "at_bats_roll15", "bat_ab_per_game_roll15"])
+    _coalesce_numeric(out, "tb_pa_roll15", ["bat_pa_roll15", "pa_roll15", "plate_appearances_roll15", "bat_pa_per_game_roll15"])
     _coalesce_numeric(out, "tb_launch_speed_roll15", ["launch_speed_mean_roll15", "bat_launch_speed_mean_roll15"])
     _coalesce_numeric(out, "tb_launch_angle_roll15", ["launch_angle_mean_roll15", "bat_launch_angle_mean_roll15"])
     _coalesce_numeric(out, "tb_whiff_rate_roll30", ["whiff_rate_roll30", "bat_whiff_rate_roll30", "diff_off_whiff_rate_roll30"])
     _coalesce_numeric(out, "tb_contact_rate_roll30", ["contact_rate_roll30", "bat_contact_rate_roll30", "diff_off_contact_rate_roll30"])
+    _coalesce_numeric(out, "tb_contact_rate_roll15", ["contact_rate_roll15", "bat_contact_rate_roll15", "tb_contact_rate_roll30"])
 
     # rate/proxy helpers
-    out["tb_xbh_roll15"] = pd.to_numeric(out["tb_2b_roll15"], errors="coerce").fillna(0.0) + pd.to_numeric(out["tb_3b_roll15"], errors="coerce").fillna(0.0) + pd.to_numeric(out["tb_hr_roll15"], errors="coerce").fillna(0.0)
-    ab15 = pd.to_numeric(out["tb_ab_roll15"], errors="coerce").replace(0, np.nan)
-    h15 = pd.to_numeric(out["tb_hits_roll15"], errors="coerce")
-    hr15 = pd.to_numeric(out["tb_hr_roll15"], errors="coerce")
-    xbh15 = pd.to_numeric(out["tb_xbh_roll15"], errors="coerce")
-    out["tb_hit_rate_proxy"] = h15 / ab15
-    out["tb_xbh_rate_proxy"] = xbh15 / ab15
-    out["tb_iso_proxy"] = ((xbh15 + hr15) / ab15).clip(lower=0)
-    out["tb_weighted_base_event_proxy"] = ((h15 - xbh15).fillna(0.0) + 2.0 * (xbh15 - hr15).fillna(0.0) + 4.0 * hr15.fillna(0.0)) / ab15
+    out["tb_xbh_roll15"] = (
+        pd.to_numeric(out["tb_2b_roll15"], errors="coerce").fillna(0.0)
+        + pd.to_numeric(out["tb_3b_roll15"], errors="coerce").fillna(0.0)
+        + pd.to_numeric(out["tb_hr_roll15"], errors="coerce").fillna(0.0)
+    )
+    pa15 = pd.to_numeric(out["tb_pa_roll15"], errors="coerce")
+    ab15 = pd.to_numeric(out["tb_ab_roll15"], errors="coerce")
+    denom = pa15.where(pa15 > 0, ab15)
+    denom = denom.where(denom > 0, np.nan)
+    h15 = pd.to_numeric(out["tb_hits_roll15"], errors="coerce").fillna(0.0)
+    hr15 = pd.to_numeric(out["tb_hr_roll15"], errors="coerce").fillna(0.0)
+    dbl15 = pd.to_numeric(out["tb_2b_roll15"], errors="coerce").fillna(0.0)
+    trp15 = pd.to_numeric(out["tb_3b_roll15"], errors="coerce").fillna(0.0)
+    xbh15 = pd.to_numeric(out["tb_xbh_roll15"], errors="coerce").fillna(0.0)
+    sing15 = (h15 - xbh15).clip(lower=0)
+    out["tb_hit_rate_proxy"] = (h15 / denom).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    out["tb_xbh_rate_proxy"] = (xbh15 / denom).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    out["tb_iso_proxy"] = out["tb_xbh_rate_proxy"]
+    out["tb_weighted_base_event_proxy"] = (
+        (sing15 + 2.0 * dbl15 + 3.0 * trp15 + 4.0 * hr15) / denom
+    ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     out["tb_slug_proxy"] = out["tb_weighted_base_event_proxy"]
 
     # lineup bucket encoding (numeric-only)
@@ -120,9 +134,25 @@ def _add_tb_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # interactions
     out["contact_quality_x_volume"] = pd.to_numeric(out["tb_launch_speed_roll15"], errors="coerce") * pd.to_numeric(out["expected_ab_proxy"], errors="coerce")
+    fallback_cq = pd.to_numeric(out["tb_contact_rate_roll15"], errors="coerce").fillna(0.0) * pd.to_numeric(out["tb_pa_roll15"], errors="coerce").fillna(0.0)
+    out["contact_quality_x_volume"] = pd.to_numeric(out["contact_quality_x_volume"], errors="coerce").fillna(fallback_cq)
     out["xbh_proxy_x_expected_ab"] = pd.to_numeric(out["tb_xbh_rate_proxy"], errors="coerce") * pd.to_numeric(out["expected_ab_proxy"], errors="coerce")
+    out["xbh_proxy_x_expected_ab"] = pd.to_numeric(out["xbh_proxy_x_expected_ab"], errors="coerce").fillna(
+        pd.to_numeric(out["tb_xbh_rate_proxy"], errors="coerce") * pd.to_numeric(out["tb_pa_roll15"], errors="coerce")
+    )
     _coalesce_numeric(out, "park_factor_xbh_proxy", ["park_factor_xbh_blend", "park_factor_xbh_hist_shrunk", "park_factor_hits_blend"])
     out["launch_speed_x_park_factor"] = pd.to_numeric(out["tb_launch_speed_roll15"], errors="coerce") * pd.to_numeric(out["park_factor_xbh_proxy"], errors="coerce")
+    feature_cov_cols = [
+        "tb_hit_rate_proxy",
+        "tb_xbh_rate_proxy",
+        "tb_iso_proxy",
+        "tb_weighted_base_event_proxy",
+        "contact_quality_x_volume",
+        "xbh_proxy_x_expected_ab",
+    ]
+    cov = {c: float(pd.to_numeric(out.get(c), errors="coerce").notna().mean()) for c in feature_cov_cols if c in out.columns}
+    sample = out[feature_cov_cols].head(5).to_dict("records") if all(c in out.columns for c in feature_cov_cols) else []
+    logging.info("tb_prop_mart engineered_feature_coverage=%s sample=%s", cov, sample)
     return out
 
 
