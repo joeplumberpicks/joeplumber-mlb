@@ -23,6 +23,7 @@ from src.utils.drive import resolve_data_dirs
 from src.utils.logging import configure_logging, log_header
 
 GRADE_THRESHOLDS = [("A+", 0.70), ("A", 0.67), ("A-", 0.64), ("B+", 0.61), ("B", 0.58), ("B-", 0.55), ("C+", 0.52)]
+OPENING_DAY_GRADE_THRESHOLDS = [("A", 0.52), ("B", 0.46), ("C", 0.40)]
 LINEUP_PA_MAP = {1: 4.65, 2: 4.55, 3: 4.45, 4: 4.35, 5: 4.25, 6: 4.10, 7: 3.95, 8: 3.80, 9: 3.70}
 LINEUP_JUNK_TOKENS = ["watch", "tickets", "alerts", "lineup has not been posted", "era"]
 TEAM_TO_CANONICAL = {
@@ -121,6 +122,42 @@ def _grade(p: float) -> str:
         if p >= t:
             return g
     return "C"
+
+
+def _grade_opening_day(p: float) -> str:
+    for g, t in OPENING_DAY_GRADE_THRESHOLDS:
+        if p >= t:
+            return g
+    return "D"
+
+
+def _zscore_clip(series: pd.Series, clip: float = 2.0) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    mu = s.mean()
+    sigma = s.std()
+    if pd.isna(sigma) or float(sigma) <= 1e-9:
+        return pd.Series(0.0, index=s.index, dtype="float64")
+    z = (s - mu) / sigma
+    return z.clip(lower=-clip, upper=clip).fillna(0.0)
+
+
+def _weighted_zscore(df: pd.DataFrame, terms: list[tuple[str, float]], invert: set[str] | None = None) -> tuple[pd.Series, list[str]]:
+    invert = invert or set()
+    score = pd.Series(0.0, index=df.index, dtype="float64")
+    used: list[str] = []
+    total_w = 0.0
+    for col, w in terms:
+        if col not in df.columns:
+            continue
+        z = _zscore_clip(df[col])
+        if col in invert:
+            z = -z
+        score = score + w * z
+        total_w += abs(w)
+        used.append(col)
+    if total_w <= 0:
+        return pd.Series(0.0, index=df.index, dtype="float64"), used
+    return score / total_w, used
 
 
 def _latest_model(models_dir: Path) -> Path:
@@ -636,6 +673,22 @@ def main() -> None:
         logging.info(
             "Opening Day / early-season fallback engaged: using most recent historical feature rows where current-season rows are unavailable."
         )
+    sparse_threshold = max(10, int(0.30 * max(1, final_selected_scoring_row_count)))
+    opening_day_separation_mode = bool(selected_current_season_count == 0 or selected_current_season_count < sparse_threshold)
+    if selected_current_season_count == 0:
+        opening_day_reason = "no_current_season_rows"
+    elif selected_current_season_count < sparse_threshold:
+        opening_day_reason = f"sparse_current_rows_lt_{sparse_threshold}"
+    else:
+        opening_day_reason = "off"
+    logging.info(
+        "tb_prop live opening_day_separation_mode=%s reason=%s selected_current=%s threshold=%s total_selected=%s",
+        opening_day_separation_mode,
+        opening_day_reason,
+        selected_current_season_count,
+        sparse_threshold,
+        final_selected_scoring_row_count,
+    )
     if final_selected_scoring_row_count == 0:
         raise ValueError("No selected scoring rows after season-priority feature selection")
 
@@ -846,6 +899,74 @@ def main() -> None:
     avg_adjustment = float(np.mean(live_adjusted_tb2_probability - base_tb2_probability)) if len(base_tb2_probability) else 0.0
     logging.info("tb_prop live average_adjustment_applied=%.6f", avg_adjustment)
 
+    # Temporary opening-day / early-season separation overlay.
+    hitter_power_score, power_cols = _weighted_zscore(
+        X,
+        [
+            ("tb_slugging_proxy", 0.30),
+            ("tb_power_boost", 0.20),
+            ("tb_xbh_rate", 0.20),
+            ("tb_hr_rate", 0.15),
+            ("tb_launch_speed_roll15", 0.10),
+            ("tb_hits_roll15", 0.05),
+        ],
+    )
+    hitter_contact_score, contact_cols = _weighted_zscore(
+        X,
+        [
+            ("tb_contact_rate_roll30", 0.40),
+            ("tb_contact_rate_roll15", 0.25),
+            ("tb_whiff_rate_roll30", 0.20),
+            ("bat_chase_rate_roll30", 0.15),
+        ],
+        invert={"tb_whiff_rate_roll30", "bat_chase_rate_roll30"},
+    )
+    pitcher_attackability_score, pitch_cols = _weighted_zscore(
+        X,
+        [
+            ("pit_contact_rate_roll30", 0.45),
+            ("pit_whiff_rate_roll30", 0.35),
+            ("pit_k_roll30", 0.20),
+        ],
+        invert={"pit_whiff_rate_roll30", "pit_k_roll30"},
+    )
+    lineup_frame = pd.DataFrame(index=df_scoring.index)
+    lineup_frame["expected_ab_proxy"] = expected_ab_proxy
+    lineup_frame["expected_batting_order_pa"] = pd.to_numeric(df_scoring.get("expected_batting_order_pa"), errors="coerce")
+    lineup_frame["inv_lineup_slot"] = -pd.to_numeric(df_scoring.get("lineup_slot"), errors="coerce")
+    lineup_volume_score, lineup_cols = _weighted_zscore(
+        lineup_frame,
+        [
+            ("expected_ab_proxy", 0.50),
+            ("inv_lineup_slot", 0.35),
+            ("expected_batting_order_pa", 0.15),
+        ],
+    )
+    opening_day_sep_score = (
+        0.35 * hitter_power_score
+        + 0.25 * hitter_contact_score
+        + 0.25 * pitcher_attackability_score
+        + 0.15 * lineup_volume_score
+    )
+    clipped_sep_score = opening_day_sep_score.clip(lower=-1.25, upper=1.25)
+    opening_day_sep_multiplier = 1.0 + 0.12 * clipped_sep_score
+    opening_day_sep_multiplier = opening_day_sep_multiplier.clip(lower=0.85, upper=1.15)
+
+    final_tb2_probability = np.clip(live_adjusted_tb2_probability, 0.10, 0.75)
+    if opening_day_separation_mode:
+        final_tb2_probability = np.clip(live_adjusted_tb2_probability * opening_day_sep_multiplier, 0.10, 0.75)
+
+    def _q(arr: pd.Series | np.ndarray) -> dict[str, float]:
+        a = np.asarray(arr, dtype=float)
+        if len(a) == 0:
+            return {}
+        return {"p10": float(np.quantile(a, 0.10)), "p50": float(np.quantile(a, 0.50)), "p90": float(np.quantile(a, 0.90))}
+
+    logging.info("tb_prop live opening_day_subscore_columns power=%s contact=%s pitcher=%s lineup=%s", power_cols, contact_cols, pitch_cols, lineup_cols)
+    logging.info("tb_prop live opening_day_sep_score_summary=%s", _q(opening_day_sep_score))
+    logging.info("tb_prop live opening_day_sep_multiplier_summary=%s", _q(opening_day_sep_multiplier))
+    logging.info("tb_prop live probability_quantiles base=%s final=%s", _q(base_tb2_probability), _q(final_tb2_probability))
+
     # layered player-name resolution: existing non-numeric -> players.parquet -> rolling history -> optional web -> batter_id
     existing_name = _non_numeric_name(df_scoring.get("player_name", pd.Series("", index=df_scoring.index, dtype="object")))
 
@@ -955,13 +1076,21 @@ def main() -> None:
     out["expected_tb_live"] = expected_tb_live
     out["base_tb2_probability"] = base_tb2_probability
     out["live_adjusted_tb2_probability"] = live_adjusted_tb2_probability
+    out["final_tb2_probability"] = final_tb2_probability
+    out["opening_day_sep_score"] = opening_day_sep_score
+    out["opening_day_sep_multiplier"] = opening_day_sep_multiplier
+    out["opening_day_separation_mode"] = int(opening_day_separation_mode)
     out["model_feature_count"] = int(len(feats))
     out["model_feature_match_count"] = int(available_feature_count)
     out["season_source_used"] = pd.to_numeric(out["batter_id"], errors="coerce").map(season_source_map).fillna(pd.NA)
+    out["expected_ab_proxy"] = expected_ab_proxy
     out["live_adjustment_multiplier"] = live_adjustment_multiplier
     out["weather_adjustment_applied"] = (np.abs(weather_adj_multiplier - 1.0) > 1e-9).astype(int)
     out["lineup_adjustment_applied"] = (np.abs(lineup_adjustment_multiplier - 1.0) > 1e-9).astype(int)
-    out["grade"] = out["live_adjusted_tb2_probability"].map(_grade)
+    if opening_day_separation_mode:
+        out["grade"] = out["final_tb2_probability"].map(_grade_opening_day)
+    else:
+        out["grade"] = out["live_adjusted_tb2_probability"].map(_grade)
     logging.info(
         "tb_prop live board_identity non_null_player_name_count=%s non_null_batter_id_count=%s sample_rows=%s",
         int(out["player_name"].astype(str).str.strip().ne("").sum()) if "player_name" in out.columns else 0,
@@ -973,11 +1102,22 @@ def main() -> None:
     out_dir = dirs["outputs_dir"] / "tb_prop"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"tb_prop_board_{args.season}_{args.date}_{ts}.csv"
-    out.sort_values("live_adjusted_tb2_probability", ascending=False, kind="mergesort").to_csv(out_path, index=False)
+    rank_col = "final_tb2_probability" if opening_day_separation_mode else "live_adjusted_tb2_probability"
+    out_sorted = out.sort_values(rank_col, ascending=False, kind="mergesort").copy()
+    logging.info(
+        "tb_prop live top10_pre_overlay=%s",
+        out.sort_values("live_adjusted_tb2_probability", ascending=False, kind="mergesort")[["player_name", "live_adjusted_tb2_probability"]].head(10).to_dict("records"),
+    )
+    logging.info(
+        "tb_prop live top10_post_overlay=%s",
+        out_sorted[["player_name", "final_tb2_probability"]].head(10).to_dict("records"),
+    )
+    out_sorted.to_csv(out_path, index=False)
 
     print("\nJOE PLUMBER TB BOARD")
-    for _, r in out.sort_values("live_adjusted_tb2_probability", ascending=False, kind="mergesort").head(30).iterrows():
-        print(f"{str(r.get('player_name','')):<24} {100*float(r['live_adjusted_tb2_probability']):>5.1f}%  {r['grade']}")
+    for _, r in out_sorted.head(30).iterrows():
+        pct_col = "final_tb2_probability" if opening_day_separation_mode else "live_adjusted_tb2_probability"
+        print(f"{str(r.get('player_name','')):<24} {100*float(r[pct_col]):>5.1f}%  {r['grade']}")
     print(f"\nboard_out={out_path}")
 
 
