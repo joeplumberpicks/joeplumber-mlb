@@ -119,12 +119,29 @@ def _add_tb_features(df: pd.DataFrame) -> pd.DataFrame:
     xbh15 = pd.to_numeric(out["tb_xbh_roll15"], errors="coerce").fillna(0.0)
     sing15 = (h15 - xbh15).clip(lower=0)
     out["tb_hit_rate_proxy"] = (h15 / denom).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    out["tb_xbh_rate_proxy"] = (xbh15 / denom).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    out["tb_iso_proxy"] = out["tb_xbh_rate_proxy"]
+    out["tb_xbh_rate"] = (xbh15 / denom).replace([np.inf, -np.inf], np.nan).fillna(0.0)
     out["tb_weighted_base_event_proxy"] = (
         (sing15 + 2.0 * dbl15 + 3.0 * trp15 + 4.0 * hr15) / denom
     ).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    out["tb_slug_proxy"] = out["tb_weighted_base_event_proxy"]
+    out["tb_slugging_proxy"] = out["tb_weighted_base_event_proxy"]
+    out["tb_slug_proxy"] = out["tb_slugging_proxy"]
+    out["tb_iso_proxy"] = (out["tb_slugging_proxy"] - out["tb_hit_rate_proxy"]).clip(lower=0.0)
+    out["tb_hr_rate"] = (hr15 / denom).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    out["tb_power_boost"] = out["tb_xbh_rate"] * out["tb_hr_rate"]
+    out["tb_contact_power_interaction"] = (
+        pd.to_numeric(out["tb_contact_rate_roll15"], errors="coerce").fillna(0.0)
+        * pd.to_numeric(out["tb_slugging_proxy"], errors="coerce").fillna(0.0)
+    )
+
+    for c in [
+        "tb_slugging_proxy",
+        "tb_iso_proxy",
+        "tb_xbh_rate",
+        "tb_hr_rate",
+        "tb_power_boost",
+        "tb_contact_power_interaction",
+    ]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.5)
 
     # lineup bucket encoding (numeric-only)
     ls = pd.to_numeric(out["lineup_slot_numeric"], errors="coerce")
@@ -136,15 +153,19 @@ def _add_tb_features(df: pd.DataFrame) -> pd.DataFrame:
     out["contact_quality_x_volume"] = pd.to_numeric(out["tb_launch_speed_roll15"], errors="coerce") * pd.to_numeric(out["expected_ab_proxy"], errors="coerce")
     fallback_cq = pd.to_numeric(out["tb_contact_rate_roll15"], errors="coerce").fillna(0.0) * pd.to_numeric(out["tb_pa_roll15"], errors="coerce").fillna(0.0)
     out["contact_quality_x_volume"] = pd.to_numeric(out["contact_quality_x_volume"], errors="coerce").fillna(fallback_cq)
-    out["xbh_proxy_x_expected_ab"] = pd.to_numeric(out["tb_xbh_rate_proxy"], errors="coerce") * pd.to_numeric(out["expected_ab_proxy"], errors="coerce")
+    out["xbh_proxy_x_expected_ab"] = pd.to_numeric(out["tb_xbh_rate"], errors="coerce") * pd.to_numeric(out["expected_ab_proxy"], errors="coerce")
     out["xbh_proxy_x_expected_ab"] = pd.to_numeric(out["xbh_proxy_x_expected_ab"], errors="coerce").fillna(
-        pd.to_numeric(out["tb_xbh_rate_proxy"], errors="coerce") * pd.to_numeric(out["tb_pa_roll15"], errors="coerce")
+        pd.to_numeric(out["tb_xbh_rate"], errors="coerce") * pd.to_numeric(out["tb_pa_roll15"], errors="coerce")
     )
     _coalesce_numeric(out, "park_factor_xbh_proxy", ["park_factor_xbh_blend", "park_factor_xbh_hist_shrunk", "park_factor_hits_blend"])
     out["launch_speed_x_park_factor"] = pd.to_numeric(out["tb_launch_speed_roll15"], errors="coerce") * pd.to_numeric(out["park_factor_xbh_proxy"], errors="coerce")
     feature_cov_cols = [
         "tb_hit_rate_proxy",
-        "tb_xbh_rate_proxy",
+        "tb_xbh_rate",
+        "tb_hr_rate",
+        "tb_power_boost",
+        "tb_contact_power_interaction",
+        "tb_slugging_proxy",
         "tb_iso_proxy",
         "tb_weighted_base_event_proxy",
         "contact_quality_x_volume",
@@ -152,6 +173,14 @@ def _add_tb_features(df: pd.DataFrame) -> pd.DataFrame:
     ]
     cov = {c: float(pd.to_numeric(out.get(c), errors="coerce").notna().mean()) for c in feature_cov_cols if c in out.columns}
     sample = out[feature_cov_cols].head(5).to_dict("records") if all(c in out.columns for c in feature_cov_cols) else []
+    slug_stats = pd.to_numeric(out.get("tb_slugging_proxy"), errors="coerce")
+    logging.info(
+        "tb_prop_mart slugging_proxy_stats mean=%.6f std=%.6f min=%.6f max=%.6f",
+        float(slug_stats.mean()),
+        float(slug_stats.std()),
+        float(slug_stats.min()),
+        float(slug_stats.max()),
+    )
     logging.info("tb_prop_mart engineered_feature_coverage=%s sample=%s", cov, sample)
     return out
 
@@ -197,7 +226,8 @@ def main() -> None:
         target_mean = float(pd.to_numeric(merged.get("target_tb"), errors="coerce").mean()) if matched_rows else 0.0
         engineered = [
             "lineup_slot_numeric", "expected_batting_order_pa", "expected_ab_proxy", "temperature", "wind_speed",
-            "tb_hit_rate_proxy", "tb_xbh_rate_proxy", "tb_iso_proxy", "tb_weighted_base_event_proxy",
+            "tb_hit_rate_proxy", "tb_xbh_rate", "tb_iso_proxy", "tb_weighted_base_event_proxy", "tb_slugging_proxy",
+            "tb_hr_rate", "tb_power_boost", "tb_contact_power_interaction",
             "contact_quality_x_volume", "xbh_proxy_x_expected_ab", "launch_speed_x_park_factor",
         ]
         engineered_non_null = {c: float(pd.to_numeric(merged.get(c), errors="coerce").notna().mean()) for c in engineered if c in merged.columns}

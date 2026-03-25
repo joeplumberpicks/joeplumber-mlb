@@ -46,7 +46,9 @@ def select_safe_numeric_features(
         safe_cols.update(extra_safe_cols)
 
     numeric_features = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in excluded]
-    unsafe_features = [c for c in numeric_features if not (c in safe_cols or c.endswith(ROLL_SUFFIXES))]
+    unsafe_features = [
+        c for c in numeric_features if not (c in safe_cols or c.endswith(ROLL_SUFFIXES) or c.startswith("tb_"))
+    ]
     if exclude_live_only:
         unsafe_features = unsafe_features + [c for c in numeric_features if c in LIVE_ONLY_FEATURE_NAMES and c not in unsafe_features]
     candidate = [c for c in numeric_features if c not in unsafe_features]
