@@ -510,10 +510,19 @@ def main() -> None:
             f"slate_teams={slate_team_list} batter_teams_available={batter_teams_available}"
         )
 
-    hitter_props_features_path = dirs["marts_dir"] / "hitter_props_features.parquet"
-    if not hitter_props_features_path.exists():
-        raise FileNotFoundError(f"hitter feature mart not found: {hitter_props_features_path}")
-    df_features = pd.read_parquet(hitter_props_features_path).copy()
+    feature_paths = [
+        dirs["marts_dir"] / f"hitter_props_features_{args.season}.parquet",
+        dirs["marts_dir"] / f"hitter_props_features_{args.season - 1}.parquet",
+        dirs["marts_dir"] / "hitter_props_features.parquet",
+    ]
+    existing_feature_paths = []
+    for p in feature_paths:
+        if p.exists() and p not in existing_feature_paths:
+            existing_feature_paths.append(p)
+    if not existing_feature_paths:
+        raise FileNotFoundError(f"hitter feature mart not found in any expected path: {feature_paths}")
+    df_features = pd.concat([pd.read_parquet(p).copy() for p in existing_feature_paths], ignore_index=True, sort=False)
+    logging.info("hit_prop live feature_mart_sources=%s total_rows=%s", [str(p) for p in existing_feature_paths], len(df_features))
     df_lineups = selected.copy()
     if "batter_id" not in df_lineups.columns:
         raise ValueError("lineup candidates missing batter_id column before hitter feature join diagnostics")
@@ -538,9 +547,10 @@ def main() -> None:
             f"lineup_batter_id_sample={lineup_batter_sample} feature_batter_id_sample={feature_batter_sample} "
             f"lineup_batter_id_dtype={df_lineups['batter_id'].dtype} feature_batter_id_dtype={df_features['batter_id'].dtype}"
         )
-    feature_season_col = _pick(list(df_features.columns), ["season", "_season"])
-    if feature_season_col is not None:
-        df_features["_feature_season"] = pd.to_numeric(df_features[feature_season_col], errors="coerce")
+    if "_season" in df_features.columns:
+        df_features["_feature_season"] = pd.to_numeric(df_features["_season"], errors="coerce")
+    elif "season" in df_features.columns:
+        df_features["_feature_season"] = pd.to_numeric(df_features["season"], errors="coerce")
     elif "game_date" in df_features.columns:
         df_features["_feature_season"] = pd.to_datetime(df_features["game_date"], errors="coerce").dt.year
     else:
@@ -600,6 +610,11 @@ def main() -> None:
     selected = selected[pd.to_numeric(selected["batter_id"], errors="coerce").isin(df_selected_features["batter_id"].dropna().unique().tolist())].copy()
     selected_feature_by_batter = df_selected_features.set_index("batter_id")
     df_scoring = selected.copy()
+    feature_name_col = _pick(list(df_selected_features.columns), ["player_name", "batter_name", "name"])
+    if feature_name_col:
+        feature_name_map = df_selected_features.set_index("batter_id")[feature_name_col]
+    else:
+        feature_name_map = pd.Series(dtype="object")
 
     logging.info(
         "hit_prop live lineup_source_summary confirmed_rows=%s confirmed_games=%s projected_rows=%s projected_games_used=%s fallback_rows=%s fallback_games=%s total_rows=%s total_games=%s",
@@ -769,12 +784,30 @@ def main() -> None:
     avg_adjustment = float(np.mean(live_adjusted_hit_probability - base_hit_probability)) if len(base_hit_probability) else 0.0
     logging.info("hit_prop live average_adjustment_applied=%.6f", avg_adjustment)
 
-    out = df_scoring[[c for c in ["player_name", "batter_team", "opponent_team", "lineup_slot", "expected_batting_order_pa", "lineup_confidence"] if c in df_scoring.columns]].copy()
+    lineup_name_series = df_scoring["player_name"] if "player_name" in df_scoring.columns else pd.Series("", index=df_scoring.index, dtype="object")
+    scoring_name_series = lineup_name_series.astype(str).str.strip()
+    feature_name_series = (
+        df_scoring["batter_id"].map(feature_name_map).astype(str).str.strip()
+        if not feature_name_map.empty
+        else pd.Series("", index=df_scoring.index, dtype="object")
+    )
+    fallback_name_series = df_scoring["batter_id"].astype("Int64").astype(str)
+    resolved_name = scoring_name_series.where(scoring_name_series != "", feature_name_series)
+    resolved_name = resolved_name.where(resolved_name != "", fallback_name_series)
+    df_scoring["player_name"] = resolved_name
+
+    out = df_scoring[[c for c in ["player_name", "batter_id", "batter_team", "opponent_team", "lineup_slot", "expected_batting_order_pa", "lineup_confidence"] if c in df_scoring.columns]].copy()
     out["bat_ab_per_game_roll15"] = pd.to_numeric(X["bat_ab_per_game_roll15"], errors="coerce") if "bat_ab_per_game_roll15" in X.columns else pd.Series(np.nan, index=out.index, dtype="float64")
     out["expected_ab_proxy"] = expected_ab_proxy
     out["base_hit_probability"] = base_hit_probability
     out["live_adjusted_hit_probability"] = live_adjusted_hit_probability
     out["grade"] = out["live_adjusted_hit_probability"].map(_grade)
+    logging.info(
+        "hit_prop live board_identity non_null_player_name_count=%s non_null_batter_id_count=%s sample_rows=%s",
+        int(out["player_name"].astype(str).str.strip().ne("").sum()) if "player_name" in out.columns else 0,
+        int(pd.to_numeric(out.get("batter_id"), errors="coerce").notna().sum()) if "batter_id" in out.columns else 0,
+        out[[c for c in ["player_name", "batter_id", "live_adjusted_hit_probability"] if c in out.columns]].head(5).to_dict("records"),
+    )
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = dirs["outputs_dir"] / "hit_prop"
