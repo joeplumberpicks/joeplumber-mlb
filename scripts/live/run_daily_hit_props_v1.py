@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import logging
 import sys
 from datetime import datetime, timezone
@@ -510,19 +511,16 @@ def main() -> None:
             f"slate_teams={slate_team_list} batter_teams_available={batter_teams_available}"
         )
 
-    feature_paths = [
-        dirs["marts_dir"] / f"hitter_props_features_{args.season}.parquet",
-        dirs["marts_dir"] / f"hitter_props_features_{args.season - 1}.parquet",
-        dirs["marts_dir"] / "hitter_props_features.parquet",
-    ]
-    existing_feature_paths = []
-    for p in feature_paths:
-        if p.exists() and p not in existing_feature_paths:
-            existing_feature_paths.append(p)
-    if not existing_feature_paths:
-        raise FileNotFoundError(f"hitter feature mart not found in any expected path: {feature_paths}")
-    df_features = pd.concat([pd.read_parquet(p).copy() for p in existing_feature_paths], ignore_index=True, sort=False)
-    logging.info("hit_prop live feature_mart_sources=%s total_rows=%s", [str(p) for p in existing_feature_paths], len(df_features))
+    feature_files = sorted(glob.glob(str(dirs["marts_dir"] / "hitter_props_features_*.parquet")))
+    if len(feature_files) == 0:
+        raise ValueError("No hitter_props_features_* files found")
+    df_features = pd.concat([pd.read_parquet(fp).copy() for fp in feature_files], ignore_index=True, sort=False)
+    logging.info("hit_prop live feature_files_loaded=%s", feature_files)
+    logging.info("hit_prop live feature_rows_total=%s", len(df_features))
+    if "season" in df_features.columns:
+        logging.info("hit_prop live feature_counts_by_season=%s", df_features["season"].value_counts(dropna=False).to_dict())
+    elif "_season" in df_features.columns:
+        logging.info("hit_prop live feature_counts_by_season=%s", df_features["_season"].value_counts(dropna=False).to_dict())
     df_lineups = selected.copy()
     if "batter_id" not in df_lineups.columns:
         raise ValueError("lineup candidates missing batter_id column before hitter feature join diagnostics")
@@ -610,9 +608,12 @@ def main() -> None:
     selected = selected[pd.to_numeric(selected["batter_id"], errors="coerce").isin(df_selected_features["batter_id"].dropna().unique().tolist())].copy()
     selected_feature_by_batter = df_selected_features.set_index("batter_id")
     df_scoring = selected.copy()
+    if "player_name" in df_scoring.columns:
+        df_scoring["player_name_lineup"] = df_scoring["player_name"]
     feature_name_col = _pick(list(df_selected_features.columns), ["player_name", "batter_name", "name"])
     if feature_name_col:
         feature_name_map = df_selected_features.set_index("batter_id")[feature_name_col]
+        df_scoring["player_name_feature"] = df_scoring["batter_id"].map(feature_name_map)
     else:
         feature_name_map = pd.Series(dtype="object")
 
@@ -784,17 +785,19 @@ def main() -> None:
     avg_adjustment = float(np.mean(live_adjusted_hit_probability - base_hit_probability)) if len(base_hit_probability) else 0.0
     logging.info("hit_prop live average_adjustment_applied=%.6f", avg_adjustment)
 
-    lineup_name_series = df_scoring["player_name"] if "player_name" in df_scoring.columns else pd.Series("", index=df_scoring.index, dtype="object")
-    scoring_name_series = lineup_name_series.astype(str).str.strip()
-    feature_name_series = (
-        df_scoring["batter_id"].map(feature_name_map).astype(str).str.strip()
-        if not feature_name_map.empty
-        else pd.Series("", index=df_scoring.index, dtype="object")
+    if "player_name" not in df_scoring.columns or df_scoring["player_name"].astype(str).str.isnumeric().all():
+        if "player_name_lineup" in df_scoring.columns:
+            df_scoring["player_name"] = df_scoring["player_name_lineup"]
+        elif "player_name_feature" in df_scoring.columns:
+            df_scoring["player_name"] = df_scoring["player_name_feature"]
+    if "player_name_feature" in df_scoring.columns:
+        fallback_mask = df_scoring["player_name"].astype(str).str.strip().eq("") | df_scoring["player_name"].isna()
+        df_scoring.loc[fallback_mask, "player_name"] = df_scoring.loc[fallback_mask, "player_name_feature"]
+    df_scoring["player_name"] = df_scoring["player_name"].fillna(df_scoring["batter_id"].astype(str))
+    logging.info(
+        "hit_prop live player_name_resolution_non_numeric_count=%s",
+        int((~df_scoring["player_name"].astype(str).str.isnumeric()).sum()),
     )
-    fallback_name_series = df_scoring["batter_id"].astype("Int64").astype(str)
-    resolved_name = scoring_name_series.where(scoring_name_series != "", feature_name_series)
-    resolved_name = resolved_name.where(resolved_name != "", fallback_name_series)
-    df_scoring["player_name"] = resolved_name
 
     out = df_scoring[[c for c in ["player_name", "batter_id", "batter_team", "opponent_team", "lineup_slot", "expected_batting_order_pa", "lineup_confidence"] if c in df_scoring.columns]].copy()
     out["bat_ab_per_game_roll15"] = pd.to_numeric(X["bat_ab_per_game_roll15"], errors="coerce") if "bat_ab_per_game_roll15" in X.columns else pd.Series(np.nan, index=out.index, dtype="float64")
