@@ -511,7 +511,10 @@ def main() -> None:
             f"slate_teams={slate_team_list} batter_teams_available={batter_teams_available}"
         )
 
-    feature_files = sorted(glob.glob(str(dirs["marts_dir"] / "hitter_props_features_*.parquet")))
+    by_season_dir = dirs["marts_dir"] / "by_season"
+    feature_files = sorted(glob.glob(str(by_season_dir / "hitter_props_features_*.parquet")))
+    if len(feature_files) == 0:
+        feature_files = sorted(glob.glob(str(dirs["marts_dir"] / "hitter_props_features_*.parquet")))
     if len(feature_files) == 0:
         raise ValueError("No hitter_props_features_* files found")
     df_features = pd.concat([pd.read_parquet(fp).copy() for fp in feature_files], ignore_index=True, sort=False)
