@@ -615,6 +615,7 @@ def main() -> None:
         ).sum()
     )
     final_selected_scoring_row_count = len(df_selected_features)
+    season_source_map = df_selected_features.set_index("batter_id")["_feature_season"] if "_feature_season" in df_selected_features.columns else pd.Series(dtype="float64")
     sample_selected = (
         df_selected_features[["batter_id", "_feature_season"]]
         .head(10)
@@ -791,6 +792,12 @@ def main() -> None:
         missing_feature_count,
         missing_features[:10],
     )
+    logging.info(
+        "hit_prop live season_match_counts current=%s previous=%s older=%s",
+        selected_current_season_count,
+        selected_previous_season_count,
+        selected_older_fallback_count,
+    )
     logging.info("hit_prop live scoring_dataframe_rows=%s", len(df_scoring))
     if X_scoring.shape[0] == 0:
         raise ValueError("Scoring dataframe unexpectedly empty after selection stage")
@@ -809,8 +816,19 @@ def main() -> None:
     logging.info("hit_prop live expected_ab_proxy_non_null_count=%s", ab_non_null)
 
     base_hit_probability = model.predict_proba(X_scoring)[:, 1]
+    weather_adj_multiplier = np.ones(len(df_scoring), dtype="float64")
+    if "weather_wind_out" in df_scoring.columns:
+        weather_adj_multiplier = weather_adj_multiplier + 0.01 * pd.to_numeric(df_scoring["weather_wind_out"], errors="coerce").fillna(0.0).to_numpy()
+    if "weather_wind_in" in df_scoring.columns:
+        weather_adj_multiplier = weather_adj_multiplier - 0.01 * pd.to_numeric(df_scoring["weather_wind_in"], errors="coerce").fillna(0.0).to_numpy()
+    if "temperature" in df_scoring.columns:
+        temp_delta = (pd.to_numeric(df_scoring["temperature"], errors="coerce").fillna(72.0) - 72.0).to_numpy()
+        weather_adj_multiplier = weather_adj_multiplier + 0.001 * np.clip(temp_delta, -15, 15)
+    weather_adj_multiplier = np.clip(weather_adj_multiplier, 0.96, 1.04)
+    lineup_adjustment_multiplier = 1.0 + 0.015 * (expected_ab_proxy.fillna(4.1) - 4.1)
+    live_adjustment_multiplier = np.clip(lineup_adjustment_multiplier * weather_adj_multiplier, 0.92, 1.08)
     live_adjusted_hit_probability = np.clip(
-        base_hit_probability + 0.015 * (expected_ab_proxy.fillna(4.1) - 4.1),
+        base_hit_probability * live_adjustment_multiplier,
         0.01,
         0.99,
     )
@@ -910,6 +928,12 @@ def main() -> None:
     out["expected_ab_proxy"] = expected_ab_proxy
     out["base_hit_probability"] = base_hit_probability
     out["live_adjusted_hit_probability"] = live_adjusted_hit_probability
+    out["model_feature_count"] = int(len(feats))
+    out["model_feature_match_count"] = int(available_feature_count)
+    out["season_source_used"] = pd.to_numeric(out["batter_id"], errors="coerce").map(season_source_map).fillna(pd.NA)
+    out["live_adjustment_multiplier"] = live_adjustment_multiplier
+    out["weather_adjustment_applied"] = (np.abs(weather_adj_multiplier - 1.0) > 1e-9).astype(int)
+    out["lineup_adjustment_applied"] = (np.abs(lineup_adjustment_multiplier - 1.0) > 1e-9).astype(int)
     out["grade"] = out["live_adjusted_hit_probability"].map(_grade)
     logging.info(
         "hit_prop live board_identity non_null_player_name_count=%s non_null_batter_id_count=%s sample_rows=%s",

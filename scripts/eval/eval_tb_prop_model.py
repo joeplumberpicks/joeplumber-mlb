@@ -19,7 +19,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.props.hitter_prop_common import coerce_lineup_slot_numeric, filter_season_range, poisson_prob_at_least, season_series, select_safe_numeric_features
+from src.props.hitter_prop_common import (
+    LIVE_ONLY_FEATURE_NAMES,
+    classify_feature_sets,
+    coerce_lineup_slot_numeric,
+    filter_season_range,
+    poisson_prob_at_least,
+    season_series,
+    select_safe_numeric_features,
+)
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
 from src.utils.logging import configure_logging, log_header
@@ -88,8 +96,11 @@ def main() -> None:
     y_test = pd.to_numeric(test[TARGET], errors="coerce").clip(lower=0)
 
     excluded = {"game_pk", "batter_id", "opp_pitcher_id", "season", TARGET}
-    feats, unsafe_features, dropped_all_null = select_safe_numeric_features(train, excluded=excluded)
+    feats, unsafe_features, dropped_all_null = select_safe_numeric_features(train, excluded=excluded, exclude_live_only=True)
+    historical_feats, _ = classify_feature_sets(feats)
+    live_only_excluded = [c for c in train.columns if c in LIVE_ONLY_FEATURE_NAMES and pd.api.types.is_numeric_dtype(train[c])]
     logging.info("tb_prop eval dropped_unsafe_features_n=%s features=%s", len(unsafe_features), unsafe_features)
+    logging.info("tb_prop eval dropped_live_only_features_n=%s features=%s", len(live_only_excluded), live_only_excluded)
     logging.info("tb_prop eval dropped_all_null_features_n=%s features=%s", len(dropped_all_null), dropped_all_null)
     if not feats:
         raise ValueError("No safe numeric non-null features available for evaluation")
@@ -136,6 +147,10 @@ def main() -> None:
         "n_train": int(len(train)),
         "n_test": int(len(test)),
         "feature_count": int(len(feats)),
+        "historical_feature_count": int(len(historical_feats)),
+        "live_only_features_excluded_count": int(len(live_only_excluded)),
+        "live_only_features_excluded": live_only_excluded,
+        "historical_eval_excludes_live_only": True,
         "expected_tb_quantiles": _qstats(expected_tb),
         "tb2_probability_quantiles": _qstats(np.asarray(tb2_prob, dtype=float)),
     }

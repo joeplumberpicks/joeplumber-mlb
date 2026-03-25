@@ -16,6 +16,11 @@ SAFE_ENGINEERED_COLS = {
 }
 ROLL_SUFFIXES = ("_roll3", "_roll7", "_roll15", "_roll30")
 LINEUP_PA_MAP = {1: 4.65, 2: 4.55, 3: 4.45, 4: 4.35, 5: 4.25, 6: 4.10, 7: 3.95, 8: 3.80, 9: 3.70}
+LIVE_ONLY_FEATURE_NAMES = {
+    "lineup_slot", "lineup_slot_numeric", "expected_batting_order_pa", "expected_ab_proxy",
+    "lineup_confidence", "lineup_status_confirmed", "lineup_status_projected", "lineup_status_fallback",
+    "temperature", "wind_speed", "weather_wind_out", "weather_wind_in",
+}
 
 
 def season_series(df: pd.DataFrame) -> pd.Series:
@@ -34,6 +39,7 @@ def select_safe_numeric_features(
     df: pd.DataFrame,
     excluded: set[str],
     extra_safe_cols: set[str] | None = None,
+    exclude_live_only: bool = False,
 ) -> tuple[list[str], list[str], list[str]]:
     safe_cols = set(SAFE_ENGINEERED_COLS)
     if extra_safe_cols:
@@ -41,6 +47,8 @@ def select_safe_numeric_features(
 
     numeric_features = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in excluded]
     unsafe_features = [c for c in numeric_features if not (c in safe_cols or c.endswith(ROLL_SUFFIXES))]
+    if exclude_live_only:
+        unsafe_features = unsafe_features + [c for c in numeric_features if c in LIVE_ONLY_FEATURE_NAMES and c not in unsafe_features]
     candidate = [c for c in numeric_features if c not in unsafe_features]
 
     keep: list[str] = []
@@ -52,6 +60,12 @@ def select_safe_numeric_features(
             dropped_all_null.append(c)
 
     return keep, unsafe_features, dropped_all_null
+
+
+def classify_feature_sets(columns: list[str]) -> tuple[list[str], list[str]]:
+    live_only = [c for c in columns if c in LIVE_ONLY_FEATURE_NAMES]
+    historical = [c for c in columns if c not in LIVE_ONLY_FEATURE_NAMES]
+    return historical, live_only
 
 
 def coerce_lineup_slot_numeric(df: pd.DataFrame) -> pd.Series:

@@ -20,7 +20,13 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.props.hitter_prop_common import coerce_lineup_slot_numeric, filter_season_range, select_safe_numeric_features
+from src.props.hitter_prop_common import (
+    LIVE_ONLY_FEATURE_NAMES,
+    classify_feature_sets,
+    coerce_lineup_slot_numeric,
+    filter_season_range,
+    select_safe_numeric_features,
+)
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
 from src.utils.logging import configure_logging, log_header
@@ -62,13 +68,16 @@ def main() -> None:
 
     excluded = {"game_pk", "batter_id", "opp_pitcher_id", "season", TARGET}
     numeric_before = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in excluded]
-    features, unsafe_features, dropped_all_null = select_safe_numeric_features(df, excluded=excluded)
+    features, unsafe_features, dropped_all_null = select_safe_numeric_features(df, excluded=excluded, exclude_live_only=True)
+    historical_feats, live_only_feats_present = classify_feature_sets(features)
     retained_engineered = [c for c in features if c.startswith("tb_") or c.startswith("lineup_bucket_") or c.endswith("_x_volume") or c.endswith("_x_expected_ab") or c.endswith("_x_park_factor")]
     null_rates = {c: float(pd.to_numeric(df[c], errors="coerce").isna().mean()) for c in numeric_before}
     top_missing = sorted(null_rates.items(), key=lambda kv: kv[1], reverse=True)[:15]
     logging.info("tb_prop train feature_count_before_filter=%s", len(numeric_before))
     logging.info("tb_prop train feature_count_after_filter=%s", len(features))
+    live_only_excluded = [c for c in numeric_before if c in LIVE_ONLY_FEATURE_NAMES]
     logging.info("tb_prop train dropped_unsafe_features_n=%s features=%s", len(unsafe_features), unsafe_features)
+    logging.info("tb_prop train dropped_live_only_features_n=%s features=%s", len(live_only_excluded), live_only_excluded)
     logging.info("tb_prop train dropped_all_null_features_n=%s features=%s", len(dropped_all_null), dropped_all_null)
     logging.info("tb_prop train retained_engineered_extras_n=%s features=%s", len(retained_engineered), retained_engineered)
     logging.info("tb_prop train top_missing_numeric_features=%s", top_missing)
@@ -135,6 +144,9 @@ def main() -> None:
         "chosen_alpha": best_alpha,
         "alpha_grid_scores_poisson_deviance": alpha_scores,
         "derived_live_probability": "P(TB>=2) via Poisson(lambda=expected_tb)",
+        "historical_feature_count": int(len(historical_feats)),
+        "live_only_features_excluded": live_only_excluded,
+        "live_only_features_excluded_count": int(len(live_only_excluded)),
         "dropped_unsafe_features": unsafe_features,
         "dropped_all_null_features": dropped_all_null,
         "retained_engineered_extras": retained_engineered,
