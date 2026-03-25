@@ -22,6 +22,78 @@ from src.utils.logging import configure_logging, log_header
 GRADE_THRESHOLDS = [("A+", 0.70), ("A", 0.67), ("A-", 0.64), ("B+", 0.61), ("B", 0.58), ("B-", 0.55), ("C+", 0.52)]
 LINEUP_PA_MAP = {1: 4.65, 2: 4.55, 3: 4.45, 4: 4.35, 5: 4.25, 6: 4.10, 7: 3.95, 8: 3.80, 9: 3.70}
 LINEUP_JUNK_TOKENS = ["watch", "tickets", "alerts", "lineup has not been posted", "era"]
+TEAM_TO_CANONICAL = {
+    "ARI": "ARIZONA DIAMONDBACKS",
+    "ARIZONA DIAMONDBACKS": "ARIZONA DIAMONDBACKS",
+    "ATL": "ATLANTA BRAVES",
+    "ATLANTA BRAVES": "ATLANTA BRAVES",
+    "BAL": "BALTIMORE ORIOLES",
+    "BALTIMORE ORIOLES": "BALTIMORE ORIOLES",
+    "BOS": "BOSTON RED SOX",
+    "BOSTON RED SOX": "BOSTON RED SOX",
+    "CHC": "CHICAGO CUBS",
+    "CHICAGO CUBS": "CHICAGO CUBS",
+    "CWS": "CHICAGO WHITE SOX",
+    "CHW": "CHICAGO WHITE SOX",
+    "CHICAGO WHITE SOX": "CHICAGO WHITE SOX",
+    "CIN": "CINCINNATI REDS",
+    "CINCINNATI REDS": "CINCINNATI REDS",
+    "CLE": "CLEVELAND GUARDIANS",
+    "CLEVELAND GUARDIANS": "CLEVELAND GUARDIANS",
+    "COL": "COLORADO ROCKIES",
+    "COLORADO ROCKIES": "COLORADO ROCKIES",
+    "DET": "DETROIT TIGERS",
+    "DETROIT TIGERS": "DETROIT TIGERS",
+    "HOU": "HOUSTON ASTROS",
+    "HOUSTON ASTROS": "HOUSTON ASTROS",
+    "KC": "KANSAS CITY ROYALS",
+    "KCR": "KANSAS CITY ROYALS",
+    "KANSAS CITY ROYALS": "KANSAS CITY ROYALS",
+    "LAA": "LOS ANGELES ANGELS",
+    "ANA": "LOS ANGELES ANGELS",
+    "LOS ANGELES ANGELS": "LOS ANGELES ANGELS",
+    "LAD": "LOS ANGELES DODGERS",
+    "LOS ANGELES DODGERS": "LOS ANGELES DODGERS",
+    "MIA": "MIAMI MARLINS",
+    "FLA": "MIAMI MARLINS",
+    "MIAMI MARLINS": "MIAMI MARLINS",
+    "MIL": "MILWAUKEE BREWERS",
+    "MILWAUKEE BREWERS": "MILWAUKEE BREWERS",
+    "MIN": "MINNESOTA TWINS",
+    "MINNESOTA TWINS": "MINNESOTA TWINS",
+    "NYM": "NEW YORK METS",
+    "NEW YORK METS": "NEW YORK METS",
+    "NYY": "NEW YORK YANKEES",
+    "NEW YORK YANKEES": "NEW YORK YANKEES",
+    "ATH": "OAKLAND ATHLETICS",
+    "OAKLAND ATHLETICS": "OAKLAND ATHLETICS",
+    "PHI": "PHILADELPHIA PHILLIES",
+    "PHILADELPHIA PHILLIES": "PHILADELPHIA PHILLIES",
+    "PIT": "PITTSBURGH PIRATES",
+    "PITTSBURGH PIRATES": "PITTSBURGH PIRATES",
+    "SD": "SAN DIEGO PADRES",
+    "SDP": "SAN DIEGO PADRES",
+    "SAN DIEGO PADRES": "SAN DIEGO PADRES",
+    "SF": "SAN FRANCISCO GIANTS",
+    "SFG": "SAN FRANCISCO GIANTS",
+    "SAN FRANCISCO GIANTS": "SAN FRANCISCO GIANTS",
+    "SEA": "SEATTLE MARINERS",
+    "SEATTLE MARINERS": "SEATTLE MARINERS",
+    "STL": "ST. LOUIS CARDINALS",
+    "SLN": "ST. LOUIS CARDINALS",
+    "ST. LOUIS CARDINALS": "ST. LOUIS CARDINALS",
+    "ST LOUIS CARDINALS": "ST. LOUIS CARDINALS",
+    "TB": "TAMPA BAY RAYS",
+    "TBR": "TAMPA BAY RAYS",
+    "TAMPA BAY RAYS": "TAMPA BAY RAYS",
+    "TEX": "TEXAS RANGERS",
+    "TEXAS RANGERS": "TEXAS RANGERS",
+    "TOR": "TORONTO BLUE JAYS",
+    "TORONTO BLUE JAYS": "TORONTO BLUE JAYS",
+    "WSH": "WASHINGTON NATIONALS",
+    "WSN": "WASHINGTON NATIONALS",
+    "WASHINGTON NATIONALS": "WASHINGTON NATIONALS",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,6 +147,13 @@ def _is_junk_name(name: str) -> bool:
     if " pm " in f" {s} " or " am " in f" {s} " or " et" in f" {s} ":
         return True
     return False
+
+
+def _normalize_team_canonical(team_val: object) -> str | None:
+    tok = str(team_val or "").strip().upper()
+    if not tok:
+        return None
+    return TEAM_TO_CANONICAL.get(tok)
 
 
 def _validate_lineup_rows(df: pd.DataFrame, label: str) -> pd.DataFrame:
@@ -166,26 +245,49 @@ def _build_fallback_lineups(
     if chosen_season is not None:
         b = b[pd.to_numeric(b["_season"], errors="coerce") == chosen_season].copy()
 
-    b["batter_team"] = b[team_col].astype(str).str.upper()
+    b["batter_team"] = b[team_col].astype(str).str.upper().str.strip()
+    b["batter_team_canonical"] = b["batter_team"].map(_normalize_team_canonical)
     b["batter_id"] = pd.to_numeric(b[bid_col], errors="coerce").astype("Int64")
     b["player_name"] = b[name_col].astype(str) if name_col else b["batter_id"].astype(str)
     b["_pa"] = pd.to_numeric(b[pa_col], errors="coerce") if pa_col else np.nan
     b["_old_slot"] = pd.to_numeric(b[old_slot_col], errors="coerce") if old_slot_col else np.nan
     b["game_date"] = pd.to_datetime(b.get("game_date"), errors="coerce")
+    b = b[b["batter_id"].notna()].copy()
     b = b.sort_values(["game_date", "_pa"], ascending=[False, False], kind="mergesort")
     b = b.groupby(["batter_team", "batter_id"], as_index=False).head(1)
 
     slate_team_map = team_games[["game_pk", "batter_team"]].drop_duplicates().copy()
-    slate_team_map["batter_team"] = slate_team_map["batter_team"].astype(str).str.upper()
-    slate_teams = sorted(set(slate_team_map["batter_team"].astype(str).tolist()))
+    slate_team_map["batter_team"] = slate_team_map["batter_team"].astype(str).str.upper().str.strip()
+    slate_team_map["batter_team_canonical"] = slate_team_map["batter_team"].map(_normalize_team_canonical)
+    if "opponent_team" in team_games.columns:
+        slate_teams_long = (
+            team_games[["batter_team", "opponent_team"]]
+            .melt(value_name="slate_team_raw")
+            .drop(columns=["variable"], errors="ignore")
+        )
+    else:
+        slate_teams_long = team_games[["batter_team"]].rename(columns={"batter_team": "slate_team_raw"})
+    slate_teams_long["slate_team_canonical"] = slate_teams_long["slate_team_raw"].astype(str).str.upper().str.strip().map(_normalize_team_canonical)
+    slate_team_canonical = sorted(slate_teams_long["slate_team_canonical"].dropna().unique().tolist())
     logging.info(
-        "fallback diagnostics batter_history_rows=%s unique_batter_teams=%s slate_teams=%s",
+        "fallback diagnostics batter_history_rows=%s batter_team_raw_unique=%s batter_team_canonical_unique=%s slate_team_canonical=%s",
         len(b),
-        int(b["batter_team"].nunique()) if len(b) else 0,
-        slate_teams,
+        sorted(b["batter_team"].dropna().astype(str).unique().tolist()),
+        sorted(b["batter_team_canonical"].dropna().astype(str).unique().tolist()),
+        slate_team_canonical,
     )
-    b = b[b["batter_team"].isin(slate_teams)].copy()
+    b = b[b["batter_team_canonical"].isin(slate_team_canonical)].copy()
     logging.info("fallback diagnostics rows_after_slate_team_filter=%s", len(b))
+    if b.empty:
+        batter_raw_teams = sorted(batter[team_col].astype(str).str.upper().str.strip().dropna().unique().tolist())
+        batter_canonical = sorted(pd.Series(batter_raw_teams).map(_normalize_team_canonical).dropna().unique().tolist())
+        mapping_failures = sorted(pd.Series(batter_raw_teams)[pd.Series(batter_raw_teams).map(_normalize_team_canonical).isna()].unique().tolist())
+        raise ValueError(
+            "Fallback lineup canonical team match produced zero rows. "
+            f"raw_batter_teams={batter_raw_teams} canonical_batter_teams={batter_canonical} "
+            f"slate_team_canonical={slate_team_canonical} mapping_failures={mapping_failures}"
+        )
+    b["batter_team"] = b["batter_team_canonical"]
     b = b.sort_values(["batter_team", "game_date", "_pa", "_old_slot"], ascending=[True, False, False, True], kind="mergesort")
     b["lineup_slot"] = b.groupby("batter_team").cumcount() + 1
     b = b[b["lineup_slot"] <= 9].copy()
@@ -204,7 +306,8 @@ def _build_fallback_lineups(
         game_col = "game_pk"
 
     if "game_pk" in team_games.columns and not team_games.empty:
-        mapped = b.merge(slate_team_map, on="batter_team", how="left", suffixes=("", "_mapped"))
+        canonical_game_map = slate_team_map[["game_pk", "batter_team_canonical"]].drop_duplicates().rename(columns={"game_pk": "game_pk_mapped"})
+        mapped = b.merge(canonical_game_map, on="batter_team_canonical", how="left")
         mapped["game_pk"] = mapped["game_pk_mapped"].where(mapped["game_pk_mapped"].notna(), mapped[game_col] if game_col in mapped.columns else pd.NA)
         b = mapped.drop(columns=["game_pk_mapped"], errors="ignore")
         game_col = "game_pk"
@@ -220,6 +323,15 @@ def _build_fallback_lineups(
     if "game_pk" not in out.columns:
         out["game_pk"] = pd.NA
     out = out[[c for c in ["game_pk", "batter_team", "batter_id", "player_name", "lineup_slot", "lineup_status", "lineup_source"] if c in out.columns]]
+    out["batter_id"] = pd.to_numeric(out.get("batter_id"), errors="coerce").astype("Int64")
+    out["player_name"] = out["player_name"].astype(str).where(out["player_name"].astype(str).str.strip() != "", out["batter_id"].astype(str))
+    non_null_batter_id_count = int(out["batter_id"].notna().sum()) if "batter_id" in out.columns else 0
+    unique_batter_id_count = int(out["batter_id"].dropna().nunique()) if "batter_id" in out.columns else 0
+    logging.info(
+        "fallback diagnostics non_null_batter_id_count=%s unique_batter_id_count=%s",
+        non_null_batter_id_count,
+        unique_batter_id_count,
+    )
     logging.info("fallback diagnostics final_fallback_row_count=%s", len(out))
     return out
 
@@ -398,6 +510,112 @@ def main() -> None:
             f"slate_teams={slate_team_list} batter_teams_available={batter_teams_available}"
         )
 
+    feature_paths = [
+        dirs["marts_dir"] / f"hitter_props_features_{args.season}.parquet",
+        dirs["marts_dir"] / f"hitter_props_features_{args.season - 1}.parquet",
+        dirs["marts_dir"] / "hitter_props_features.parquet",
+    ]
+    existing_feature_paths = []
+    for p in feature_paths:
+        if p.exists() and p not in existing_feature_paths:
+            existing_feature_paths.append(p)
+    if not existing_feature_paths:
+        raise FileNotFoundError(f"hitter feature mart not found in any expected path: {feature_paths}")
+    df_features = pd.concat([pd.read_parquet(p).copy() for p in existing_feature_paths], ignore_index=True, sort=False)
+    logging.info("hit_prop live feature_mart_sources=%s total_rows=%s", [str(p) for p in existing_feature_paths], len(df_features))
+    df_lineups = selected.copy()
+    if "batter_id" not in df_lineups.columns:
+        raise ValueError("lineup candidates missing batter_id column before hitter feature join diagnostics")
+    if "batter_id" not in df_features.columns:
+        raise ValueError("hitter feature mart missing batter_id column")
+    df_lineups["batter_id"] = pd.to_numeric(df_lineups["batter_id"], errors="coerce")
+    df_features["batter_id"] = pd.to_numeric(df_features["batter_id"], errors="coerce")
+    lineup_batter_sample = df_lineups["batter_id"].dropna().head(10).tolist()
+    feature_batter_sample = df_features["batter_id"].dropna().head(10).tolist()
+    lineup_batter_set = set(df_lineups["batter_id"].dropna().tolist())
+    feature_batter_set = set(df_features["batter_id"].dropna().tolist())
+    intersection = lineup_batter_set & feature_batter_set
+    logging.info(
+        "hit_prop live batter_id diagnostics lineup_sample=%s feature_sample=%s intersection_count=%s",
+        lineup_batter_sample,
+        feature_batter_sample,
+        len(intersection),
+    )
+    if len(intersection) == 0:
+        raise ValueError(
+            "No overlapping batter_id values between lineups and hitter feature mart. "
+            f"lineup_batter_id_sample={lineup_batter_sample} feature_batter_id_sample={feature_batter_sample} "
+            f"lineup_batter_id_dtype={df_lineups['batter_id'].dtype} feature_batter_id_dtype={df_features['batter_id'].dtype}"
+        )
+    if "_season" in df_features.columns:
+        df_features["_feature_season"] = pd.to_numeric(df_features["_season"], errors="coerce")
+    elif "season" in df_features.columns:
+        df_features["_feature_season"] = pd.to_numeric(df_features["season"], errors="coerce")
+    elif "game_date" in df_features.columns:
+        df_features["_feature_season"] = pd.to_datetime(df_features["game_date"], errors="coerce").dt.year
+    else:
+        df_features["_feature_season"] = np.nan
+    df_features["_feature_game_date"] = pd.to_datetime(df_features.get("game_date"), errors="coerce")
+
+    df_joined = df_lineups[["batter_id"]].dropna().drop_duplicates().merge(df_features, on=["batter_id"], how="inner")
+    if df_joined.empty:
+        raise ValueError("No batter_id overlap between lineups and hitter feature mart")
+    df_joined["_season_priority"] = np.select(
+        [
+            pd.to_numeric(df_joined["_feature_season"], errors="coerce") == args.season,
+            pd.to_numeric(df_joined["_feature_season"], errors="coerce") == (args.season - 1),
+        ],
+        [2, 1],
+        default=0,
+    )
+    joined_candidate_row_count = len(df_joined)
+    candidate_counts_by_season = pd.to_numeric(df_joined["_feature_season"], errors="coerce").value_counts(dropna=False).to_dict()
+    df_joined = df_joined.sort_values(
+        ["batter_id", "_season_priority", "_feature_season", "_feature_game_date"],
+        ascending=[True, False, False, False],
+        kind="mergesort",
+    )
+    df_selected_features = df_joined.drop_duplicates(subset=["batter_id"], keep="first").copy()
+    selected_current_season_count = int((pd.to_numeric(df_selected_features["_feature_season"], errors="coerce") == args.season).sum())
+    selected_previous_season_count = int((pd.to_numeric(df_selected_features["_feature_season"], errors="coerce") == (args.season - 1)).sum())
+    selected_older_fallback_count = int(
+        (
+            (pd.to_numeric(df_selected_features["_feature_season"], errors="coerce") != args.season)
+            & (pd.to_numeric(df_selected_features["_feature_season"], errors="coerce") != (args.season - 1))
+        ).sum()
+    )
+    final_selected_scoring_row_count = len(df_selected_features)
+    sample_selected = (
+        df_selected_features[["batter_id", "_feature_season"]]
+        .head(10)
+        .to_dict("records")
+    )
+    logging.info(
+        "hit_prop live feature_row_selection joined_candidate_row_count=%s candidate_counts_by_season=%s selected_current_season_count=%s selected_previous_season_count=%s selected_older_fallback_count=%s final_selected_scoring_row_count=%s sample_batter_season=%s",
+        joined_candidate_row_count,
+        candidate_counts_by_season,
+        selected_current_season_count,
+        selected_previous_season_count,
+        selected_older_fallback_count,
+        final_selected_scoring_row_count,
+        sample_selected,
+    )
+    if selected_previous_season_count > 0 or selected_older_fallback_count > 0:
+        logging.info(
+            "Opening Day / early-season fallback engaged: using most recent historical feature rows where current-season rows are unavailable."
+        )
+    if final_selected_scoring_row_count == 0:
+        raise ValueError("No selected scoring rows after season-priority feature selection")
+
+    selected = selected[pd.to_numeric(selected["batter_id"], errors="coerce").isin(df_selected_features["batter_id"].dropna().unique().tolist())].copy()
+    selected_feature_by_batter = df_selected_features.set_index("batter_id")
+    df_scoring = selected.copy()
+    feature_name_col = _pick(list(df_selected_features.columns), ["player_name", "batter_name", "name"])
+    if feature_name_col:
+        feature_name_map = df_selected_features.set_index("batter_id")[feature_name_col]
+    else:
+        feature_name_map = pd.Series(dtype="object")
+
     logging.info(
         "hit_prop live lineup_source_summary confirmed_rows=%s confirmed_games=%s projected_rows=%s projected_games_used=%s fallback_rows=%s fallback_games=%s total_rows=%s total_games=%s",
         len(confirmed),
@@ -424,15 +642,17 @@ def main() -> None:
         )
         logging.info("hit_prop live lineup_source_by_game=%s", per_game)
 
-    board = selected.merge(team_games, on=["game_pk", "batter_team"], how="inner")
-    if "park_factor_hits_blend" in board.columns:
-        board["park_factor_hits_blend"] = pd.to_numeric(board["park_factor_hits_blend"], errors="coerce")
-    if "park_factor_hits_hist" in board.columns:
-        board["park_factor_hits_hist"] = pd.to_numeric(board["park_factor_hits_hist"], errors="coerce")
-    if "park_factor_hits_blend" not in board.columns:
-        board["park_factor_hits_blend"] = np.nan
-    if "park_factor_hits_hist" in board.columns:
-        board["park_factor_hits_blend"] = board["park_factor_hits_blend"].fillna(board["park_factor_hits_hist"])
+    row_count_before_team_join = len(df_scoring)
+    df_scoring = df_scoring.merge(team_games, on=["game_pk", "batter_team"], how="left")
+    logging.info("hit_prop live post_selection_team_merge row_count_before=%s row_count_after=%s", row_count_before_team_join, len(df_scoring))
+    if "park_factor_hits_blend" in df_scoring.columns:
+        df_scoring["park_factor_hits_blend"] = pd.to_numeric(df_scoring["park_factor_hits_blend"], errors="coerce")
+    if "park_factor_hits_hist" in df_scoring.columns:
+        df_scoring["park_factor_hits_hist"] = pd.to_numeric(df_scoring["park_factor_hits_hist"], errors="coerce")
+    if "park_factor_hits_blend" not in df_scoring.columns:
+        df_scoring["park_factor_hits_blend"] = np.nan
+    if "park_factor_hits_hist" in df_scoring.columns:
+        df_scoring["park_factor_hits_blend"] = df_scoring["park_factor_hits_blend"].fillna(df_scoring["park_factor_hits_hist"])
 
     batter["game_date"] = pd.to_datetime(batter.get("game_date"), errors="coerce")
     batter = batter[batter["game_date"] < slate_date].copy()
@@ -447,22 +667,29 @@ def main() -> None:
     cur_latest = batter[pd.to_numeric(batter["_season"], errors="coerce") == args.season].sort_values("game_date").groupby("batter_id").tail(1).set_index("batter_id")
     prev_latest = batter[pd.to_numeric(batter["_season"], errors="coerce") == (args.season - 1)].sort_values("game_date").groupby("batter_id").tail(1).set_index("batter_id")
 
-    board = board.merge(cur_ct.reset_index(), on="batter_id", how="left")
-    use_prev = pd.to_numeric(board["_cur_n"], errors="coerce").fillna(0) < args.min_current_games
+    row_count_before_cur_merge = len(df_scoring)
+    df_scoring = df_scoring.merge(cur_ct.reset_index(), on="batter_id", how="left")
+    logging.info("hit_prop live post_selection_batter_merge row_count_before=%s row_count_after=%s", row_count_before_cur_merge, len(df_scoring))
+    if df_selected_features["_feature_season"].eq(args.season).any():
+        use_prev = pd.to_numeric(df_scoring["_cur_n"], errors="coerce").fillna(0) < args.min_current_games
+    else:
+        logging.info("Skipping current-season filters (using fallback historical data)")
+        use_prev = pd.Series(True, index=df_scoring.index)
 
     model_path = _latest_model(dirs["models_dir"])
     bundle = joblib.load(model_path)
     model = bundle["model"]
     feats = list(bundle.get("feature_list", []))
-    X = pd.DataFrame(index=board.index, columns=feats, dtype="float64")
+    X = pd.DataFrame(index=df_scoring.index, columns=feats, dtype="float64")
 
     for c in feats:
         if c.startswith("bat_"):
-            cur = board["batter_id"].map(cur_latest[c]) if (not cur_latest.empty and c in cur_latest.columns) else pd.Series(np.nan, index=board.index)
-            prv = board["batter_id"].map(prev_latest[c]) if (not prev_latest.empty and c in prev_latest.columns) else pd.Series(np.nan, index=board.index)
-            X[c] = np.where(use_prev, prv, cur)
-        elif c in board.columns:
-            X[c] = pd.to_numeric(board[c], errors="coerce")
+            best = df_scoring["batter_id"].map(selected_feature_by_batter[c]) if (not selected_feature_by_batter.empty and c in selected_feature_by_batter.columns) else pd.Series(np.nan, index=df_scoring.index)
+            cur = df_scoring["batter_id"].map(cur_latest[c]) if (not cur_latest.empty and c in cur_latest.columns) else pd.Series(np.nan, index=df_scoring.index)
+            prv = df_scoring["batter_id"].map(prev_latest[c]) if (not prev_latest.empty and c in prev_latest.columns) else pd.Series(np.nan, index=df_scoring.index)
+            X[c] = pd.to_numeric(best, errors="coerce").where(pd.to_numeric(best, errors="coerce").notna(), np.where(use_prev, prv, cur))
+        elif c in df_scoring.columns:
+            X[c] = pd.to_numeric(df_scoring[c], errors="coerce")
 
     if not pitcher.empty:
         pitcher["game_date"] = pd.to_datetime(pitcher.get("game_date"), errors="coerce")
@@ -475,29 +702,31 @@ def main() -> None:
         p_cur_ct = p_grp.apply(lambda x: int((pd.to_numeric(x["_season"], errors="coerce") == args.season).sum())).rename("_p_cur_n")
         p_cur = pitcher[pd.to_numeric(pitcher["_season"], errors="coerce") == args.season].sort_values("game_date").groupby("pitcher_id").tail(1).set_index("pitcher_id")
         p_prev = pitcher[pd.to_numeric(pitcher["_season"], errors="coerce") == (args.season - 1)].sort_values("game_date").groupby("pitcher_id").tail(1).set_index("pitcher_id")
-        board = board.merge(p_cur_ct.reset_index(), left_on="opp_pitcher_id", right_on="pitcher_id", how="left")
-        use_prev_p = pd.to_numeric(board["_p_cur_n"], errors="coerce").fillna(0) < args.min_current_games
+        row_count_before_pitcher_merge = len(df_scoring)
+        df_scoring = df_scoring.merge(p_cur_ct.reset_index(), left_on="opp_pitcher_id", right_on="pitcher_id", how="left")
+        logging.info("hit_prop live post_selection_pitcher_merge row_count_before=%s row_count_after=%s", row_count_before_pitcher_merge, len(df_scoring))
+        use_prev_p = pd.to_numeric(df_scoring["_p_cur_n"], errors="coerce").fillna(0) < args.min_current_games
         for c in feats:
             if c.startswith("pit_"):
-                cur = board["opp_pitcher_id"].map(p_cur[c]) if (not p_cur.empty and c in p_cur.columns) else pd.Series(np.nan, index=board.index)
-                prv = board["opp_pitcher_id"].map(p_prev[c]) if (not p_prev.empty and c in p_prev.columns) else pd.Series(np.nan, index=board.index)
+                cur = df_scoring["opp_pitcher_id"].map(p_cur[c]) if (not p_cur.empty and c in p_cur.columns) else pd.Series(np.nan, index=df_scoring.index)
+                prv = df_scoring["opp_pitcher_id"].map(p_prev[c]) if (not p_prev.empty and c in p_prev.columns) else pd.Series(np.nan, index=df_scoring.index)
                 X[c] = np.where(use_prev_p, prv, cur)
 
-    board["expected_batting_order_pa"] = pd.to_numeric(board["lineup_slot"], errors="coerce").map(LINEUP_PA_MAP)
-    board["lineup_confidence"] = _lineup_conf(board["lineup_slot"])
+    df_scoring["expected_batting_order_pa"] = pd.to_numeric(df_scoring["lineup_slot"], errors="coerce").map(LINEUP_PA_MAP)
+    df_scoring["lineup_confidence"] = _lineup_conf(df_scoring["lineup_slot"])
 
-    has_slot = pd.to_numeric(board.get("lineup_slot"), errors="coerce").notna()
+    has_slot = pd.to_numeric(df_scoring.get("lineup_slot"), errors="coerce").notna()
     ab_proxy_series = pd.Series(np.nan, index=X.index, dtype="float64")
     ab_proxy_series.loc[has_slot] = (
-        pd.to_numeric(board.loc[has_slot, "lineup_confidence"], errors="coerce")
-        * pd.to_numeric(board.loc[has_slot, "expected_batting_order_pa"], errors="coerce")
+        pd.to_numeric(df_scoring.loc[has_slot, "lineup_confidence"], errors="coerce")
+        * pd.to_numeric(df_scoring.loc[has_slot, "expected_batting_order_pa"], errors="coerce")
     )
 
     x_extra = {
         "bat_ab_per_game_roll15": pd.to_numeric(X["bat_ab_per_game_roll15"], errors="coerce") if "bat_ab_per_game_roll15" in X.columns else pd.Series(np.nan, index=X.index, dtype="float64"),
         "bat_pa_per_game_roll15": pd.to_numeric(X["bat_pa_per_game_roll15"], errors="coerce") if "bat_pa_per_game_roll15" in X.columns else pd.Series(np.nan, index=X.index, dtype="float64"),
-        "expected_batting_order_pa": pd.to_numeric(board["expected_batting_order_pa"], errors="coerce"),
-        "lineup_confidence": pd.to_numeric(board["lineup_confidence"], errors="coerce"),
+        "expected_batting_order_pa": pd.to_numeric(df_scoring["expected_batting_order_pa"], errors="coerce"),
+        "lineup_confidence": pd.to_numeric(df_scoring["lineup_confidence"], errors="coerce"),
         "expected_ab_proxy": ab_proxy_series,
     }
     extra_df = pd.DataFrame(x_extra, index=X.index)
@@ -512,12 +741,31 @@ def main() -> None:
         X = X.loc[:, ~X.columns.duplicated(keep="last")].copy()
 
     # scoring matrix remains aligned to trained features only
-    X_scoring = X.reindex(columns=feats, fill_value=np.nan)
+    if df_scoring.empty:
+        raise ValueError("Scoring dataframe unexpectedly empty after selection stage")
+    available_features = [c for c in feats if c in X.columns]
+    missing_features = [c for c in feats if c not in X.columns]
+    available_feature_count = len(available_features)
+    missing_feature_count = len(missing_features)
+    if available_feature_count == 0:
+        raise ValueError("No model features found in scoring dataframe")
+    X_scoring = X[available_features].copy()
+    X_scoring = X_scoring.reindex(columns=feats, fill_value=np.nan)
+    logging.info(
+        "hit_prop live feature_availability expected_feature_count=%s available_feature_count=%s missing_feature_count=%s sample_missing_features=%s",
+        len(feats),
+        available_feature_count,
+        missing_feature_count,
+        missing_features[:10],
+    )
+    logging.info("hit_prop live scoring_dataframe_rows=%s", len(df_scoring))
+    if X_scoring.shape[0] == 0:
+        raise ValueError("Scoring dataframe unexpectedly empty after selection stage")
     logging.info("hit_prop live X_scoring_shape rows=%s cols=%s", X_scoring.shape[0], X_scoring.shape[1])
     logging.info("hit_prop live scoring_feature_count=%s", len(feats))
 
-    real_slot = int(pd.to_numeric(board.get("lineup_slot"), errors="coerce").notna().sum()) if "lineup_slot" in board.columns else 0
-    fallback_conf_only = int(((pd.to_numeric(board.get("lineup_slot"), errors="coerce").isna()) & (pd.to_numeric(board.get("lineup_confidence"), errors="coerce").notna())).sum()) if "lineup_confidence" in board.columns else 0
+    real_slot = int(pd.to_numeric(df_scoring.get("lineup_slot"), errors="coerce").notna().sum()) if "lineup_slot" in df_scoring.columns else 0
+    fallback_conf_only = int(((pd.to_numeric(df_scoring.get("lineup_slot"), errors="coerce").isna()) & (pd.to_numeric(df_scoring.get("lineup_confidence"), errors="coerce").notna())).sum()) if "lineup_confidence" in df_scoring.columns else 0
     if "expected_ab_proxy" in X.columns:
         expected_ab_proxy = pd.to_numeric(X["expected_ab_proxy"], errors="coerce")
     else:
@@ -536,12 +784,30 @@ def main() -> None:
     avg_adjustment = float(np.mean(live_adjusted_hit_probability - base_hit_probability)) if len(base_hit_probability) else 0.0
     logging.info("hit_prop live average_adjustment_applied=%.6f", avg_adjustment)
 
-    out = board[[c for c in ["player_name", "batter_team", "opponent_team", "lineup_slot", "expected_batting_order_pa", "lineup_confidence"] if c in board.columns]].copy()
+    lineup_name_series = df_scoring["player_name"] if "player_name" in df_scoring.columns else pd.Series("", index=df_scoring.index, dtype="object")
+    scoring_name_series = lineup_name_series.astype(str).str.strip()
+    feature_name_series = (
+        df_scoring["batter_id"].map(feature_name_map).astype(str).str.strip()
+        if not feature_name_map.empty
+        else pd.Series("", index=df_scoring.index, dtype="object")
+    )
+    fallback_name_series = df_scoring["batter_id"].astype("Int64").astype(str)
+    resolved_name = scoring_name_series.where(scoring_name_series != "", feature_name_series)
+    resolved_name = resolved_name.where(resolved_name != "", fallback_name_series)
+    df_scoring["player_name"] = resolved_name
+
+    out = df_scoring[[c for c in ["player_name", "batter_id", "batter_team", "opponent_team", "lineup_slot", "expected_batting_order_pa", "lineup_confidence"] if c in df_scoring.columns]].copy()
     out["bat_ab_per_game_roll15"] = pd.to_numeric(X["bat_ab_per_game_roll15"], errors="coerce") if "bat_ab_per_game_roll15" in X.columns else pd.Series(np.nan, index=out.index, dtype="float64")
     out["expected_ab_proxy"] = expected_ab_proxy
     out["base_hit_probability"] = base_hit_probability
     out["live_adjusted_hit_probability"] = live_adjusted_hit_probability
     out["grade"] = out["live_adjusted_hit_probability"].map(_grade)
+    logging.info(
+        "hit_prop live board_identity non_null_player_name_count=%s non_null_batter_id_count=%s sample_rows=%s",
+        int(out["player_name"].astype(str).str.strip().ne("").sum()) if "player_name" in out.columns else 0,
+        int(pd.to_numeric(out.get("batter_id"), errors="coerce").notna().sum()) if "batter_id" in out.columns else 0,
+        out[[c for c in ["player_name", "batter_id", "live_adjusted_hit_probability"] if c in out.columns]].head(5).to_dict("records"),
+    )
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = dirs["outputs_dir"] / "hit_prop"
