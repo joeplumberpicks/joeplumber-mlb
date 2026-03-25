@@ -10,6 +10,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+import requests
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -155,6 +156,34 @@ def _normalize_team_canonical(team_val: object) -> str | None:
     if not tok:
         return None
     return TEAM_TO_CANONICAL.get(tok)
+
+
+def _non_numeric_name(series: pd.Series) -> pd.Series:
+    s = series.fillna("").astype(str).str.strip()
+    return s.where((s != "") & (~s.str.isnumeric()))
+
+
+def _lookup_player_names_web(batter_ids: list[int], timeout: int = 10) -> pd.DataFrame:
+    if not batter_ids:
+        return pd.DataFrame(columns=["batter_id", "player_name"])
+    out: list[dict[str, object]] = []
+    chunk = 50
+    for i in range(0, len(batter_ids), chunk):
+        ids = batter_ids[i : i + chunk]
+        try:
+            resp = requests.get(f"https://statsapi.mlb.com/api/v1/people?personIds={','.join(map(str, ids))}", timeout=timeout)
+            resp.raise_for_status()
+            people = resp.json().get("people", [])
+            for p in people:
+                pid = pd.to_numeric(p.get("id"), errors="coerce")
+                nm = str(p.get("fullName") or "").strip()
+                if pd.notna(pid) and nm:
+                    out.append({"batter_id": int(pid), "player_name": nm})
+        except Exception:
+            logging.exception("player_name web lookup failed for chunk=%s; continuing", ids)
+    if not out:
+        return pd.DataFrame(columns=["batter_id", "player_name"])
+    return pd.DataFrame(out).drop_duplicates(subset=["batter_id"], keep="last")
 
 
 def _validate_lineup_rows(df: pd.DataFrame, label: str) -> pd.DataFrame:
@@ -788,18 +817,92 @@ def main() -> None:
     avg_adjustment = float(np.mean(live_adjusted_hit_probability - base_hit_probability)) if len(base_hit_probability) else 0.0
     logging.info("hit_prop live average_adjustment_applied=%.6f", avg_adjustment)
 
-    if "player_name" not in df_scoring.columns or df_scoring["player_name"].astype(str).str.isnumeric().all():
-        if "player_name_lineup" in df_scoring.columns:
-            df_scoring["player_name"] = df_scoring["player_name_lineup"]
-        elif "player_name_feature" in df_scoring.columns:
-            df_scoring["player_name"] = df_scoring["player_name_feature"]
-    if "player_name_feature" in df_scoring.columns:
-        fallback_mask = df_scoring["player_name"].astype(str).str.strip().eq("") | df_scoring["player_name"].isna()
-        df_scoring.loc[fallback_mask, "player_name"] = df_scoring.loc[fallback_mask, "player_name_feature"]
+    # layered player-name resolution: existing non-numeric -> players.parquet -> rolling history -> optional web -> batter_id
+    existing_name = _non_numeric_name(df_scoring.get("player_name", pd.Series("", index=df_scoring.index, dtype="object")))
+
+    ref_frames: list[pd.DataFrame] = []
+    players_ref_path = dirs["reference_dir"] / "players.parquet"
+    if players_ref_path.exists():
+        try:
+            players_ref = pd.read_parquet(players_ref_path).copy()
+            pid_col = _pick(list(players_ref.columns), ["batter_id", "player_id", "mlbam_id", "id"])
+            pname_col = _pick(list(players_ref.columns), ["player_name", "name", "full_name"])
+            if pid_col and pname_col:
+                p = players_ref[[pid_col, pname_col]].copy()
+                p.columns = ["batter_id", "player_name"]
+                p["batter_id"] = pd.to_numeric(p["batter_id"], errors="coerce").astype("Int64")
+                p["player_name"] = _non_numeric_name(p["player_name"])
+                p = p.dropna(subset=["batter_id", "player_name"]).drop_duplicates(subset=["batter_id"], keep="last")
+                ref_frames.append(p)
+        except Exception:
+            logging.exception("player_name reference load failed path=%s", players_ref_path)
+
+    rolling_name_col = _pick(list(batter.columns), ["player_name", "batter_name", "name"])
+    if rolling_name_col and "batter_id" in batter.columns:
+        bname = batter[["batter_id", "game_date", rolling_name_col]].copy()
+        bname["batter_id"] = pd.to_numeric(bname["batter_id"], errors="coerce").astype("Int64")
+        bname["player_name"] = _non_numeric_name(bname[rolling_name_col])
+        bname["game_date"] = pd.to_datetime(bname["game_date"], errors="coerce")
+        bname = bname.dropna(subset=["batter_id", "player_name"]).sort_values("game_date").drop_duplicates(subset=["batter_id"], keep="last")
+        ref_frames.append(bname[["batter_id", "player_name"]])
+
+    df_ref = pd.DataFrame(columns=["batter_id", "player_name"])
+    if ref_frames:
+        # players.parquet takes precedence over rolling, so append rolling first then players
+        ordered = ref_frames
+        df_ref = pd.concat(ordered, ignore_index=True, sort=False).dropna(subset=["batter_id"]).drop_duplicates(subset=["batter_id"], keep="last")
+
+    cache_path = dirs["reference_dir"] / "player_name_lookup_cache.parquet"
+    if cache_path.exists():
+        try:
+            cache_df = pd.read_parquet(cache_path).copy()
+            if {"batter_id", "player_name"}.issubset(cache_df.columns):
+                cache_df["batter_id"] = pd.to_numeric(cache_df["batter_id"], errors="coerce").astype("Int64")
+                cache_df["player_name"] = _non_numeric_name(cache_df["player_name"])
+                cache_df = cache_df.dropna(subset=["batter_id", "player_name"]).drop_duplicates(subset=["batter_id"], keep="last")
+                df_ref = pd.concat([df_ref, cache_df[["batter_id", "player_name"]]], ignore_index=True, sort=False).drop_duplicates(subset=["batter_id"], keep="first")
+        except Exception:
+            logging.exception("player_name cache load failed path=%s", cache_path)
+
+    df_scoring["batter_id"] = pd.to_numeric(df_scoring["batter_id"], errors="coerce").astype("Int64")
+    df_scoring = df_scoring.merge(df_ref.rename(columns={"player_name": "player_name_ref"}), on="batter_id", how="left")
+    resolved_local = existing_name.where(existing_name.notna(), _non_numeric_name(df_scoring.get("player_name_lineup", pd.Series("", index=df_scoring.index))))
+    resolved_local = resolved_local.where(resolved_local.notna(), _non_numeric_name(df_scoring.get("player_name_feature", pd.Series("", index=df_scoring.index))))
+    resolved_local = resolved_local.where(resolved_local.notna(), _non_numeric_name(df_scoring.get("player_name_ref", pd.Series("", index=df_scoring.index))))
+    df_scoring["player_name"] = resolved_local
+
+    unresolved_ids = (
+        df_scoring.loc[df_scoring["player_name"].isna(), "batter_id"]
+        .dropna()
+        .astype(int)
+        .drop_duplicates()
+        .tolist()
+    )
+    if unresolved_ids:
+        web_df = _lookup_player_names_web(unresolved_ids)
+        if not web_df.empty:
+            web_df["batter_id"] = pd.to_numeric(web_df["batter_id"], errors="coerce").astype("Int64")
+            web_df["player_name"] = _non_numeric_name(web_df["player_name"])
+            web_df = web_df.dropna(subset=["batter_id", "player_name"]).drop_duplicates(subset=["batter_id"], keep="last")
+            df_scoring = df_scoring.merge(web_df.rename(columns={"player_name": "player_name_web"}), on="batter_id", how="left")
+            miss = df_scoring["player_name"].isna()
+            df_scoring.loc[miss, "player_name"] = _non_numeric_name(df_scoring.loc[miss, "player_name_web"])
+            try:
+                cache_union = pd.concat(
+                    [df_ref[["batter_id", "player_name"]], web_df[["batter_id", "player_name"]]],
+                    ignore_index=True,
+                    sort=False,
+                ).drop_duplicates(subset=["batter_id"], keep="last")
+                cache_union.to_parquet(cache_path, index=False)
+            except Exception:
+                logging.exception("player_name cache write failed path=%s", cache_path)
+
     df_scoring["player_name"] = df_scoring["player_name"].fillna(df_scoring["batter_id"].astype(str))
+    unresolved_batter_id_count = int(df_scoring["player_name"].astype(str).str.isnumeric().sum())
     logging.info(
-        "hit_prop live player_name_resolution_non_numeric_count=%s",
+        "hit_prop live player_name_resolution_non_numeric_count=%s unresolved_batter_id_count=%s",
         int((~df_scoring["player_name"].astype(str).str.isnumeric()).sum()),
+        unresolved_batter_id_count,
     )
 
     out = df_scoring[[c for c in ["player_name", "batter_id", "batter_team", "opponent_team", "lineup_slot", "expected_batting_order_pa", "lineup_confidence"] if c in df_scoring.columns]].copy()
