@@ -22,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
 from src.utils.logging import configure_logging, log_header
+from src.props.hitter_prop_common import LIVE_ONLY_FEATURE_NAMES
 
 TARGET = "target_hit_1_plus"
 
@@ -109,10 +110,13 @@ def main() -> None:
 
     excluded = {"game_pk", "batter_id", "opp_pitcher_id", "season", TARGET, "target_hit1p", "target_hit_1p"}
     numeric_features = [c for c in train.columns if pd.api.types.is_numeric_dtype(train[c]) and c not in excluded]
-    unsafe_features = [c for c in numeric_features if not _is_safe_feature(c)]
+    live_only_features = [c for c in numeric_features if c in LIVE_ONLY_FEATURE_NAMES]
+    unsafe_features = [c for c in numeric_features if (not _is_safe_feature(c)) or (c in LIVE_ONLY_FEATURE_NAMES)]
     if unsafe_features:
         logging.info("hit_prop eval leakage_guard dropped_unsafe_features_n=%s features=%s", len(unsafe_features), unsafe_features)
+    logging.info("hit_prop eval dropped_live_only_features_n=%s features=%s", len(live_only_features), live_only_features)
     numeric_features = [c for c in numeric_features if _is_safe_feature(c)]
+    numeric_features = [c for c in numeric_features if c not in LIVE_ONLY_FEATURE_NAMES]
     feature_stats: list[tuple[str, int, float]] = []
     for c in numeric_features:
         nn = int(pd.to_numeric(train[c], errors="coerce").notna().sum())
@@ -173,6 +177,10 @@ def main() -> None:
             "train_start": args.train_start,
             "train_end": args.train_end,
             "test_season": args.test_season,
+            "historical_feature_count": int(len(feats)),
+            "live_only_features_excluded_count": int(len(live_only_features)),
+            "live_only_features_excluded": live_only_features,
+            "historical_eval_excludes_live_only": True,
             "dropped_all_null_features": dropped_all_null,
         }, f, indent=2)
     _cal_bins(y_test.to_numpy(), p).to_csv(cal_path, index=False)
