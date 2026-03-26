@@ -12,7 +12,7 @@ from joblib import dump
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import brier_score_loss, roc_auc_score
+from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -51,12 +51,26 @@ def _load_marts(dirs: dict[str, Path], seasons: list[int]) -> pd.DataFrame:
 
 
 def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]:
-    drop_cols = {"game_pk", "game_date", target_col, "total_hr"}
+    drop_cols = {
+        "game_pk",
+        "game_date",
+        target_col,
+        "total_hr",
+        "home_team",
+        "away_team",
+        "canonical_park_key",
+        "batter_feature_source",
+        "pitcher_feature_source",
+    }
     feats = [c for c in df.columns if c not in drop_cols]
     X = df[feats].copy()
+
     for c in X.columns:
+        if pd.api.types.is_bool_dtype(X[c]):
+            X[c] = X[c].astype("Int64")
         if not pd.api.types.is_numeric_dtype(X[c]):
             X[c] = pd.to_numeric(X[c], errors="coerce")
+
     X = X.replace([np.inf, -np.inf], np.nan)
     keep = [c for c in X.columns if X[c].notna().any()]
     X = X[keep].astype("float32") if keep else pd.DataFrame({"bias": np.zeros(len(df), dtype="float32")})
@@ -93,8 +107,16 @@ def main() -> None:
     y_train = y_train[y_train.notna()].astype("int64").to_numpy()
     y_test = y_test[y_test.notna()].astype("int64").to_numpy()
 
+    logging.info("train rows=%s test rows=%s", len(train_df), len(test_df))
+    if "season" in train_df.columns:
+        logging.info("train rows by season: %s", train_df["season"].value_counts().sort_index().to_dict())
+    if "season" in test_df.columns:
+        logging.info("test rows by season: %s", test_df["season"].value_counts().sort_index().to_dict())
+    logging.info("train no_hr rate=%.6f", float(np.mean(y_train)) if len(y_train) else float("nan"))
+    logging.info("test no_hr rate=%.6f", float(np.mean(y_test)) if len(y_test) else float("nan"))
+
     X_train, feat_cols = _prep_X(train_df, target_col)
-    X_test = test_df[feat_cols].copy() if feat_cols else pd.DataFrame({"bias": np.zeros(len(test_df), dtype="float32")})
+    X_test = test_df.reindex(columns=feat_cols).copy() if feat_cols else pd.DataFrame({"bias": np.zeros(len(test_df), dtype="float32")})
     X_test = X_test.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).astype("float32")
 
     base_model_name = "logreg"
@@ -128,6 +150,9 @@ def main() -> None:
 
     auc = float(roc_auc_score(y_test, p_test)) if len(np.unique(y_test)) > 1 else float("nan")
     brier = float(brier_score_loss(y_test, p_test)) if len(y_test) else float("nan")
+    ll = float(log_loss(y_test, p_test, labels=[0, 1])) if len(y_test) else float("nan")
+    pred_mean = float(np.mean(p_test)) if len(p_test) else float("nan")
+    obs_mean = float(np.mean(y_test)) if len(y_test) else float("nan")
     cal_tbl = _calibration_table(y_test, p_test)
 
     signature = f"train_{'-'.join(map(str, train_seasons))}_test_{'-'.join(map(str, test_seasons))}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
@@ -136,10 +161,24 @@ def main() -> None:
     model_path = model_dir / f"no_hr_model_{signature}.pkl"
     dump({"model": calibrated, "features": feat_cols, "target_col": target_col, "signature": signature, "base_model": base_model_name}, model_path)
 
+    feat_path = model_dir / f"no_hr_features_{signature}.txt"
+    feat_path.write_text("\n".join(feat_cols) + "\n", encoding="utf-8")
+
     bt_dir = dirs["backtests_dir"] / "no_hr"
     bt_dir.mkdir(parents=True, exist_ok=True)
     backtest = pd.DataFrame([
-        {"signature": signature, "train_seasons": ",".join(map(str, train_seasons)), "test_seasons": ",".join(map(str, test_seasons)), "model": base_model_name, "auc": auc, "brier": brier, "n_test": len(y_test)}
+        {
+            "signature": signature,
+            "train_seasons": ",".join(map(str, train_seasons)),
+            "test_seasons": ",".join(map(str, test_seasons)),
+            "model": base_model_name,
+            "auc": auc,
+            "brier": brier,
+            "logloss": ll,
+            "pred_mean": pred_mean,
+            "obs_rate": obs_mean,
+            "n_test": len(y_test),
+        }
     ])
     bt_path = bt_dir / f"no_hr_backtest_{signature}.csv"
     backtest.to_csv(bt_path, index=False)
@@ -147,7 +186,17 @@ def main() -> None:
     cal_path = bt_dir / f"no_hr_calibration_{signature}.csv"
     cal_tbl.to_csv(cal_path, index=False)
 
-    logging.info("no_hr train complete model=%s auc=%.6f brier=%.6f model_path=%s", base_model_name, auc, brier, model_path.resolve())
+    logging.info(
+        "no_hr train complete model=%s auc=%.6f brier=%.6f logloss=%.6f pred_mean=%.6f obs_rate=%.6f model_path=%s",
+        base_model_name,
+        auc,
+        brier,
+        ll,
+        pred_mean,
+        obs_mean,
+        model_path.resolve(),
+    )
+    logging.info("features saved path=%s", feat_path.resolve())
     logging.info("calibration_by_decile path=%s", cal_path.resolve())
     print(f"model -> {model_path.resolve()}")
     print(f"backtest -> {bt_path.resolve()}")
