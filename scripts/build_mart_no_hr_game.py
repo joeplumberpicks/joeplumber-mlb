@@ -290,6 +290,25 @@ def _build_team_rollups_with_context(batter_roll: pd.DataFrame, team_context: pd
     return agg.reset_index()
 
 
+def _ensure_starter_id_cols(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "home_sp_id" not in out.columns:
+        for c in ["home_probable_pitcher_id", "home_sp", "home_starter_id", "home_pitcher_id", "home_starting_pitcher_id"]:
+            if c in out.columns:
+                out["home_sp_id"] = out[c]
+                break
+    if "away_sp_id" not in out.columns:
+        for c in ["away_probable_pitcher_id", "away_sp", "away_starter_id", "away_pitcher_id", "away_starting_pitcher_id"]:
+            if c in out.columns:
+                out["away_sp_id"] = out[c]
+                break
+    if "home_sp_id" in out.columns:
+        out["home_sp_id"] = pd.to_numeric(out["home_sp_id"], errors="coerce").astype("Int64")
+    if "away_sp_id" in out.columns:
+        out["away_sp_id"] = pd.to_numeric(out["away_sp_id"], errors="coerce").astype("Int64")
+    return out
+
+
 def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_latest_per_pitcher: bool = False) -> pd.DataFrame:
     mart = spine.copy()
     if pitcher_roll.empty:
@@ -308,14 +327,14 @@ def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_lates
     logging.info("starter merge pitcher id column=%s", pitcher_id_col)
     logging.info("starter merge rolling pitcher rows=%s", len(pitcher_df))
 
-    home_sp = _pick(mart, ["home_sp_id", "home_starter_id", "home_pitcher_id", "home_starting_pitcher_id", "home_probable_pitcher_id"])
-    away_sp = _pick(mart, ["away_sp_id", "away_starter_id", "away_pitcher_id", "away_starting_pitcher_id", "away_probable_pitcher_id"])
-    if home_sp is None or away_sp is None:
-        logging.warning("starter merge skipped: could not find home/away starter id columns")
+    mart = _ensure_starter_id_cols(mart)
+    if "home_sp_id" not in mart.columns or "away_sp_id" not in mart.columns:
+        cand = [c for c in ["home_sp", "away_sp", "home_probable_pitcher_id", "away_probable_pitcher_id", "home_starter_id", "away_starter_id"] if c in mart.columns]
+        logging.warning("starter merge skipped: could not find home_sp_id/away_sp_id columns candidates_present=%s", cand)
         return mart
 
-    mart["home_sp_id"] = pd.to_numeric(mart[home_sp], errors="coerce").astype("Int64")
-    mart["away_sp_id"] = pd.to_numeric(mart[away_sp], errors="coerce").astype("Int64")
+    logging.info("pre-starter keys home_sp_id_present=%s away_sp_id_present=%s", "home_sp_id" in mart.columns, "away_sp_id" in mart.columns)
+    logging.info("pre-starter nonnull counts home_sp_id=%s away_sp_id=%s", int(mart["home_sp_id"].notna().sum()), int(mart["away_sp_id"].notna().sum()))
     pitcher_df[pitcher_id_col] = pd.to_numeric(pitcher_df[pitcher_id_col], errors="coerce").astype("Int64")
     pitcher_df = pitcher_df[pitcher_df[pitcher_id_col].notna()].copy()
 
@@ -492,10 +511,31 @@ def main() -> None:
     mart = spine[
         [
             c
-            for c in ["game_pk", "game_date", "season", "home_team", "away_team", "park_id", "canonical_park_key"]
+            for c in [
+                "game_pk",
+                "game_date",
+                "season",
+                "home_team",
+                "away_team",
+                "park_id",
+                "canonical_park_key",
+                "home_sp_id",
+                "away_sp_id",
+                "home_sp",
+                "away_sp",
+                "home_probable_pitcher_id",
+                "away_probable_pitcher_id",
+                "home_starter_id",
+                "away_starter_id",
+                "home_pitcher_id",
+                "away_pitcher_id",
+                "home_starting_pitcher_id",
+                "away_starting_pitcher_id",
+            ]
             if c in spine.columns
         ]
     ].copy()
+    mart = _ensure_starter_id_cols(mart)
 
     batter_for_rollup = prev_batter if use_batter_fallback else curr_batter
     if use_batter_fallback:
@@ -530,6 +570,16 @@ def main() -> None:
             mart = mart.drop(columns=["team"], errors="ignore")
 
     pitcher_for_merge = prev_pitcher if use_pitcher_fallback else curr_pitcher
+    pre_cols = set(mart.columns)
+    starter_key_candidates = [c for c in ["home_sp_id", "away_sp_id", "home_sp", "away_sp", "home_probable_pitcher_id", "away_probable_pitcher_id", "home_starter_id", "away_starter_id"] if c in mart.columns]
+    logging.info(
+        "pre-starter-call keys home_sp_id_present=%s away_sp_id_present=%s home_sp_id_nonnull=%s away_sp_id_nonnull=%s candidate_cols=%s",
+        "home_sp_id" in pre_cols,
+        "away_sp_id" in pre_cols,
+        int(mart["home_sp_id"].notna().sum()) if "home_sp_id" in mart.columns else 0,
+        int(mart["away_sp_id"].notna().sum()) if "away_sp_id" in mart.columns else 0,
+        starter_key_candidates,
+    )
     mart = _starter_features(mart, pitcher_for_merge, use_latest_per_pitcher=use_pitcher_fallback)
     starter_cols_after_merge = [c for c in mart.columns if c.startswith("home_sp_") or c.startswith("away_sp_")]
     logging.info("post-starter-merge starter column count=%s", len(starter_cols_after_merge))
