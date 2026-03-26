@@ -311,6 +311,7 @@ def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_lates
     home_sp = _pick(mart, ["home_sp_id", "home_starter_id", "home_pitcher_id", "home_starting_pitcher_id", "home_probable_pitcher_id"])
     away_sp = _pick(mart, ["away_sp_id", "away_starter_id", "away_pitcher_id", "away_starting_pitcher_id", "away_probable_pitcher_id"])
     if home_sp is None or away_sp is None:
+        logging.warning("starter merge skipped: could not find home/away starter id columns")
         return mart
 
     mart["home_sp_id"] = pd.to_numeric(mart[home_sp], errors="coerce").astype("Int64")
@@ -328,6 +329,14 @@ def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_lates
     latest_pitcher = pitcher_df.sort_values(sort_cols).groupby(pitcher_id_col, dropna=False).tail(1).copy() if sort_cols else pitcher_df.groupby(pitcher_id_col, dropna=False).tail(1).copy()
 
     numeric_cols = latest_pitcher.select_dtypes(include=["number"]).columns.tolist()
+    if len(numeric_cols) <= 2:
+        for c in latest_pitcher.columns:
+            if c in numeric_cols:
+                continue
+            coerced = pd.to_numeric(latest_pitcher[c], errors="coerce")
+            if coerced.notna().any():
+                latest_pitcher[c] = coerced
+                numeric_cols.append(c)
     exclude = {pitcher_id_col, "pitcher", "pitcher_id", "game_pk", "season", "total_hr", "no_hr_game"}
     payload_cols = [c for c in numeric_cols if c not in exclude]
 
@@ -366,6 +375,8 @@ def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_lates
     starter_cols = [c for c in mart.columns if c.startswith("home_sp_") or c.startswith("away_sp_")]
     games_with_starter_features = int(mart[starter_cols].notna().any(axis=1).sum()) if starter_cols else 0
     logging.info("starter_feature_cols=%s games_with_starter_features=%s", len(starter_cols), games_with_starter_features)
+    if not starter_cols:
+        logging.warning("starter merge produced zero prefixed columns; check merge keys and payload column selection")
     return mart
 
 
@@ -520,6 +531,8 @@ def main() -> None:
 
     pitcher_for_merge = prev_pitcher if use_pitcher_fallback else curr_pitcher
     mart = _starter_features(mart, pitcher_for_merge, use_latest_per_pitcher=use_pitcher_fallback)
+    starter_cols_after_merge = [c for c in mart.columns if c.startswith("home_sp_") or c.startswith("away_sp_")]
+    logging.info("post-starter-merge starter column count=%s", len(starter_cols_after_merge))
 
     weather_path = dirs["processed_dir"] / "weather_game.parquet"
     if weather_path.exists():
