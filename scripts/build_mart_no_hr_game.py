@@ -222,6 +222,38 @@ def _team_rollup_by_game(batter_roll: pd.DataFrame) -> pd.DataFrame:
     agg.columns = [f"team_{c}_{m}" for c, m in agg.columns]
     return agg.reset_index()
 
+    feat_cols = _select_batter_feature_cols(batter_roll)
+    if not feat_cols:
+        return pd.DataFrame(columns=["team"])
+
+    work = _sort_for_latest(batter_roll)
+    work[batter_col] = pd.to_numeric(work[batter_col], errors="coerce").astype("Int64")
+    work = work[work[batter_col].notna() & work[team_col].notna()].copy()
+    work = work.sort_values(["_sort_date", "_sort_game_pk"], ascending=[True, True])
+    latest = work.groupby([team_col, batter_col], dropna=False).tail(1)
+
+    team_agg = latest.groupby(team_col, dropna=False)[feat_cols].agg(["mean", "max"])
+    team_agg.columns = [f"team_{c}_{m}" for c, m in team_agg.columns]
+    team_agg = team_agg.reset_index().rename(columns={team_col: "team"})
+    return team_agg
+
+
+def _team_context_from_spine(spine: pd.DataFrame) -> pd.DataFrame:
+    if "game_pk" not in spine.columns:
+        return pd.DataFrame(columns=["game_pk", "team"])
+    parts: list[pd.DataFrame] = []
+    if "home_team" in spine.columns:
+        h = spine[["game_pk", "home_team"]].rename(columns={"home_team": "team"})
+        parts.append(h)
+    if "away_team" in spine.columns:
+        a = spine[["game_pk", "away_team"]].rename(columns={"away_team": "team"})
+        parts.append(a)
+    if not parts:
+        return pd.DataFrame(columns=["game_pk", "team"])
+    out = pd.concat(parts, ignore_index=True).dropna(subset=["game_pk", "team"]).drop_duplicates()
+    out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
+    out["team"] = _normalize_team_series(out["team"]).astype("string")
+    return out
 
 def _team_rollup_latest_by_team(batter_roll: pd.DataFrame) -> pd.DataFrame:
     team_col = _pick(batter_roll, ["batter_team", "batting_team", "bat_team", "team", "offense_team"])
@@ -293,58 +325,76 @@ def _build_team_rollups_with_context(batter_roll: pd.DataFrame, team_context: pd
 def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_latest_per_pitcher: bool = False) -> pd.DataFrame:
     if pitcher_roll.empty:
         return spine
-
-    pr = pitcher_roll.copy()
-    pitcher_id_col = _pick(pr, ["pitcher_id", "pitcher"])
-    if pitcher_id_col is None:
-        return spine
     logging.info("starter merge pitcher id column=%s", pitcher_id_col)
 
-    pr[pitcher_id_col] = pd.to_numeric(pr[pitcher_id_col], errors="coerce").astype("Int64")
-    if "game_pk" in pr.columns:
-        pr["game_pk"] = pd.to_numeric(pr["game_pk"], errors="coerce")
-    if "game_date" in pr.columns:
-        pr["game_date"] = pd.to_datetime(pr["game_date"], errors="coerce")
-    pr = pr[pr[pitcher_id_col].notna()].copy()
-    logging.info("starter merge rolling pitchers total=%s", int(pr[pitcher_id_col].nunique()))
+    pitcher_df = pitcher_roll.copy()
+    if "pitcher_id" in pitcher_df.columns:
+        pitcher_id_col = "pitcher_id"
+    elif "pitcher" in pitcher_df.columns:
+        pitcher_id_col = "pitcher"
+    else:
+        return spine
 
-    out = spine.copy()
-    home_sp = _pick(out, ["home_sp_id", "home_starter_id", "home_pitcher_id", "home_starting_pitcher_id", "home_probable_pitcher_id"])
-    away_sp = _pick(out, ["away_sp_id", "away_starter_id", "away_pitcher_id", "away_starting_pitcher_id", "away_probable_pitcher_id"])
+    mart = spine.copy()
+    home_sp = _pick(mart, ["home_sp_id", "home_starter_id", "home_pitcher_id", "home_starting_pitcher_id", "home_probable_pitcher_id"])
+    away_sp = _pick(mart, ["away_sp_id", "away_starter_id", "away_pitcher_id", "away_starting_pitcher_id", "away_probable_pitcher_id"])
     if home_sp is None or away_sp is None:
-        return out
+        return mart
 
-    out["home_sp_id"] = pd.to_numeric(out[home_sp], errors="coerce").astype("Int64")
-    out["away_sp_id"] = pd.to_numeric(out[away_sp], errors="coerce").astype("Int64")
-    starter_ids = pd.concat([out["home_sp_id"], out["away_sp_id"]], ignore_index=True).dropna().nunique()
-    logging.info("starter merge distinct starter ids in spine=%s", int(starter_ids))
+    mart["home_sp_id"] = pd.to_numeric(mart[home_sp], errors="coerce").astype("Int64")
+    mart["away_sp_id"] = pd.to_numeric(mart[away_sp], errors="coerce").astype("Int64")
+    pitcher_df[pitcher_id_col] = pd.to_numeric(pitcher_df[pitcher_id_col], errors="coerce").astype("Int64")
+    pitcher_df = pitcher_df[pitcher_df[pitcher_id_col].notna()].copy()
 
-    sort_cols = [c for c in ["game_date", "game_pk"] if c in pr.columns]
+    sort_cols = [c for c in ["game_date", "game_pk"] if c in pitcher_df.columns]
     if sort_cols:
-        pr = pr.sort_values(sort_cols, ascending=True)
-    pitcher_latest = pr.groupby(pitcher_id_col, dropna=False).tail(1).copy()
-    logging.info("starter merge distinct pitcher ids in rolling snapshot=%s", int(pitcher_latest[pitcher_id_col].dropna().nunique()))
+        if "game_date" in sort_cols:
+            pitcher_df["game_date"] = pd.to_datetime(pitcher_df["game_date"], errors="coerce")
+        if "game_pk" in sort_cols:
+            pitcher_df["game_pk"] = pd.to_numeric(pitcher_df["game_pk"], errors="coerce")
 
-    numeric_cols = pitcher_latest.select_dtypes(include=["number"]).columns.tolist()
-    drop_cols = {"game_pk", "season", "total_hr", "no_hr_game"}
-    numeric_cols = [c for c in numeric_cols if c not in drop_cols]
-    if pitcher_id_col not in numeric_cols:
-        numeric_cols = [pitcher_id_col] + numeric_cols
-    numeric_cols = list(dict.fromkeys(numeric_cols))
-    pitcher_features = pitcher_latest[numeric_cols].copy()
+    latest_pitcher = pitcher_df.sort_values(sort_cols).groupby(pitcher_id_col, dropna=False).tail(1).copy() if sort_cols else pitcher_df.groupby(pitcher_id_col, dropna=False).tail(1).copy()
 
-    home_map = pitcher_features.rename(columns={c: f"home_sp_{c}" for c in pitcher_features.columns if c != pitcher_id_col})
-    away_map = pitcher_features.rename(columns={c: f"away_sp_{c}" for c in pitcher_features.columns if c != pitcher_id_col})
-    out = out.merge(home_map, left_on="home_sp_id", right_on=pitcher_id_col, how="left").drop(columns=[pitcher_id_col], errors="ignore")
-    out = out.merge(away_map, left_on="away_sp_id", right_on=pitcher_id_col, how="left").drop(columns=[pitcher_id_col], errors="ignore")
-    home_pref = [c for c in out.columns if c.startswith("home_sp_")]
-    away_pref = [c for c in out.columns if c.startswith("away_sp_")]
-    home_matches = int(out[home_pref].notna().any(axis=1).sum()) if home_pref else 0
-    away_matches = int(out[away_pref].notna().any(axis=1).sum()) if away_pref else 0
-    logging.info("starter merge matched rows home=%s away=%s", home_matches, away_matches)
-    games_with_starter_features = int(out[home_pref + away_pref].notna().any(axis=1).sum()) if (home_pref or away_pref) else 0
-    logging.info("starter merge games_with_starter_features=%s", games_with_starter_features)
-    return out
+    numeric_cols = latest_pitcher.select_dtypes(include=["number"]).columns.tolist()
+    exclude = {pitcher_id_col, "pitcher", "pitcher_id", "game_pk", "season", "total_hr", "no_hr_game"}
+    payload_cols = [c for c in numeric_cols if c not in exclude]
+
+    logging.info("starter merge rolling pitchers=%s snapshot_pitchers=%s", int(pitcher_df[pitcher_id_col].nunique()), int(latest_pitcher[pitcher_id_col].nunique()))
+    starter_ids = pd.concat([mart["home_sp_id"], mart["away_sp_id"]], ignore_index=True).dropna().nunique()
+    logging.info("starter merge unique starter ids in spine=%s", int(starter_ids))
+
+    if not payload_cols:
+        logging.warning("starter merge aborted: no payload columns found")
+        return mart
+
+    logging.info("starter payload cols=%s sample=%s", len(payload_cols), payload_cols[:10])
+
+    home_snapshot = latest_pitcher[[pitcher_id_col] + payload_cols].copy()
+    home_rename = {c: f"home_sp_{c}" for c in payload_cols}
+    home_snapshot = home_snapshot.rename(columns=home_rename)
+    mart = mart.merge(home_snapshot, how="left", left_on="home_sp_id", right_on=pitcher_id_col)
+    if pitcher_id_col in mart.columns:
+        mart = mart.drop(columns=[pitcher_id_col])
+
+    home_cols = [c for c in mart.columns if c.startswith("home_sp_")]
+    home_matches = int(mart[home_cols].notna().any(axis=1).sum()) if home_cols else 0
+    logging.info("created home_sp columns=%s home starter matches=%s", len(home_cols), home_matches)
+
+    away_snapshot = latest_pitcher[[pitcher_id_col] + payload_cols].copy()
+    away_rename = {c: f"away_sp_{c}" for c in payload_cols}
+    away_snapshot = away_snapshot.rename(columns=away_rename)
+    mart = mart.merge(away_snapshot, how="left", left_on="away_sp_id", right_on=pitcher_id_col)
+    if pitcher_id_col in mart.columns:
+        mart = mart.drop(columns=[pitcher_id_col])
+
+    away_cols = [c for c in mart.columns if c.startswith("away_sp_")]
+    away_matches = int(mart[away_cols].notna().any(axis=1).sum()) if away_cols else 0
+    logging.info("created away_sp columns=%s away starter matches=%s", len(away_cols), away_matches)
+
+    starter_cols = [c for c in mart.columns if c.startswith("home_sp_") or c.startswith("away_sp_")]
+    games_with_starter_features = int(mart[starter_cols].notna().any(axis=1).sum()) if starter_cols else 0
+    logging.info("starter_feature_cols=%s games_with_starter_features=%s", len(starter_cols), games_with_starter_features)
+    return mart
 
 
 def _attach_engineered_features(mart: pd.DataFrame) -> pd.DataFrame:
