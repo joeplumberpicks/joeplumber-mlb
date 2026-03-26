@@ -222,6 +222,38 @@ def _team_rollup_by_game(batter_roll: pd.DataFrame) -> pd.DataFrame:
     agg.columns = [f"team_{c}_{m}" for c, m in agg.columns]
     return agg.reset_index()
 
+    feat_cols = _select_batter_feature_cols(batter_roll)
+    if not feat_cols:
+        return pd.DataFrame(columns=["team"])
+
+    work = _sort_for_latest(batter_roll)
+    work[batter_col] = pd.to_numeric(work[batter_col], errors="coerce").astype("Int64")
+    work = work[work[batter_col].notna() & work[team_col].notna()].copy()
+    work = work.sort_values(["_sort_date", "_sort_game_pk"], ascending=[True, True])
+    latest = work.groupby([team_col, batter_col], dropna=False).tail(1)
+
+    team_agg = latest.groupby(team_col, dropna=False)[feat_cols].agg(["mean", "max"])
+    team_agg.columns = [f"team_{c}_{m}" for c, m in team_agg.columns]
+    team_agg = team_agg.reset_index().rename(columns={team_col: "team"})
+    return team_agg
+
+
+def _team_context_from_spine(spine: pd.DataFrame) -> pd.DataFrame:
+    if "game_pk" not in spine.columns:
+        return pd.DataFrame(columns=["game_pk", "team"])
+    parts: list[pd.DataFrame] = []
+    if "home_team" in spine.columns:
+        h = spine[["game_pk", "home_team"]].rename(columns={"home_team": "team"})
+        parts.append(h)
+    if "away_team" in spine.columns:
+        a = spine[["game_pk", "away_team"]].rename(columns={"away_team": "team"})
+        parts.append(a)
+    if not parts:
+        return pd.DataFrame(columns=["game_pk", "team"])
+    out = pd.concat(parts, ignore_index=True).dropna(subset=["game_pk", "team"]).drop_duplicates()
+    out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
+    out["team"] = _normalize_team_series(out["team"]).astype("string")
+    return out
 
 def _team_rollup_latest_by_team(batter_roll: pd.DataFrame) -> pd.DataFrame:
     team_col = _pick(batter_roll, ["batter_team", "batting_team", "bat_team", "team", "offense_team"])
@@ -293,6 +325,7 @@ def _build_team_rollups_with_context(batter_roll: pd.DataFrame, team_context: pd
 def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_latest_per_pitcher: bool = False) -> pd.DataFrame:
     if pitcher_roll.empty:
         return spine
+    logging.info("starter merge pitcher id column=%s", pitcher_id_col)
 
     pitcher_df = pitcher_roll.copy()
     if "pitcher_id" in pitcher_df.columns:
