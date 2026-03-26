@@ -289,6 +289,9 @@ def _build_team_rollups_with_context(batter_roll: pd.DataFrame, team_context: pd
     agg.columns = [f"team_{c}_{m}" for c, m in agg.columns]
     return agg.reset_index()
 
+    feat_cols = _select_batter_feature_cols(batter_roll)
+    if not feat_cols:
+        return pd.DataFrame(columns=["team"])
 
 def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_latest_per_pitcher: bool = False) -> pd.DataFrame:
     if pitcher_roll.empty:
