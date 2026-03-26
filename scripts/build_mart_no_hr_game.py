@@ -235,6 +235,16 @@ def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_lates
         logging.info("starter merge matched rows (latest-per-pitcher) home=%s away=%s", home_matches, away_matches)
         return out
 
+    if use_latest_per_pitcher:
+        slim = _sort_for_latest(pr[["game_pk", "pitcher_id"] + num_cols + (["game_date"] if "game_date" in pr.columns else [])])
+        slim = slim.sort_values(["_sort_date", "_sort_game_pk"], ascending=[True, True])
+        slim = slim.groupby(["pitcher_id"], dropna=False).tail(1)
+        h = slim[["pitcher_id"] + num_cols].rename(columns={c: f"home_sp_{c}" for c in num_cols})
+        a = slim[["pitcher_id"] + num_cols].rename(columns={c: f"away_sp_{c}" for c in num_cols})
+        out = out.merge(h, left_on="home_sp_id", right_on="pitcher_id", how="left").drop(columns=["pitcher_id"], errors="ignore")
+        out = out.merge(a, left_on="away_sp_id", right_on="pitcher_id", how="left").drop(columns=["pitcher_id"], errors="ignore")
+        return out
+
     slim = pr[["game_pk", "pitcher_id"] + num_cols].drop_duplicates(subset=["game_pk", "pitcher_id"])
     h = slim.rename(columns={c: f"home_sp_{c}" for c in num_cols})
     a = slim.rename(columns={c: f"away_sp_{c}" for c in num_cols})
@@ -261,6 +271,48 @@ def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_lates
         home_matches = int(out[home_pref].notna().any(axis=1).sum()) if home_pref else 0
         away_matches = int(out[away_pref].notna().any(axis=1).sum()) if away_pref else 0
         logging.info("starter merge fallback matched rows (pitcher-only latest) home=%s away=%s", home_matches, away_matches)
+    return out
+
+
+def _attach_engineered_features(mart: pd.DataFrame) -> pd.DataFrame:
+    out = mart.copy()
+
+    def _as_numeric_series(df: pd.DataFrame, value: object, default: float) -> pd.Series:
+        if isinstance(value, str) and value in df.columns:
+            return pd.to_numeric(df[value], errors="coerce")
+        if isinstance(value, pd.Series):
+            return pd.to_numeric(value.reindex(df.index), errors="coerce")
+        return pd.Series(default, index=df.index, dtype="float64")
+
+    temp_col = _pick_contains(list(out.columns), ["temperature", "temp"])
+    wind_speed_col = _pick_contains(list(out.columns), ["wind_speed", "wind_mph", "wind"])
+    if temp_col or wind_speed_col:
+        temp_v = _as_numeric_series(out, temp_col, 70.0)
+        wind_v = _as_numeric_series(out, wind_speed_col, 0.0)
+        out["env_temp_wind_interaction"] = temp_v * wind_v
+
+    park_hr_col = _pick_contains(list(out.columns), ["park_hr", "hr_factor", "home_run_factor", "hr_park"])
+    wind_out_col = _pick_contains(list(out.columns), ["wind_out", "windout"])
+    wind_in_col = _pick_contains(list(out.columns), ["wind_in", "windin"])
+    if temp_col or wind_speed_col or park_hr_col or wind_out_col or wind_in_col:
+        temp_v = _as_numeric_series(out, temp_col, 70.0)
+        wind_v = _as_numeric_series(out, wind_speed_col, 0.0)
+        park_v = _as_numeric_series(out, park_hr_col, 1.0)
+        wind_out_v = _as_numeric_series(out, wind_out_col, 0.0)
+        wind_in_v = _as_numeric_series(out, wind_in_col, 0.0)
+        out["combined_park_weather_hr_index"] = (temp_v.fillna(70.0) / 70.0) * (1.0 + wind_v.fillna(0.0) / 20.0) * pd.to_numeric(park_v, errors="coerce").fillna(1.0)
+        out["env_hr_suppression_proxy"] = (1.0 / out["combined_park_weather_hr_index"].clip(lower=0.25, upper=5.0)) + (wind_in_v.fillna(0.0) * 0.02) - (wind_out_v.fillna(0.0) * 0.02)
+
+    home_sp_col = _pick_contains([c for c in out.columns if c.startswith("home_sp_")], ["hr", "barrel", "hard_hit", "slug", "iso", "xbh"])
+    away_sp_col = _pick_contains([c for c in out.columns if c.startswith("away_sp_")], ["hr", "barrel", "hard_hit", "slug", "iso", "xbh"])
+    home_team_power_col = _pick_contains([c for c in out.columns if c.startswith("home_team_")], ["hr", "barrel", "hard_hit", "slug", "iso", "xbh"])
+    away_team_power_col = _pick_contains([c for c in out.columns if c.startswith("away_team_")], ["hr", "barrel", "hard_hit", "slug", "iso", "xbh"])
+
+    if away_sp_col and home_team_power_col:
+        out["starter_hr_suppression_gap_away_vs_home"] = pd.to_numeric(out[away_sp_col], errors="coerce") - pd.to_numeric(out[home_team_power_col], errors="coerce")
+    if home_sp_col and away_team_power_col:
+        out["starter_hr_suppression_gap_home_vs_away"] = pd.to_numeric(out[home_sp_col], errors="coerce") - pd.to_numeric(out[away_team_power_col], errors="coerce")
+
     return out
 
 
