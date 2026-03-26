@@ -51,19 +51,41 @@ def _load_marts(dirs: dict[str, Path], seasons: list[int]) -> pd.DataFrame:
 
 
 def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]:
-    drop_cols = {
+    always_drop = {
+        "no_hr_game",
+        "total_hr",
         "game_pk",
         "game_date",
-        target_col,
-        "total_hr",
+        "home_sp_id",
+        "away_sp_id",
         "home_team",
         "away_team",
+        "park_name",
         "canonical_park_key",
-        "batter_feature_source",
-        "pitcher_feature_source",
+        target_col,
     }
-    feats = [c for c in df.columns if c not in drop_cols]
-    X = df[feats].copy()
+    engineered_allow = {
+        "combined_park_weather_hr_index",
+        "env_hr_suppression_proxy",
+        "starter_hr_suppression_gap_away_vs_home",
+        "starter_hr_suppression_gap_home_vs_away",
+    }
+
+    initial_feats = [c for c in df.columns if c not in always_drop]
+    dropped_cols: list[str] = []
+    kept_cols: list[str] = []
+    for c in initial_feats:
+        lc = c.lower()
+        drop_by_hr = (("_hr_" in lc) or lc.endswith("_hr") or lc == "hr") and (c not in engineered_allow)
+        drop_by_game_pk_proxy = ("game_pk_roll" in lc) or (lc == "game_pk")
+        drop_by_date_proxy = lc == "game_date"
+        drop_by_starter_ids = lc in {"home_sp_id", "away_sp_id"}
+        if drop_by_hr or drop_by_game_pk_proxy or drop_by_date_proxy or drop_by_starter_ids:
+            dropped_cols.append(c)
+        else:
+            kept_cols.append(c)
+
+    X = df[kept_cols].copy()
 
     for c in X.columns:
         if pd.api.types.is_bool_dtype(X[c]):
@@ -74,6 +96,15 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
     X = X.replace([np.inf, -np.inf], np.nan)
     keep = [c for c in X.columns if X[c].notna().any()]
     X = X[keep].astype("float32") if keep else pd.DataFrame({"bias": np.zeros(len(df), dtype="float32")})
+
+    logging.info(
+        "feature selection initial=%s dropped=%s kept=%s dropped_sample=%s kept_sample=%s",
+        len(initial_feats),
+        len(dropped_cols),
+        len(keep),
+        dropped_cols[:25],
+        keep[:25],
+    )
     return X, list(X.columns)
 
 
