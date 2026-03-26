@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -61,6 +62,32 @@ def _filter_season(df: pd.DataFrame, season: int) -> pd.DataFrame:
     elif "season" in out.columns:
         out = out[pd.to_numeric(out["season"], errors="coerce") == season].copy()
     return out
+
+
+def _load_spine_for_season(dirs: dict[str, Path], season: int) -> pd.DataFrame:
+    hist_path = dirs["processed_dir"] / "model_spine_game.parquet"
+    hist = _filter_season(read_parquet(hist_path), season)
+    logging.info("historical spine path=%s season=%s rows=%s", hist_path.resolve(), season, len(hist))
+    if len(hist):
+        logging.info("using historical spine for season=%s", season)
+        return hist
+
+    live_dir = dirs["processed_dir"] / "live"
+    candidates = sorted(live_dir.glob(f"model_spine_game_{season}_*.parquet"))
+    if not candidates:
+        logging.warning("no live spine candidates found for season=%s in %s", season, live_dir.resolve())
+        return hist
+
+    def _rank_live_path(p: Path) -> tuple[pd.Timestamp, float]:
+        m = re.search(rf"model_spine_game_{season}_(\d{{4}}-\d{{2}}-\d{{2}})\.parquet$", p.name)
+        ts = pd.to_datetime(m.group(1), errors="coerce") if m else pd.NaT
+        return (ts if pd.notna(ts) else pd.Timestamp.min, p.stat().st_mtime)
+
+    live_path = max(candidates, key=_rank_live_path)
+    live_spine = read_parquet(live_path)
+    live_spine = _filter_season(live_spine, season)
+    logging.info("using live spine fallback season=%s path=%s rows=%s", season, live_path.resolve(), len(live_spine))
+    return live_spine
 
 
 def _usable_batter_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -167,24 +194,46 @@ def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_lates
     pid_col = _pick(pr, ["pitcher_id", "pitcher", "mlbam_pitcher_id", "player_id"])
     if pid_col is None:
         return spine
+    logging.info("starter merge pitcher id column=%s", pid_col)
 
     pr["pitcher_id"] = pd.to_numeric(pr[pid_col], errors="coerce").astype("Int64")
-    num_cols = [
-        c
-        for c in pr.select_dtypes(include=["number"]).columns
-        if c not in {"game_pk", "pitcher_id", "season"}
-    ]
+    exclude = {"game_pk", "pitcher_id", "season", pid_col}
+    num_cols: list[str] = []
+    for c in pr.columns:
+        if c in exclude:
+            continue
+        series = pr[c] if pd.api.types.is_numeric_dtype(pr[c]) else pd.to_numeric(pr[c], errors="coerce")
+        if series.notna().any():
+            pr[c] = series
+            num_cols.append(c)
     if not num_cols:
         return spine
 
     out = spine.copy()
-    home_sp = _pick(out, ["home_sp_id", "home_starter_id", "home_pitcher_id", "home_starting_pitcher_id"])
-    away_sp = _pick(out, ["away_sp_id", "away_starter_id", "away_pitcher_id", "away_starting_pitcher_id"])
+    home_sp = _pick(out, ["home_sp_id", "home_starter_id", "home_pitcher_id", "home_starting_pitcher_id", "home_probable_pitcher_id", "home_pitcher"])
+    away_sp = _pick(out, ["away_sp_id", "away_starter_id", "away_pitcher_id", "away_starting_pitcher_id", "away_probable_pitcher_id", "away_pitcher"])
     if home_sp is None or away_sp is None:
         return out
 
     out["home_sp_id"] = pd.to_numeric(out[home_sp], errors="coerce").astype("Int64")
     out["away_sp_id"] = pd.to_numeric(out[away_sp], errors="coerce").astype("Int64")
+    starter_ids = pd.concat([out["home_sp_id"], out["away_sp_id"]], ignore_index=True).dropna().nunique()
+    logging.info("starter merge distinct starter ids in spine=%s", int(starter_ids))
+
+    if use_latest_per_pitcher:
+        slim = _sort_for_latest(pr[["game_pk", "pitcher_id"] + num_cols + (["game_date"] if "game_date" in pr.columns else [])])
+        slim = slim.sort_values(["_sort_date", "_sort_game_pk"], ascending=[True, True])
+        slim = slim.groupby(["pitcher_id"], dropna=False).tail(1)
+        h = slim[["pitcher_id"] + num_cols].rename(columns={c: f"home_sp_{c}" for c in num_cols})
+        a = slim[["pitcher_id"] + num_cols].rename(columns={c: f"away_sp_{c}" for c in num_cols})
+        out = out.merge(h, left_on="home_sp_id", right_on="pitcher_id", how="left").drop(columns=["pitcher_id"], errors="ignore")
+        out = out.merge(a, left_on="away_sp_id", right_on="pitcher_id", how="left").drop(columns=["pitcher_id"], errors="ignore")
+        home_pref = [c for c in out.columns if c.startswith("home_sp_")]
+        away_pref = [c for c in out.columns if c.startswith("away_sp_")]
+        home_matches = int(out[home_pref].notna().any(axis=1).sum()) if home_pref else 0
+        away_matches = int(out[away_pref].notna().any(axis=1).sum()) if away_pref else 0
+        logging.info("starter merge matched rows (latest-per-pitcher) home=%s away=%s", home_matches, away_matches)
+        return out
 
     if use_latest_per_pitcher:
         slim = _sort_for_latest(pr[["game_pk", "pitcher_id"] + num_cols + (["game_date"] if "game_date" in pr.columns else [])])
@@ -203,6 +252,67 @@ def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_lates
     out = out.drop(columns=["pitcher_id"], errors="ignore")
     out = out.merge(a, left_on=["game_pk", "away_sp_id"], right_on=["game_pk", "pitcher_id"], how="left")
     out = out.drop(columns=["pitcher_id"], errors="ignore")
+    home_pref = [c for c in out.columns if c.startswith("home_sp_")]
+    away_pref = [c for c in out.columns if c.startswith("away_sp_")]
+    home_matches = int(out[home_pref].notna().any(axis=1).sum()) if home_pref else 0
+    away_matches = int(out[away_pref].notna().any(axis=1).sum()) if away_pref else 0
+    logging.info("starter merge matched rows (game+pitcher) home=%s away=%s", home_matches, away_matches)
+
+    if (home_matches == 0 and away_matches == 0) and not out.empty:
+        latest = _sort_for_latest(pr[["game_pk", "pitcher_id"] + num_cols + (["game_date"] if "game_date" in pr.columns else [])])
+        latest = latest.sort_values(["_sort_date", "_sort_game_pk"], ascending=[True, True]).groupby(["pitcher_id"], dropna=False).tail(1)
+        h_latest = latest[["pitcher_id"] + num_cols].rename(columns={c: f"home_sp_{c}" for c in num_cols})
+        a_latest = latest[["pitcher_id"] + num_cols].rename(columns={c: f"away_sp_{c}" for c in num_cols})
+        out = out.drop(columns=[c for c in out.columns if c.startswith("home_sp_") or c.startswith("away_sp_")], errors="ignore")
+        out = out.merge(h_latest, left_on="home_sp_id", right_on="pitcher_id", how="left").drop(columns=["pitcher_id"], errors="ignore")
+        out = out.merge(a_latest, left_on="away_sp_id", right_on="pitcher_id", how="left").drop(columns=["pitcher_id"], errors="ignore")
+        home_pref = [c for c in out.columns if c.startswith("home_sp_")]
+        away_pref = [c for c in out.columns if c.startswith("away_sp_")]
+        home_matches = int(out[home_pref].notna().any(axis=1).sum()) if home_pref else 0
+        away_matches = int(out[away_pref].notna().any(axis=1).sum()) if away_pref else 0
+        logging.info("starter merge fallback matched rows (pitcher-only latest) home=%s away=%s", home_matches, away_matches)
+    return out
+
+
+def _attach_engineered_features(mart: pd.DataFrame) -> pd.DataFrame:
+    out = mart.copy()
+
+    def _as_numeric_series(df: pd.DataFrame, value: object, default: float) -> pd.Series:
+        if isinstance(value, str) and value in df.columns:
+            return pd.to_numeric(df[value], errors="coerce")
+        if isinstance(value, pd.Series):
+            return pd.to_numeric(value.reindex(df.index), errors="coerce")
+        return pd.Series(default, index=df.index, dtype="float64")
+
+    temp_col = _pick_contains(list(out.columns), ["temperature", "temp"])
+    wind_speed_col = _pick_contains(list(out.columns), ["wind_speed", "wind_mph", "wind"])
+    if temp_col or wind_speed_col:
+        temp_v = _as_numeric_series(out, temp_col, 70.0)
+        wind_v = _as_numeric_series(out, wind_speed_col, 0.0)
+        out["env_temp_wind_interaction"] = temp_v * wind_v
+
+    park_hr_col = _pick_contains(list(out.columns), ["park_hr", "hr_factor", "home_run_factor", "hr_park"])
+    wind_out_col = _pick_contains(list(out.columns), ["wind_out", "windout"])
+    wind_in_col = _pick_contains(list(out.columns), ["wind_in", "windin"])
+    if temp_col or wind_speed_col or park_hr_col or wind_out_col or wind_in_col:
+        temp_v = _as_numeric_series(out, temp_col, 70.0)
+        wind_v = _as_numeric_series(out, wind_speed_col, 0.0)
+        park_v = _as_numeric_series(out, park_hr_col, 1.0)
+        wind_out_v = _as_numeric_series(out, wind_out_col, 0.0)
+        wind_in_v = _as_numeric_series(out, wind_in_col, 0.0)
+        out["combined_park_weather_hr_index"] = (temp_v.fillna(70.0) / 70.0) * (1.0 + wind_v.fillna(0.0) / 20.0) * pd.to_numeric(park_v, errors="coerce").fillna(1.0)
+        out["env_hr_suppression_proxy"] = (1.0 / out["combined_park_weather_hr_index"].clip(lower=0.25, upper=5.0)) + (wind_in_v.fillna(0.0) * 0.02) - (wind_out_v.fillna(0.0) * 0.02)
+
+    home_sp_col = _pick_contains([c for c in out.columns if c.startswith("home_sp_")], ["hr", "barrel", "hard_hit", "slug", "iso", "xbh"])
+    away_sp_col = _pick_contains([c for c in out.columns if c.startswith("away_sp_")], ["hr", "barrel", "hard_hit", "slug", "iso", "xbh"])
+    home_team_power_col = _pick_contains([c for c in out.columns if c.startswith("home_team_")], ["hr", "barrel", "hard_hit", "slug", "iso", "xbh"])
+    away_team_power_col = _pick_contains([c for c in out.columns if c.startswith("away_team_")], ["hr", "barrel", "hard_hit", "slug", "iso", "xbh"])
+
+    if away_sp_col and home_team_power_col:
+        out["starter_hr_suppression_gap_away_vs_home"] = pd.to_numeric(out[away_sp_col], errors="coerce") - pd.to_numeric(out[home_team_power_col], errors="coerce")
+    if home_sp_col and away_team_power_col:
+        out["starter_hr_suppression_gap_home_vs_away"] = pd.to_numeric(out[home_sp_col], errors="coerce") - pd.to_numeric(out[away_team_power_col], errors="coerce")
+
     return out
 
 
@@ -268,7 +378,7 @@ def main() -> None:
 
     logging.info("requested season=%s", args.season)
 
-    spine = _filter_season(read_parquet(dirs["processed_dir"] / "model_spine_game.parquet"), args.season)
+    spine = _load_spine_for_season(dirs, args.season)
     spine = spine.copy()
     spine["game_pk"] = pd.to_numeric(spine["game_pk"], errors="coerce").astype("Int64")
 
