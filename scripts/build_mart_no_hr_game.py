@@ -209,22 +209,29 @@ def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_lates
 def _attach_engineered_features(mart: pd.DataFrame) -> pd.DataFrame:
     out = mart.copy()
 
+    def _as_numeric_series(df: pd.DataFrame, value: object, default: float) -> pd.Series:
+        if isinstance(value, str) and value in df.columns:
+            return pd.to_numeric(df[value], errors="coerce")
+        if isinstance(value, pd.Series):
+            return pd.to_numeric(value.reindex(df.index), errors="coerce")
+        return pd.Series(default, index=df.index, dtype="float64")
+
     temp_col = _pick_contains(list(out.columns), ["temperature", "temp"])
     wind_speed_col = _pick_contains(list(out.columns), ["wind_speed", "wind_mph", "wind"])
-    if temp_col and wind_speed_col:
-        temp_v = pd.to_numeric(out[temp_col], errors="coerce")
-        wind_v = pd.to_numeric(out[wind_speed_col], errors="coerce")
+    if temp_col or wind_speed_col:
+        temp_v = _as_numeric_series(out, temp_col, 70.0)
+        wind_v = _as_numeric_series(out, wind_speed_col, 0.0)
         out["env_temp_wind_interaction"] = temp_v * wind_v
 
     park_hr_col = _pick_contains(list(out.columns), ["park_hr", "hr_factor", "home_run_factor", "hr_park"])
     wind_out_col = _pick_contains(list(out.columns), ["wind_out", "windout"])
     wind_in_col = _pick_contains(list(out.columns), ["wind_in", "windin"])
-    if temp_col and wind_speed_col:
-        temp_v = pd.to_numeric(out[temp_col], errors="coerce")
-        wind_v = pd.to_numeric(out[wind_speed_col], errors="coerce")
-        park_v = pd.to_numeric(out[park_hr_col], errors="coerce") if park_hr_col else 1.0
-        wind_out_v = pd.to_numeric(out[wind_out_col], errors="coerce") if wind_out_col else 0.0
-        wind_in_v = pd.to_numeric(out[wind_in_col], errors="coerce") if wind_in_col else 0.0
+    if temp_col or wind_speed_col or park_hr_col or wind_out_col or wind_in_col:
+        temp_v = _as_numeric_series(out, temp_col, 70.0)
+        wind_v = _as_numeric_series(out, wind_speed_col, 0.0)
+        park_v = _as_numeric_series(out, park_hr_col, 1.0)
+        wind_out_v = _as_numeric_series(out, wind_out_col, 0.0)
+        wind_in_v = _as_numeric_series(out, wind_in_col, 0.0)
         out["combined_park_weather_hr_index"] = (temp_v.fillna(70.0) / 70.0) * (1.0 + wind_v.fillna(0.0) / 20.0) * pd.to_numeric(park_v, errors="coerce").fillna(1.0)
         out["env_hr_suppression_proxy"] = (1.0 / out["combined_park_weather_hr_index"].clip(lower=0.25, upper=5.0)) + (wind_in_v.fillna(0.0) * 0.02) - (wind_out_v.fillna(0.0) * 0.02)
 
