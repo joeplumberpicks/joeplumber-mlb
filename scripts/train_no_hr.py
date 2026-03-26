@@ -64,28 +64,36 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         "canonical_park_key",
         target_col,
     }
-    engineered_allow = {
+    explicit_allow = {
+        "season",
+        "park_id",
+        "temperature",
+        "wind_speed",
+        "wind_direction",
         "combined_park_weather_hr_index",
         "env_hr_suppression_proxy",
         "starter_hr_suppression_gap_away_vs_home",
         "starter_hr_suppression_gap_home_vs_away",
+        "venue_id",
+        "park_factor",
+        "hr_factor",
     }
+    roll_tokens = ("_roll3", "_roll7", "_roll15", "_roll30")
 
     initial_feats = [c for c in df.columns if c not in always_drop]
     dropped_cols: list[str] = []
-    kept_cols: list[str] = []
+    allow_kept_cols: list[str] = []
     for c in initial_feats:
         lc = c.lower()
-        drop_by_hr = (("_hr_" in lc) or lc.endswith("_hr") or lc == "hr") and (c not in engineered_allow)
-        drop_by_game_pk_proxy = ("game_pk_roll" in lc) or (lc == "game_pk")
-        drop_by_date_proxy = lc == "game_date"
-        drop_by_starter_ids = lc in {"home_sp_id", "away_sp_id"}
-        if drop_by_hr or drop_by_game_pk_proxy or drop_by_date_proxy or drop_by_starter_ids:
-            dropped_cols.append(c)
+        is_roll = any(tok in lc for tok in roll_tokens)
+        is_explicit_allow = c in explicit_allow
+        is_weather_prefield = lc.startswith("weather_")
+        if is_roll or is_explicit_allow or is_weather_prefield:
+            allow_kept_cols.append(c)
         else:
-            kept_cols.append(c)
+            dropped_cols.append(c)
 
-    X = df[kept_cols].copy()
+    X = df[allow_kept_cols].copy()
 
     for c in X.columns:
         if pd.api.types.is_bool_dtype(X[c]):
@@ -98,12 +106,12 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
     X = X[keep].astype("float32") if keep else pd.DataFrame({"bias": np.zeros(len(df), dtype="float32")})
 
     logging.info(
-        "feature selection initial=%s dropped=%s kept=%s dropped_sample=%s kept_sample=%s",
+        "feature selection initial=%s kept=%s dropped=%s kept_sample=%s dropped_sample=%s",
         len(initial_feats),
-        len(dropped_cols),
         len(keep),
-        dropped_cols[:25],
-        keep[:25],
+        len(dropped_cols),
+        keep[:40],
+        dropped_cols[:40],
     )
     return X, list(X.columns)
 
