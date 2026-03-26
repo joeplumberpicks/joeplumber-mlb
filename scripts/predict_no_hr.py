@@ -54,15 +54,30 @@ def main() -> None:
     mart_path = dirs["processed_dir"] / "marts" / "no_hr" / f"no_hr_game_features_{args.season}.parquet"
     mart = read_parquet(mart_path)
 
-    X = mart[features].copy() if features else pd.DataFrame(index=mart.index)
+    X = pd.DataFrame(index=mart.index)
+    missing_features: list[str] = []
+    for f in features:
+        if f in mart.columns:
+            X[f] = mart[f]
+        else:
+            X[f] = pd.NA
+            missing_features.append(f)
+
     if X.empty:
         X = pd.DataFrame({"bias": [0.0] * len(mart)})
+
     for c in X.columns:
         X[c] = pd.to_numeric(X[c], errors="coerce")
 
     p_no_hr = model.predict_proba(X)[:, 1]
 
-    out = mart[[c for c in ["game_pk", "game_date", "home_team", "away_team"] if c in mart.columns]].copy()
+    base_cols = [c for c in ["game_pk", "game_date", "home_team", "away_team"] if c in mart.columns]
+    diag_cols = [
+        c
+        for c in ["batter_feature_source", "pitcher_feature_source", "fallback_used", "feature_snapshot_season"]
+        if c in mart.columns
+    ]
+    out = mart[base_cols + diag_cols].copy()
     out["p_no_hr"] = p_no_hr
     out["tier"] = out["p_no_hr"].apply(_tier)
 
@@ -74,7 +89,16 @@ def main() -> None:
     else:
         write_parquet(out, out_path)
 
-    logging.info("no_hr_predictions rows=%s p_min=%.6f p_max=%.6f path=%s", len(out), float(out["p_no_hr"].min()) if len(out) else 0.0, float(out["p_no_hr"].max()) if len(out) else 0.0, out_path.resolve())
+    if missing_features:
+        logging.warning("Missing model features in mart (filled with NaN): count=%s sample=%s", len(missing_features), missing_features[:10])
+
+    logging.info(
+        "no_hr_predictions rows=%s p_min=%.6f p_max=%.6f path=%s",
+        len(out),
+        float(out["p_no_hr"].min()) if len(out) else 0.0,
+        float(out["p_no_hr"].max()) if len(out) else 0.0,
+        out_path.resolve(),
+    )
     print(f"no_hr_predictions -> {out_path.resolve()}")
 
 
