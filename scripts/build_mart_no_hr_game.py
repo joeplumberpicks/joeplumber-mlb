@@ -289,37 +289,28 @@ def _build_team_rollups_with_context(batter_roll: pd.DataFrame, team_context: pd
     agg.columns = [f"team_{c}_{m}" for c, m in agg.columns]
     return agg.reset_index()
 
-    feat_cols = _select_batter_feature_cols(batter_roll)
-    if not feat_cols:
-        return pd.DataFrame(columns=["team"])
 
 def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_latest_per_pitcher: bool = False) -> pd.DataFrame:
     if pitcher_roll.empty:
         return spine
 
     pr = pitcher_roll.copy()
-    pr["game_pk"] = pd.to_numeric(pr.get("game_pk"), errors="coerce").astype("Int64")
-    pid_col = _pick(pr, ["pitcher_id", "pitcher", "mlbam_pitcher_id", "player_id"])
-    if pid_col is None:
+    pitcher_id_col = _pick(pr, ["pitcher_id", "pitcher"])
+    if pitcher_id_col is None:
         return spine
-    logging.info("starter merge pitcher id column=%s", pid_col)
+    logging.info("starter merge pitcher id column=%s", pitcher_id_col)
 
-    pr["pitcher_id"] = pd.to_numeric(pr[pid_col], errors="coerce").astype("Int64")
-    exclude = {"game_pk", "pitcher_id", "season", pid_col}
-    num_cols: list[str] = []
-    for c in pr.columns:
-        if c in exclude:
-            continue
-        series = pr[c] if pd.api.types.is_numeric_dtype(pr[c]) else pd.to_numeric(pr[c], errors="coerce")
-        if series.notna().any():
-            pr[c] = series
-            num_cols.append(c)
-    if not num_cols:
-        return spine
+    pr[pitcher_id_col] = pd.to_numeric(pr[pitcher_id_col], errors="coerce").astype("Int64")
+    if "game_pk" in pr.columns:
+        pr["game_pk"] = pd.to_numeric(pr["game_pk"], errors="coerce")
+    if "game_date" in pr.columns:
+        pr["game_date"] = pd.to_datetime(pr["game_date"], errors="coerce")
+    pr = pr[pr[pitcher_id_col].notna()].copy()
+    logging.info("starter merge rolling pitchers total=%s", int(pr[pitcher_id_col].nunique()))
 
     out = spine.copy()
-    home_sp = _pick(out, ["home_sp_id", "home_starter_id", "home_pitcher_id", "home_starting_pitcher_id", "home_probable_pitcher_id", "home_pitcher"])
-    away_sp = _pick(out, ["away_sp_id", "away_starter_id", "away_pitcher_id", "away_starting_pitcher_id", "away_probable_pitcher_id", "away_pitcher"])
+    home_sp = _pick(out, ["home_sp_id", "home_starter_id", "home_pitcher_id", "home_starting_pitcher_id", "home_probable_pitcher_id"])
+    away_sp = _pick(out, ["away_sp_id", "away_starter_id", "away_pitcher_id", "away_starting_pitcher_id", "away_probable_pitcher_id"])
     if home_sp is None or away_sp is None:
         return out
 
@@ -328,18 +319,31 @@ def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_lates
     starter_ids = pd.concat([out["home_sp_id"], out["away_sp_id"]], ignore_index=True).dropna().nunique()
     logging.info("starter merge distinct starter ids in spine=%s", int(starter_ids))
 
-    slim = _sort_for_latest(pr[["game_pk", "pitcher_id"] + num_cols + (["game_date"] if "game_date" in pr.columns else [])])
-    slim = slim.sort_values(["_sort_date", "_sort_game_pk"], ascending=[True, True]).groupby(["pitcher_id"], dropna=False).tail(1)
-    logging.info("starter merge distinct pitcher ids in rolling snapshot=%s", int(slim["pitcher_id"].dropna().nunique()))
-    h = slim[["pitcher_id"] + num_cols].rename(columns={c: f"home_sp_{c}" for c in num_cols})
-    a = slim[["pitcher_id"] + num_cols].rename(columns={c: f"away_sp_{c}" for c in num_cols})
-    out = out.merge(h, left_on="home_sp_id", right_on="pitcher_id", how="left").drop(columns=["pitcher_id"], errors="ignore")
-    out = out.merge(a, left_on="away_sp_id", right_on="pitcher_id", how="left").drop(columns=["pitcher_id"], errors="ignore")
+    sort_cols = [c for c in ["game_date", "game_pk"] if c in pr.columns]
+    if sort_cols:
+        pr = pr.sort_values(sort_cols, ascending=True)
+    pitcher_latest = pr.groupby(pitcher_id_col, dropna=False).tail(1).copy()
+    logging.info("starter merge distinct pitcher ids in rolling snapshot=%s", int(pitcher_latest[pitcher_id_col].dropna().nunique()))
+
+    numeric_cols = pitcher_latest.select_dtypes(include=["number"]).columns.tolist()
+    drop_cols = {"game_pk", "season", "total_hr", "no_hr_game"}
+    numeric_cols = [c for c in numeric_cols if c not in drop_cols]
+    if pitcher_id_col not in numeric_cols:
+        numeric_cols = [pitcher_id_col] + numeric_cols
+    numeric_cols = list(dict.fromkeys(numeric_cols))
+    pitcher_features = pitcher_latest[numeric_cols].copy()
+
+    home_map = pitcher_features.rename(columns={c: f"home_sp_{c}" for c in pitcher_features.columns if c != pitcher_id_col})
+    away_map = pitcher_features.rename(columns={c: f"away_sp_{c}" for c in pitcher_features.columns if c != pitcher_id_col})
+    out = out.merge(home_map, left_on="home_sp_id", right_on=pitcher_id_col, how="left").drop(columns=[pitcher_id_col], errors="ignore")
+    out = out.merge(away_map, left_on="away_sp_id", right_on=pitcher_id_col, how="left").drop(columns=[pitcher_id_col], errors="ignore")
     home_pref = [c for c in out.columns if c.startswith("home_sp_")]
     away_pref = [c for c in out.columns if c.startswith("away_sp_")]
     home_matches = int(out[home_pref].notna().any(axis=1).sum()) if home_pref else 0
     away_matches = int(out[away_pref].notna().any(axis=1).sum()) if away_pref else 0
     logging.info("starter merge matched rows home=%s away=%s", home_matches, away_matches)
+    games_with_starter_features = int(out[home_pref + away_pref].notna().any(axis=1).sum()) if (home_pref or away_pref) else 0
+    logging.info("starter merge games_with_starter_features=%s", games_with_starter_features)
     return out
 
 
