@@ -40,30 +40,59 @@ SUPPRESSION_KEYWORDS = [
 DANGER_TOKENS = [
     "barrel",
     "hard_hit",
+    "hardhit",
     "launch_speed",
     "launch_angle",
-    "fb",
-    "fly",
-    "air",
+    "fly_ball",
+    "flyball",
+    "fb_rate",
+    "air_ball",
+    "airball",
+    "air_rate",
     "pulled",
+    "pulled_air",
+    "pull_air",
     "xbh",
     "iso",
     "slug",
+    "slg",
 ]
 
 PITCHER_SUPPRESSION_TOKENS = [
     "barrel",
     "hard_hit",
+    "hardhit",
     "launch_speed",
     "launch_angle",
-    "fb",
+    "fly_ball",
+    "flyball",
+    "fb_rate",
+    "air_ball",
+    "airball",
+    "air_rate",
     "fly",
-    "air",
-    "hr",
     "contact_rate",
     "whiff_rate",
     "chase_rate",
 ]
+
+STRICT_EXCLUDE_SUBSTRINGS = [
+    "game_pk",
+    "park_id",
+    "pitches",
+    "swings",
+    "whiffs",
+    "contacts",
+    "chases",
+    "in_zone_pitches",
+    "_k_",
+    "_bb_",
+    "_h_",
+    "_hbp_",
+    "_hr_",
+]
+
+STRICT_EXCLUDE_SUFFIXES = ("_k", "_bb", "_h", "_hbp", "_hr")
 
 TEAM_ABBR_MAP = {
     "arizona diamondbacks": "AZ",
@@ -295,10 +324,11 @@ def _select_batter_feature_cols(batter_roll: pd.DataFrame) -> list[str]:
         if not pd.api.types.is_numeric_dtype(batter_roll[c]):
             continue
         lc = c.lower()
-        is_danger = any(k in lc for k in DANGER_TOKENS)
-        is_suppression = any(k in lc for k in SUPPRESSION_KEYWORDS)
         is_roll_like = "roll" in lc
-        if (is_roll_like and (is_danger or is_suppression)) and "team" not in lc:
+        is_allowed_family = any(k in lc for k in DANGER_TOKENS)
+        has_strict_excluded_substring = any(tok in lc for tok in STRICT_EXCLUDE_SUBSTRINGS)
+        has_strict_excluded_suffix = lc.endswith(STRICT_EXCLUDE_SUFFIXES)
+        if is_roll_like and is_allowed_family and (not has_strict_excluded_substring) and (not has_strict_excluded_suffix) and "team" not in lc:
             num_cols.append(c)
     logging.info("selected HR-danger batter rolling columns=%s sample=%s", len(num_cols), num_cols[:15])
     return num_cols
@@ -576,40 +606,36 @@ def _attach_engineered_features(mart: pd.DataFrame) -> pd.DataFrame:
         out["starter_hr_suppression_gap_home_vs_away"] = pd.to_numeric(out[home_sp_col], errors="coerce") - pd.to_numeric(out[away_team_power_col], errors="coerce")
         engineered_matchup_env += 1
 
-    def _first_numeric_matching(cols: list[str], tokens: list[str], starts_with: str) -> pd.Series | None:
-        for c in cols:
+    def _collect_prefixed_numeric_cols(starts_with: str, allow_tokens: list[str]) -> list[str]:
+        matched: list[str] = []
+        for c in out.columns:
+            if not c.startswith(starts_with):
+                continue
             lc = c.lower()
-            if c.startswith(starts_with) and any(t in lc for t in tokens):
-                series = pd.to_numeric(out[c], errors="coerce")
-                if series.notna().any():
-                    return series
-        return None
+            if not any(tok in lc for tok in allow_tokens):
+                continue
+            if any(tok in lc for tok in STRICT_EXCLUDE_SUBSTRINGS):
+                continue
+            if lc.endswith(STRICT_EXCLUDE_SUFFIXES):
+                continue
+            if not pd.api.types.is_numeric_dtype(out[c]):
+                continue
+            matched.append(c)
+        return matched
 
-    starter_cols = list(out.columns)
-    home_bad_parts = [
-        _first_numeric_matching(starter_cols, ["barrel", "hard_hit", "launch_speed", "launch_angle", "fb", "fly", "air", "hr"], "home_sp_"),
-    ]
-    away_bad_parts = [
-        _first_numeric_matching(starter_cols, ["barrel", "hard_hit", "launch_speed", "launch_angle", "fb", "fly", "air", "hr"], "away_sp_"),
-    ]
-    home_good_parts = [
-        _first_numeric_matching(starter_cols, ["whiff_rate", "chase_rate"], "home_sp_"),
-    ]
-    away_good_parts = [
-        _first_numeric_matching(starter_cols, ["whiff_rate", "chase_rate"], "away_sp_"),
-    ]
-    home_contact = _first_numeric_matching(starter_cols, ["contact_rate"], "home_sp_")
-    away_contact = _first_numeric_matching(starter_cols, ["contact_rate"], "away_sp_")
-    if home_contact is not None:
-        home_good_parts.append(-home_contact)
-    if away_contact is not None:
-        away_good_parts.append(-away_contact)
+    home_bad_cols = _collect_prefixed_numeric_cols("home_sp_", ["barrel", "hard_hit", "hardhit", "launch_speed", "launch_angle", "fly_ball", "flyball", "fb_rate", "air_ball", "airball", "air_rate"])
+    away_bad_cols = _collect_prefixed_numeric_cols("away_sp_", ["barrel", "hard_hit", "hardhit", "launch_speed", "launch_angle", "fly_ball", "flyball", "fb_rate", "air_ball", "airball", "air_rate"])
+    home_good_cols = _collect_prefixed_numeric_cols("home_sp_", ["whiff_rate", "chase_rate"])
+    away_good_cols = _collect_prefixed_numeric_cols("away_sp_", ["whiff_rate", "chase_rate"])
+    home_contact_cols = _collect_prefixed_numeric_cols("home_sp_", ["contact_rate"])
+    away_contact_cols = _collect_prefixed_numeric_cols("away_sp_", ["contact_rate"])
 
-    home_bad_stack = [s for s in home_bad_parts if s is not None]
-    away_bad_stack = [s for s in away_bad_parts if s is not None]
-    home_good_stack = [s for s in home_good_parts if s is not None]
-    away_good_stack = [s for s in away_good_parts if s is not None]
-    pitcher_supp_cols_used = len(home_bad_stack) + len(away_bad_stack) + len(home_good_stack) + len(away_good_stack)
+    home_bad_stack = [pd.to_numeric(out[c], errors="coerce") for c in home_bad_cols]
+    away_bad_stack = [pd.to_numeric(out[c], errors="coerce") for c in away_bad_cols]
+    home_good_stack = [pd.to_numeric(out[c], errors="coerce") for c in home_good_cols] + [(-pd.to_numeric(out[c], errors="coerce")) for c in home_contact_cols]
+    away_good_stack = [pd.to_numeric(out[c], errors="coerce") for c in away_good_cols] + [(-pd.to_numeric(out[c], errors="coerce")) for c in away_contact_cols]
+
+    pitcher_supp_cols_used = len(home_bad_cols) + len(away_bad_cols) + len(home_good_cols) + len(away_good_cols) + len(home_contact_cols) + len(away_contact_cols)
     logging.info("pitcher suppression columns selected=%s", pitcher_supp_cols_used)
 
     if home_bad_stack or home_good_stack:
