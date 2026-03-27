@@ -115,6 +115,21 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         "slg",
         "xbh",
     )
+    safe_engineered_tokens = (
+        "hr_danger",
+        "suppression",
+        "env_interaction",
+        "vs_",
+        "top3",
+        "danger_score",
+    )
+    banned_substrings = (
+        "game_pk",
+        "game_id",
+        "game_date",
+        "_id",
+        "lineup_id",
+    )
 
     initial_feats = [c for c in df.columns if c not in always_drop]
     dropped_cols: list[str] = []
@@ -122,12 +137,20 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
     for c in initial_feats:
         lc = c.lower()
         is_explicit_keep = c in trusted_explicit_keep
-        has_allowed_roll_window = any(tok in lc for tok in rolling_window_tokens)
+        is_roll = any(tok in lc for tok in rolling_window_tokens)
         has_trusted_stat_family = any(tok in lc for tok in trusted_stat_family_tokens)
-        is_trusted_roll_feature = has_allowed_roll_window and has_trusted_stat_family
+        is_trusted_roll_feature = is_roll and has_trusted_stat_family
+        is_safe_engineered = any(tok in lc for tok in safe_engineered_tokens)
+        is_banned_roll = any(tok in lc for tok in banned_substrings)
+        is_weather_prefield = lc.startswith("weather_")
 
-        if is_explicit_keep or is_trusted_roll_feature:
-            candidate_kept_cols.append(c)
+        if (
+            (is_trusted_roll_feature and not is_banned_roll)
+            or is_explicit_keep
+            or is_weather_prefield
+            or is_safe_engineered
+        ):
+            allow_kept_cols.append(c)
         else:
             dropped_cols.append(c)
 
@@ -148,6 +171,11 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
     logging.info("feature selection dropped count=%s", len(dropped_cols))
     logging.info("feature selection first 50 kept columns=%s", keep[:50])
     logging.info("feature selection first 50 dropped columns=%s", dropped_cols[:50])
+    logging.info(
+        "engineered features kept count=%s sample=%s",
+        len([c for c in allow_kept_cols if any(tok in c.lower() for tok in safe_engineered_tokens)]),
+        [c for c in allow_kept_cols if any(tok in c.lower() for tok in safe_engineered_tokens)][:10],
+    )
     return X, list(X.columns)
 
 
