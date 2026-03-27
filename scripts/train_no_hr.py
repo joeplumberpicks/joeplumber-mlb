@@ -138,6 +138,51 @@ def _calibration_table(y: np.ndarray, p: np.ndarray, bins: int = 10) -> pd.DataF
     return tmp.groupby("bin", dropna=False).agg(pred_mean=("p", "mean"), obs_rate=("y", "mean"), n=("y", "size")).reset_index()
 
 
+def _scan_and_drop_leakage_features(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    y_train: np.ndarray,
+    corr_threshold: float = 0.98,
+    auc_threshold: float = 0.98,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    y_series = pd.Series(y_train, index=X_train.index)
+    leaked_features: list[str] = []
+
+    for c in X_train.columns:
+        s = pd.to_numeric(X_train[c], errors="coerce")
+        valid = s.notna() & y_series.notna()
+        if valid.sum() < 2:
+            continue
+
+        y_valid = y_series[valid]
+        s_valid = s[valid]
+
+        corr = float(s_valid.corr(y_valid))
+        if not np.isfinite(corr):
+            corr = 0.0
+
+        single_auc = float("nan")
+        if y_valid.nunique() > 1 and s_valid.nunique() > 1:
+            try:
+                single_auc = float(roc_auc_score(y_valid, s_valid))
+            except Exception:
+                single_auc = float("nan")
+        if not np.isfinite(single_auc):
+            single_auc = 0.5
+
+        if abs(corr) > corr_threshold or single_auc > auc_threshold:
+            logging.warning('LEAKAGE WARNING: Feature "%s" AUC=%.6f correlation=%.6f -> DROPPED', c, single_auc, corr)
+            leaked_features.append(c)
+
+    if leaked_features:
+        X_train = X_train.drop(columns=leaked_features, errors="ignore")
+        X_test = X_test.drop(columns=leaked_features, errors="ignore")
+
+    logging.info("leakage scan removed features=%s", len(leaked_features))
+    logging.info("feature count after leakage scan=%s", X_train.shape[1])
+    return X_train, X_test, leaked_features
+
+
 def main() -> None:
     args = parse_args()
     train_seasons = _parse_seasons(args.train_seasons)
@@ -193,6 +238,10 @@ def main() -> None:
     X_train, feat_cols = _prep_X(train_df, target_col)
     X_test = test_df.reindex(columns=feat_cols).copy() if feat_cols else pd.DataFrame({"bias": np.zeros(len(test_df), dtype="float32")})
     X_test = X_test.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).astype("float32")
+    X_train, X_test, leaked_features = _scan_and_drop_leakage_features(X_train, X_test, y_train)
+    feat_cols = list(X_train.columns)
+    if not feat_cols:
+        raise ValueError("All features were removed after leakage scan. Investigate feature engineering.")
 
     base_model_name = "logreg"
     try:
@@ -229,12 +278,26 @@ def main() -> None:
     pred_mean = float(np.mean(p_test)) if len(p_test) else float("nan")
     obs_mean = float(np.mean(y_test)) if len(y_test) else float("nan")
     cal_tbl = _calibration_table(y_test, p_test)
+    if np.isfinite(auc) and auc > 0.90:
+        logging.warning("Model performance unusually high — possible residual leakage (auc=%.6f)", auc)
+    if np.isfinite(auc) and auc > 0.97:
+        raise ValueError("Model AUC exceeds 0.97 — leakage still present. Investigate feature engineering.")
 
     signature = f"train_{'-'.join(map(str, train_seasons))}_test_{'-'.join(map(str, test_seasons))}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     model_dir = dirs["models_dir"] / "no_hr"
     model_dir.mkdir(parents=True, exist_ok=True)
     model_path = model_dir / f"no_hr_model_{signature}.pkl"
-    dump({"model": calibrated, "features": feat_cols, "target_col": target_col, "signature": signature, "base_model": base_model_name}, model_path)
+    dump(
+        {
+            "model": calibrated,
+            "features": feat_cols,
+            "target_col": target_col,
+            "signature": signature,
+            "base_model": base_model_name,
+            "leakage_dropped_features": leaked_features,
+        },
+        model_path,
+    )
 
     feat_path = model_dir / f"no_hr_features_{signature}.txt"
     feat_path.write_text("\n".join(feat_cols) + "\n", encoding="utf-8")
