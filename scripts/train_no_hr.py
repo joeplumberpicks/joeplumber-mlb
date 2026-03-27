@@ -34,6 +34,16 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train No-HR Engine v1")
     p.add_argument("--train-seasons", type=str, required=True, help="Comma-separated seasons, e.g. 2021,2022,2023")
     p.add_argument("--test-seasons", type=str, required=True, help="Comma-separated seasons, e.g. 2024")
+    p.add_argument(
+        "--allow-missing-train-seasons",
+        action="store_true",
+        help="Allow training when requested train seasons have zero labeled rows.",
+    )
+    p.add_argument(
+        "--allow-missing-test-seasons",
+        action="store_true",
+        help="Allow training when requested test seasons have zero labeled rows.",
+    )
     p.add_argument("--config", type=Path, default=Path("configs/project.yaml"))
     return p.parse_args()
 
@@ -154,6 +164,21 @@ def main() -> None:
         missing_labeled = [s for s in train_seasons if s not in labeled_train_seasons]
         if missing_labeled:
             logging.warning("requested train seasons with zero labeled rows: %s", missing_labeled)
+            if not args.allow_missing_train_seasons:
+                raise ValueError(
+                    f"Requested train seasons have zero labeled rows: {missing_labeled}. "
+                    "Rebuild targets and marts for those seasons, or rerun with --allow-missing-train-seasons."
+                )
+    if "season" in test_df.columns:
+        labeled_test_seasons = set(pd.to_numeric(test_df["season"], errors="coerce").dropna().astype(int).tolist())
+        missing_labeled_test = [s for s in test_seasons if s not in labeled_test_seasons]
+        if missing_labeled_test:
+            logging.warning("requested test seasons with zero labeled rows: %s", missing_labeled_test)
+            if not args.allow_missing_test_seasons:
+                raise ValueError(
+                    f"Requested test seasons have zero labeled rows: {missing_labeled_test}. "
+                    "Rebuild targets and marts for those seasons, or rerun with --allow-missing-test-seasons."
+                )
     y_train = y_train[y_train.notna()].astype("int64").to_numpy()
     y_test = y_test[y_test.notna()].astype("int64").to_numpy()
 
