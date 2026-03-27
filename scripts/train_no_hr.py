@@ -133,7 +133,7 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
 
     initial_feats = [c for c in df.columns if c not in always_drop]
     dropped_cols: list[str] = []
-    allow_kept_cols: list[str] = []
+    candidate_kept_cols: list[str] = []
     for c in initial_feats:
         lc = c.lower()
         is_explicit_keep = c in trusted_explicit_keep
@@ -154,7 +154,7 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         else:
             dropped_cols.append(c)
 
-    X = df[allow_kept_cols].copy()
+    X = df[candidate_kept_cols].copy()
 
     for c in X.columns:
         if pd.api.types.is_bool_dtype(X[c]):
