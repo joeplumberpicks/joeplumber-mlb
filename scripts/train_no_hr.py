@@ -84,7 +84,7 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         "starter_hr_suppression_gap_away_vs_home",
         "starter_hr_suppression_gap_home_vs_away",
     }
-    rolling_window_tokens = ("_roll3", "_roll7", "_roll15", "_roll30")
+    roll_tokens = ("_roll3", "_roll7", "_roll15", "_roll30")
     trusted_stat_family_tokens = (
         "whiff_rate",
         "contact_rate",
@@ -136,17 +136,16 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
     candidate_kept_cols: list[str] = []
     for c in initial_feats:
         lc = c.lower()
-        is_explicit_keep = c in trusted_explicit_keep
-        is_roll = any(tok in lc for tok in rolling_window_tokens)
+        is_roll = any(tok in lc for tok in roll_tokens)
+        is_explicit_allow = c in explicit_allow
         has_trusted_stat_family = any(tok in lc for tok in trusted_stat_family_tokens)
-        is_trusted_roll_feature = is_roll and has_trusted_stat_family
         is_safe_engineered = any(tok in lc for tok in safe_engineered_tokens)
         is_banned_roll = any(tok in lc for tok in banned_substrings)
         is_weather_prefield = lc.startswith("weather_")
 
         if (
-            (is_trusted_roll_feature and not is_banned_roll)
-            or is_explicit_keep
+            ((is_roll and has_trusted_stat_family) and not is_banned_roll)
+            or is_explicit_allow
             or is_weather_prefield
             or is_safe_engineered
         ):
@@ -154,7 +153,10 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         else:
             dropped_cols.append(c)
 
-    X = df[candidate_kept_cols].copy()
+    assert isinstance(allow_kept_cols, list)
+    assert isinstance(dropped_cols, list)
+
+    X = df[allow_kept_cols].copy()
 
     for c in X.columns:
         if pd.api.types.is_bool_dtype(X[c]):
