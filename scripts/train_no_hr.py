@@ -74,7 +74,7 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         "canonical_park_key",
         target_col,
     }
-    explicit_allow = {
+    trusted_explicit_keep = {
         "season",
         "temperature",
         "wind_speed",
@@ -133,7 +133,7 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
 
     initial_feats = [c for c in df.columns if c not in always_drop]
     dropped_cols: list[str] = []
-    allow_kept_cols: list[str] = []
+    candidate_kept_cols: list[str] = []
     for c in initial_feats:
         lc = c.lower()
         is_roll = any(tok in lc for tok in roll_tokens)
