@@ -37,6 +37,34 @@ SUPPRESSION_KEYWORDS = [
     "k",
 ]
 
+DANGER_TOKENS = [
+    "barrel",
+    "hard_hit",
+    "launch_speed",
+    "launch_angle",
+    "fb",
+    "fly",
+    "air",
+    "pulled",
+    "xbh",
+    "iso",
+    "slug",
+]
+
+PITCHER_SUPPRESSION_TOKENS = [
+    "barrel",
+    "hard_hit",
+    "launch_speed",
+    "launch_angle",
+    "fb",
+    "fly",
+    "air",
+    "hr",
+    "contact_rate",
+    "whiff_rate",
+    "chase_rate",
+]
+
 TEAM_ABBR_MAP = {
     "arizona diamondbacks": "AZ",
     "atlanta braves": "ATL",
@@ -172,6 +200,70 @@ def _usable_pitcher_rows(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _enforce_prior_to_game_rolling(df: pd.DataFrame, entity_col: str, source_name: str) -> pd.DataFrame:
+    if df.empty:
+        logging.info("%s prior-to-game shift skipped: empty dataframe", source_name)
+        return df.copy()
+    if entity_col not in df.columns:
+        logging.warning("%s prior-to-game shift skipped: missing entity column=%s", source_name, entity_col)
+        return df.copy()
+    if "game_pk" not in df.columns:
+        logging.warning("%s prior-to-game shift skipped: missing game_pk column", source_name)
+        return df.copy()
+
+    out = df.copy()
+    out[entity_col] = pd.to_numeric(out[entity_col], errors="coerce").astype("Int64")
+    out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
+    out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce") if "game_date" in out.columns else pd.NaT
+    out = out[out[entity_col].notna() & out["game_pk"].notna()].copy()
+
+    passthrough_cols = {
+        entity_col,
+        "game_pk",
+        "game_date",
+        "season",
+        "batter",
+        "batter_id",
+        "pitcher",
+        "pitcher_id",
+        "player_id",
+        "team",
+        "batter_team",
+        "batting_team",
+        "bat_team",
+        "offense_team",
+    }
+    rolling_stat_cols = []
+    for c in out.columns:
+        if c in passthrough_cols:
+            continue
+        lc = c.lower()
+        is_numeric = pd.api.types.is_numeric_dtype(out[c])
+        is_roll_or_stat = "roll" in lc or any(k in lc for k in SUPPRESSION_KEYWORDS)
+        if is_numeric or is_roll_or_stat:
+            rolling_stat_cols.append(c)
+
+    if not rolling_stat_cols:
+        logging.warning("%s prior-to-game shift found no rolling/stat columns to shift", source_name)
+        return out
+
+    out["__source_game_pk"] = out["game_pk"]
+    out = out.sort_values([entity_col, "game_date", "game_pk"], ascending=[True, True, True])
+    shift_cols = rolling_stat_cols + ["__source_game_pk"]
+    out[shift_cols] = out.groupby(entity_col, dropna=False)[shift_cols].shift(1)
+
+    leak_mask = out["__source_game_pk"].notna() & (pd.to_numeric(out["__source_game_pk"], errors="coerce").astype("Int64") == out["game_pk"])
+    if bool(leak_mask.any()):
+        raise ValueError(f"Leakage detected: rolling features include same-game data ({source_name})")
+
+    null_pct = out[rolling_stat_cols].isna().mean().sort_values(ascending=False)
+    logging.info("%s prior-to-game shift rolling columns=%s", source_name, len(rolling_stat_cols))
+    logging.info("%s shifted null pct (top 20)=%s", source_name, {k: round(float(v), 4) for k, v in null_pct.head(20).items()})
+    sample_cols = [entity_col, "game_date", "game_pk", "__source_game_pk"] + rolling_stat_cols[:6]
+    logging.info("%s shift sample rows=%s", source_name, out[sample_cols].head(5).to_dict("records"))
+    return out
+
+
 def _sort_for_latest(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
     if "game_date" in work.columns:
@@ -203,9 +295,28 @@ def _select_batter_feature_cols(batter_roll: pd.DataFrame) -> list[str]:
         if not pd.api.types.is_numeric_dtype(batter_roll[c]):
             continue
         lc = c.lower()
-        if any(k in lc for k in SUPPRESSION_KEYWORDS) and "team" not in lc:
+        is_danger = any(k in lc for k in DANGER_TOKENS)
+        is_suppression = any(k in lc for k in SUPPRESSION_KEYWORDS)
+        is_roll_like = "roll" in lc
+        if (is_roll_like and (is_danger or is_suppression)) and "team" not in lc:
             num_cols.append(c)
+    logging.info("selected HR-danger batter rolling columns=%s sample=%s", len(num_cols), num_cols[:15])
     return num_cols
+
+
+def _aggregate_with_top3_mean(work: pd.DataFrame, group_cols: list[str], feat_cols: list[str], prefix: str) -> pd.DataFrame:
+    grouped = work.groupby(group_cols, dropna=False)
+    mean_df = grouped[feat_cols].mean().rename(columns=lambda c: f"{prefix}{c}_mean")
+    max_df = grouped[feat_cols].max().rename(columns=lambda c: f"{prefix}{c}_max")
+
+    top3_parts: list[pd.DataFrame] = []
+    for c in feat_cols:
+        top3_series = grouped[c].apply(lambda s: pd.to_numeric(s, errors="coerce").dropna().nlargest(3).mean())
+        top3_parts.append(top3_series.rename(f"{prefix}{c}_top3_mean").to_frame())
+    top3_df = pd.concat(top3_parts, axis=1) if top3_parts else pd.DataFrame(index=mean_df.index)
+
+    out = pd.concat([mean_df, max_df, top3_df], axis=1).reset_index()
+    return out
 
 
 def _team_rollup_by_game(batter_roll: pd.DataFrame) -> pd.DataFrame:
@@ -217,10 +328,9 @@ def _team_rollup_by_game(batter_roll: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["game_pk", "team"])
     work = batter_roll[["game_pk", team_col] + feat_cols].copy()
     work = work.rename(columns={team_col: "team"})
-    agg_spec = {c: ["mean", "max"] for c in feat_cols}
-    agg = work.groupby(["game_pk", "team"], dropna=False).agg(agg_spec)
-    agg.columns = [f"team_{c}_{m}" for c, m in agg.columns]
-    return agg.reset_index()
+    agg = _aggregate_with_top3_mean(work, ["game_pk", "team"], feat_cols, "team_")
+    logging.info("engineered team HR-danger features (by game)=%s", len([c for c in agg.columns if c.startswith("team_")]))
+    return agg
 
 
 def _team_rollup_latest_by_team(batter_roll: pd.DataFrame) -> pd.DataFrame:
@@ -239,9 +349,9 @@ def _team_rollup_latest_by_team(batter_roll: pd.DataFrame) -> pd.DataFrame:
     work = work.sort_values(["_sort_date", "_sort_game_pk"], ascending=[True, True])
     latest = work.groupby([team_col, batter_col], dropna=False).tail(1)
 
-    team_agg = latest.groupby(team_col, dropna=False)[feat_cols].agg(["mean", "max"])
-    team_agg.columns = [f"team_{c}_{m}" for c, m in team_agg.columns]
-    team_agg = team_agg.reset_index().rename(columns={team_col: "team"})
+    latest = latest.rename(columns={team_col: "team"})
+    team_agg = _aggregate_with_top3_mean(latest, ["team"], feat_cols, "team_")
+    logging.info("engineered team HR-danger features (latest by team)=%s", len([c for c in team_agg.columns if c.startswith("team_")]))
     return team_agg
 
 
@@ -270,24 +380,30 @@ def _build_team_rollups_with_context(batter_roll: pd.DataFrame, team_context: pd
         return pd.DataFrame(columns=["team"] if latest_by_team else ["game_pk", "team"])
 
     work = batter_roll[["game_pk", batter_col] + feat_cols + (["game_date"] if "game_date" in batter_roll.columns else [])].copy()
+    if "__source_game_pk" in batter_roll.columns:
+        work["__source_game_pk"] = pd.to_numeric(batter_roll["__source_game_pk"], errors="coerce").astype("Int64")
     work["game_pk"] = pd.to_numeric(work["game_pk"], errors="coerce").astype("Int64")
     work[batter_col] = pd.to_numeric(work[batter_col], errors="coerce").astype("Int64")
     work = work.merge(team_context[["game_pk", "team"]], on="game_pk", how="inner")
     work = work[work[batter_col].notna() & work["team"].notna()].copy()
     if work.empty:
         return pd.DataFrame(columns=["team"] if latest_by_team else ["game_pk", "team"])
+    if "__source_game_pk" in work.columns:
+        leak_mask = work["__source_game_pk"].notna() & (work["__source_game_pk"] == work["game_pk"])
+        if bool(leak_mask.any()):
+            raise ValueError("Leakage detected: rolling features include same-game data")
 
     if latest_by_team:
         work = _sort_for_latest(work)
         work = work.sort_values(["_sort_date", "_sort_game_pk"], ascending=[True, True])
         latest = work.groupby(["team", batter_col], dropna=False).tail(1)
-        agg = latest.groupby("team", dropna=False)[feat_cols].agg(["mean", "max"])
-        agg.columns = [f"team_{c}_{m}" for c, m in agg.columns]
-        return agg.reset_index()
+        agg = _aggregate_with_top3_mean(latest, ["team"], feat_cols, "team_")
+        logging.info("engineered team HR-danger features (context latest)=%s", len([c for c in agg.columns if c.startswith("team_")]))
+        return agg
 
-    agg = work.groupby(["game_pk", "team"], dropna=False)[feat_cols].agg(["mean", "max"])
-    agg.columns = [f"team_{c}_{m}" for c, m in agg.columns]
-    return agg.reset_index()
+    agg = _aggregate_with_top3_mean(work, ["game_pk", "team"], feat_cols, "team_")
+    logging.info("engineered team HR-danger features (context by game)=%s", len([c for c in agg.columns if c.startswith("team_")]))
+    return agg
 
 
 def _ensure_starter_id_cols(df: pd.DataFrame) -> pd.DataFrame:
@@ -338,28 +454,30 @@ def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_lates
     pitcher_df[pitcher_id_col] = pd.to_numeric(pitcher_df[pitcher_id_col], errors="coerce").astype("Int64")
     pitcher_df = pitcher_df[pitcher_df[pitcher_id_col].notna()].copy()
 
-    sort_cols = [c for c in ["game_date", "game_pk"] if c in pitcher_df.columns]
-    if sort_cols:
-        if "game_date" in sort_cols:
-            pitcher_df["game_date"] = pd.to_datetime(pitcher_df["game_date"], errors="coerce")
-        if "game_pk" in sort_cols:
-            pitcher_df["game_pk"] = pd.to_numeric(pitcher_df["game_pk"], errors="coerce")
+    if "game_pk" not in pitcher_df.columns or "game_pk" not in mart.columns:
+        logging.warning("starter merge skipped: game_pk required for prior-to-game alignment")
+        return mart
 
-    latest_pitcher = pitcher_df.sort_values(sort_cols).groupby(pitcher_id_col, dropna=False).tail(1).copy() if sort_cols else pitcher_df.groupby(pitcher_id_col, dropna=False).tail(1).copy()
+    pitcher_df["game_pk"] = pd.to_numeric(pitcher_df["game_pk"], errors="coerce").astype("Int64")
+    mart["game_pk"] = pd.to_numeric(mart["game_pk"], errors="coerce").astype("Int64")
+    pitcher_df = pitcher_df[pitcher_df["game_pk"].notna()].copy()
 
-    numeric_cols = latest_pitcher.select_dtypes(include=["number"]).columns.tolist()
+    if "__source_game_pk" in pitcher_df.columns:
+        pitcher_df["__source_game_pk"] = pd.to_numeric(pitcher_df["__source_game_pk"], errors="coerce").astype("Int64")
+
+    numeric_cols = pitcher_df.select_dtypes(include=["number"]).columns.tolist()
     if len(numeric_cols) <= 2:
-        for c in latest_pitcher.columns:
+        for c in pitcher_df.columns:
             if c in numeric_cols:
                 continue
-            coerced = pd.to_numeric(latest_pitcher[c], errors="coerce")
+            coerced = pd.to_numeric(pitcher_df[c], errors="coerce")
             if coerced.notna().any():
-                latest_pitcher[c] = coerced
+                pitcher_df[c] = coerced
                 numeric_cols.append(c)
-    exclude = {pitcher_id_col, "pitcher", "pitcher_id", "game_pk", "season", "total_hr", "no_hr_game"}
+    exclude = {pitcher_id_col, "pitcher", "pitcher_id", "game_pk", "season", "total_hr", "no_hr_game", "__source_game_pk"}
     payload_cols = [c for c in numeric_cols if c not in exclude]
 
-    logging.info("starter merge rolling pitchers=%s snapshot_pitchers=%s", int(pitcher_df[pitcher_id_col].nunique()), int(latest_pitcher[pitcher_id_col].nunique()))
+    logging.info("starter merge rolling pitchers=%s", int(pitcher_df[pitcher_id_col].nunique()))
     starter_ids = pd.concat([mart["home_sp_id"], mart["away_sp_id"]], ignore_index=True).dropna().nunique()
     logging.info("starter merge unique starter ids in spine=%s", int(starter_ids))
 
@@ -369,10 +487,15 @@ def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_lates
 
     logging.info("starter payload cols=%s sample=%s", len(payload_cols), payload_cols[:10])
 
-    home_snapshot = latest_pitcher[[pitcher_id_col] + payload_cols].copy()
+    merge_cols = ["game_pk", pitcher_id_col] + payload_cols + (["__source_game_pk"] if "__source_game_pk" in pitcher_df.columns else [])
+    per_game_pitcher = pitcher_df[merge_cols].drop_duplicates(subset=["game_pk", pitcher_id_col], keep="last").copy()
+
+    home_snapshot = per_game_pitcher.copy()
     home_rename = {c: f"home_sp_{c}" for c in payload_cols}
+    if "__source_game_pk" in home_snapshot.columns:
+        home_rename["__source_game_pk"] = "home_sp_source_game_pk"
     home_snapshot = home_snapshot.rename(columns=home_rename)
-    mart = mart.merge(home_snapshot, how="left", left_on="home_sp_id", right_on=pitcher_id_col)
+    mart = mart.merge(home_snapshot, how="left", left_on=["game_pk", "home_sp_id"], right_on=["game_pk", pitcher_id_col])
     if pitcher_id_col in mart.columns:
         mart = mart.drop(columns=[pitcher_id_col])
 
@@ -380,10 +503,12 @@ def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_lates
     home_matches = int(mart[home_cols].notna().any(axis=1).sum()) if home_cols else 0
     logging.info("created home_sp columns=%s home starter matches=%s", len(home_cols), home_matches)
 
-    away_snapshot = latest_pitcher[[pitcher_id_col] + payload_cols].copy()
+    away_snapshot = per_game_pitcher.copy()
     away_rename = {c: f"away_sp_{c}" for c in payload_cols}
+    if "__source_game_pk" in away_snapshot.columns:
+        away_rename["__source_game_pk"] = "away_sp_source_game_pk"
     away_snapshot = away_snapshot.rename(columns=away_rename)
-    mart = mart.merge(away_snapshot, how="left", left_on="away_sp_id", right_on=pitcher_id_col)
+    mart = mart.merge(away_snapshot, how="left", left_on=["game_pk", "away_sp_id"], right_on=["game_pk", pitcher_id_col])
     if pitcher_id_col in mart.columns:
         mart = mart.drop(columns=[pitcher_id_col])
 
@@ -394,6 +519,15 @@ def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_lates
     starter_cols = [c for c in mart.columns if c.startswith("home_sp_") or c.startswith("away_sp_")]
     games_with_starter_features = int(mart[starter_cols].notna().any(axis=1).sum()) if starter_cols else 0
     logging.info("starter_feature_cols=%s games_with_starter_features=%s", len(starter_cols), games_with_starter_features)
+    if "home_sp_source_game_pk" in mart.columns:
+        leak_home = mart["home_sp_source_game_pk"].notna() & (mart["home_sp_source_game_pk"] == mart["game_pk"])
+        if bool(leak_home.any()):
+            raise ValueError("Leakage detected: rolling features include same-game data")
+    if "away_sp_source_game_pk" in mart.columns:
+        leak_away = mart["away_sp_source_game_pk"].notna() & (mart["away_sp_source_game_pk"] == mart["game_pk"])
+        if bool(leak_away.any()):
+            raise ValueError("Leakage detected: rolling features include same-game data")
+    mart = mart.drop(columns=["home_sp_source_game_pk", "away_sp_source_game_pk"], errors="ignore")
     if not starter_cols:
         logging.warning("starter merge produced zero prefixed columns; check merge keys and payload column selection")
     return mart
@@ -401,6 +535,8 @@ def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_lates
 
 def _attach_engineered_features(mart: pd.DataFrame) -> pd.DataFrame:
     out = mart.copy()
+    engineered_starter = 0
+    engineered_matchup_env = 0
 
     def _as_numeric_series(df: pd.DataFrame, value: object, default: float) -> pd.Series:
         if isinstance(value, str) and value in df.columns:
@@ -435,8 +571,93 @@ def _attach_engineered_features(mart: pd.DataFrame) -> pd.DataFrame:
 
     if away_sp_col and home_team_power_col:
         out["starter_hr_suppression_gap_away_vs_home"] = pd.to_numeric(out[away_sp_col], errors="coerce") - pd.to_numeric(out[home_team_power_col], errors="coerce")
+        engineered_matchup_env += 1
     if home_sp_col and away_team_power_col:
         out["starter_hr_suppression_gap_home_vs_away"] = pd.to_numeric(out[home_sp_col], errors="coerce") - pd.to_numeric(out[away_team_power_col], errors="coerce")
+        engineered_matchup_env += 1
+
+    def _first_numeric_matching(cols: list[str], tokens: list[str], starts_with: str) -> pd.Series | None:
+        for c in cols:
+            lc = c.lower()
+            if c.startswith(starts_with) and any(t in lc for t in tokens):
+                series = pd.to_numeric(out[c], errors="coerce")
+                if series.notna().any():
+                    return series
+        return None
+
+    starter_cols = list(out.columns)
+    home_bad_parts = [
+        _first_numeric_matching(starter_cols, ["barrel", "hard_hit", "launch_speed", "launch_angle", "fb", "fly", "air", "hr"], "home_sp_"),
+    ]
+    away_bad_parts = [
+        _first_numeric_matching(starter_cols, ["barrel", "hard_hit", "launch_speed", "launch_angle", "fb", "fly", "air", "hr"], "away_sp_"),
+    ]
+    home_good_parts = [
+        _first_numeric_matching(starter_cols, ["whiff_rate", "chase_rate"], "home_sp_"),
+    ]
+    away_good_parts = [
+        _first_numeric_matching(starter_cols, ["whiff_rate", "chase_rate"], "away_sp_"),
+    ]
+    home_contact = _first_numeric_matching(starter_cols, ["contact_rate"], "home_sp_")
+    away_contact = _first_numeric_matching(starter_cols, ["contact_rate"], "away_sp_")
+    if home_contact is not None:
+        home_good_parts.append(-home_contact)
+    if away_contact is not None:
+        away_good_parts.append(-away_contact)
+
+    home_bad_stack = [s for s in home_bad_parts if s is not None]
+    away_bad_stack = [s for s in away_bad_parts if s is not None]
+    home_good_stack = [s for s in home_good_parts if s is not None]
+    away_good_stack = [s for s in away_good_parts if s is not None]
+    pitcher_supp_cols_used = len(home_bad_stack) + len(away_bad_stack) + len(home_good_stack) + len(away_good_stack)
+    logging.info("pitcher suppression columns selected=%s", pitcher_supp_cols_used)
+
+    if home_bad_stack or home_good_stack:
+        home_bad = pd.concat(home_bad_stack, axis=1).mean(axis=1) if home_bad_stack else pd.Series(0.0, index=out.index)
+        home_good = pd.concat(home_good_stack, axis=1).mean(axis=1) if home_good_stack else pd.Series(0.0, index=out.index)
+        out["home_sp_hr_suppression_score"] = home_good - home_bad
+        engineered_starter += 1
+    if away_bad_stack or away_good_stack:
+        away_bad = pd.concat(away_bad_stack, axis=1).mean(axis=1) if away_bad_stack else pd.Series(0.0, index=out.index)
+        away_good = pd.concat(away_good_stack, axis=1).mean(axis=1) if away_good_stack else pd.Series(0.0, index=out.index)
+        out["away_sp_hr_suppression_score"] = away_good - away_bad
+        engineered_starter += 1
+
+    home_team_danger_col = _pick_contains([c for c in out.columns if c.startswith("home_team_")], DANGER_TOKENS)
+    away_team_danger_col = _pick_contains([c for c in out.columns if c.startswith("away_team_")], DANGER_TOKENS)
+    if home_team_danger_col and "away_sp_hr_suppression_score" in out.columns:
+        out["home_offense_power_vs_away_sp_suppression"] = pd.to_numeric(out[home_team_danger_col], errors="coerce") - pd.to_numeric(out["away_sp_hr_suppression_score"], errors="coerce")
+        engineered_matchup_env += 1
+    if away_team_danger_col and "home_sp_hr_suppression_score" in out.columns:
+        out["away_offense_power_vs_home_sp_suppression"] = pd.to_numeric(out[away_team_danger_col], errors="coerce") - pd.to_numeric(out["home_sp_hr_suppression_score"], errors="coerce")
+        engineered_matchup_env += 1
+
+    home_barrel_col = _pick_contains([c for c in out.columns if c.startswith("home_team_")], ["barrel"])
+    away_barrel_col = _pick_contains([c for c in out.columns if c.startswith("away_team_")], ["barrel"])
+    away_sp_contact_supp = _pick_contains([c for c in out.columns if c.startswith("away_sp_")], ["contact_rate"])
+    home_sp_contact_supp = _pick_contains([c for c in out.columns if c.startswith("home_sp_")], ["contact_rate"])
+    if home_barrel_col and away_sp_contact_supp:
+        out["home_barrel_pressure_vs_away_sp_contact_suppression"] = pd.to_numeric(out[home_barrel_col], errors="coerce") - pd.to_numeric(out[away_sp_contact_supp], errors="coerce")
+        engineered_matchup_env += 1
+    if away_barrel_col and home_sp_contact_supp:
+        out["away_barrel_pressure_vs_home_sp_contact_suppression"] = pd.to_numeric(out[away_barrel_col], errors="coerce") - pd.to_numeric(out[home_sp_contact_supp], errors="coerce")
+        engineered_matchup_env += 1
+
+    if home_team_danger_col and "combined_park_weather_hr_index" in out.columns:
+        out["home_power_env_interaction"] = pd.to_numeric(out[home_team_danger_col], errors="coerce") * pd.to_numeric(out["combined_park_weather_hr_index"], errors="coerce")
+        engineered_matchup_env += 1
+    if away_team_danger_col and "combined_park_weather_hr_index" in out.columns:
+        out["away_power_env_interaction"] = pd.to_numeric(out[away_team_danger_col], errors="coerce") * pd.to_numeric(out["combined_park_weather_hr_index"], errors="coerce")
+        engineered_matchup_env += 1
+    if "home_sp_hr_suppression_score" in out.columns and "env_hr_suppression_proxy" in out.columns:
+        out["home_sp_env_suppression_interaction"] = pd.to_numeric(out["home_sp_hr_suppression_score"], errors="coerce") * pd.to_numeric(out["env_hr_suppression_proxy"], errors="coerce")
+        engineered_matchup_env += 1
+    if "away_sp_hr_suppression_score" in out.columns and "env_hr_suppression_proxy" in out.columns:
+        out["away_sp_env_suppression_interaction"] = pd.to_numeric(out["away_sp_hr_suppression_score"], errors="coerce") * pd.to_numeric(out["env_hr_suppression_proxy"], errors="coerce")
+        engineered_matchup_env += 1
+
+    logging.info("engineered starter suppression features created=%s", engineered_starter)
+    logging.info("engineered matchup/environment interaction features created=%s", engineered_matchup_env)
 
     return out
 
@@ -479,6 +700,16 @@ def main() -> None:
     prev_batter = _usable_batter_rows(_filter_season(all_batter_roll, args.season - 1))
     curr_pitcher = _usable_pitcher_rows(_filter_season(all_pitcher_roll, args.season))
     prev_pitcher = _usable_pitcher_rows(_filter_season(all_pitcher_roll, args.season - 1))
+
+    batter_entity_col = _pick(all_batter_roll, ["batter_id", "batter", "player_id"])
+    pitcher_entity_col = _pick(all_pitcher_roll, ["pitcher_id", "pitcher", "mlbam_pitcher_id", "player_id"])
+    if batter_entity_col is None or pitcher_entity_col is None:
+        raise ValueError("Could not determine batter/pitcher entity key columns for prior-to-game shift enforcement")
+
+    curr_batter = _enforce_prior_to_game_rolling(curr_batter, batter_entity_col, "batter_game_rolling_current")
+    prev_batter = _enforce_prior_to_game_rolling(prev_batter, batter_entity_col, "batter_game_rolling_prior")
+    curr_pitcher = _enforce_prior_to_game_rolling(curr_pitcher, pitcher_entity_col, "pitcher_game_rolling_current")
+    prev_pitcher = _enforce_prior_to_game_rolling(prev_pitcher, pitcher_entity_col, "pitcher_game_rolling_prior")
 
     logging.info(
         "batter rolling usable rows season=%s:%s prior=%s:%s",
