@@ -64,9 +64,8 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         "canonical_park_key",
         target_col,
     }
-    explicit_allow = {
+    trusted_explicit_keep = {
         "season",
-        "park_id",
         "temperature",
         "wind_speed",
         "wind_direction",
@@ -74,26 +73,36 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         "env_hr_suppression_proxy",
         "starter_hr_suppression_gap_away_vs_home",
         "starter_hr_suppression_gap_home_vs_away",
-        "venue_id",
-        "park_factor",
-        "hr_factor",
     }
-    roll_tokens = ("_roll3", "_roll7", "_roll15", "_roll30")
+    rolling_window_tokens = ("_roll3", "_roll7", "_roll15", "_roll30")
+    trusted_stat_family_tokens = (
+        "whiff_rate",
+        "contact_rate",
+        "chase_rate",
+        "swing_rate",
+        "zone_swing_rate",
+        "launch_speed",
+        "launch_angle",
+        "release_speed",
+        "release_spin_rate",
+    )
 
     initial_feats = [c for c in df.columns if c not in always_drop]
     dropped_cols: list[str] = []
-    allow_kept_cols: list[str] = []
+    candidate_kept_cols: list[str] = []
     for c in initial_feats:
         lc = c.lower()
-        is_roll = any(tok in lc for tok in roll_tokens)
-        is_explicit_allow = c in explicit_allow
-        is_weather_prefield = lc.startswith("weather_")
-        if is_roll or is_explicit_allow or is_weather_prefield:
-            allow_kept_cols.append(c)
+        is_explicit_keep = c in trusted_explicit_keep
+        has_allowed_roll_window = any(tok in lc for tok in rolling_window_tokens)
+        has_trusted_stat_family = any(tok in lc for tok in trusted_stat_family_tokens)
+        is_trusted_roll_feature = has_allowed_roll_window and has_trusted_stat_family
+
+        if is_explicit_keep or is_trusted_roll_feature:
+            candidate_kept_cols.append(c)
         else:
             dropped_cols.append(c)
 
-    X = df[allow_kept_cols].copy()
+    X = df[candidate_kept_cols].copy()
 
     for c in X.columns:
         if pd.api.types.is_bool_dtype(X[c]):
@@ -105,14 +114,11 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
     keep = [c for c in X.columns if X[c].notna().any()]
     X = X[keep].astype("float32") if keep else pd.DataFrame({"bias": np.zeros(len(df), dtype="float32")})
 
-    logging.info(
-        "feature selection initial=%s kept=%s dropped=%s kept_sample=%s dropped_sample=%s",
-        len(initial_feats),
-        len(keep),
-        len(dropped_cols),
-        keep[:40],
-        dropped_cols[:40],
-    )
+    logging.info("feature selection initial feature count=%s", len(initial_feats))
+    logging.info("feature selection kept count=%s", len(keep))
+    logging.info("feature selection dropped count=%s", len(dropped_cols))
+    logging.info("feature selection first 50 kept columns=%s", keep[:50])
+    logging.info("feature selection first 50 dropped columns=%s", dropped_cols[:50])
     return X, list(X.columns)
 
 
@@ -143,6 +149,11 @@ def main() -> None:
     y_test = pd.to_numeric(test_df[target_col], errors="coerce")
     train_df = train_df[y_train.notna()].copy()
     test_df = test_df[y_test.notna()].copy()
+    if "season" in train_df.columns:
+        labeled_train_seasons = set(pd.to_numeric(train_df["season"], errors="coerce").dropna().astype(int).tolist())
+        missing_labeled = [s for s in train_seasons if s not in labeled_train_seasons]
+        if missing_labeled:
+            logging.warning("requested train seasons with zero labeled rows: %s", missing_labeled)
     y_train = y_train[y_train.notna()].astype("int64").to_numpy()
     y_test = y_test[y_test.notna()].astype("int64").to_numpy()
 
