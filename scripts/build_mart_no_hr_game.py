@@ -37,6 +37,34 @@ SUPPRESSION_KEYWORDS = [
     "k",
 ]
 
+DANGER_TOKENS = [
+    "barrel",
+    "hard_hit",
+    "launch_speed",
+    "launch_angle",
+    "fb",
+    "fly",
+    "air",
+    "pulled",
+    "xbh",
+    "iso",
+    "slug",
+]
+
+PITCHER_SUPPRESSION_TOKENS = [
+    "barrel",
+    "hard_hit",
+    "launch_speed",
+    "launch_angle",
+    "fb",
+    "fly",
+    "air",
+    "hr",
+    "contact_rate",
+    "whiff_rate",
+    "chase_rate",
+]
+
 TEAM_ABBR_MAP = {
     "arizona diamondbacks": "AZ",
     "atlanta braves": "ATL",
@@ -267,9 +295,28 @@ def _select_batter_feature_cols(batter_roll: pd.DataFrame) -> list[str]:
         if not pd.api.types.is_numeric_dtype(batter_roll[c]):
             continue
         lc = c.lower()
-        if any(k in lc for k in SUPPRESSION_KEYWORDS) and "team" not in lc:
+        is_danger = any(k in lc for k in DANGER_TOKENS)
+        is_suppression = any(k in lc for k in SUPPRESSION_KEYWORDS)
+        is_roll_like = "roll" in lc
+        if (is_roll_like and (is_danger or is_suppression)) and "team" not in lc:
             num_cols.append(c)
+    logging.info("selected HR-danger batter rolling columns=%s sample=%s", len(num_cols), num_cols[:15])
     return num_cols
+
+
+def _aggregate_with_top3_mean(work: pd.DataFrame, group_cols: list[str], feat_cols: list[str], prefix: str) -> pd.DataFrame:
+    grouped = work.groupby(group_cols, dropna=False)
+    mean_df = grouped[feat_cols].mean().rename(columns=lambda c: f"{prefix}{c}_mean")
+    max_df = grouped[feat_cols].max().rename(columns=lambda c: f"{prefix}{c}_max")
+
+    top3_parts: list[pd.DataFrame] = []
+    for c in feat_cols:
+        top3_series = grouped[c].apply(lambda s: pd.to_numeric(s, errors="coerce").dropna().nlargest(3).mean())
+        top3_parts.append(top3_series.rename(f"{prefix}{c}_top3_mean").to_frame())
+    top3_df = pd.concat(top3_parts, axis=1) if top3_parts else pd.DataFrame(index=mean_df.index)
+
+    out = pd.concat([mean_df, max_df, top3_df], axis=1).reset_index()
+    return out
 
 
 def _team_rollup_by_game(batter_roll: pd.DataFrame) -> pd.DataFrame:
@@ -281,10 +328,9 @@ def _team_rollup_by_game(batter_roll: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=["game_pk", "team"])
     work = batter_roll[["game_pk", team_col] + feat_cols].copy()
     work = work.rename(columns={team_col: "team"})
-    agg_spec = {c: ["mean", "max"] for c in feat_cols}
-    agg = work.groupby(["game_pk", "team"], dropna=False).agg(agg_spec)
-    agg.columns = [f"team_{c}_{m}" for c, m in agg.columns]
-    return agg.reset_index()
+    agg = _aggregate_with_top3_mean(work, ["game_pk", "team"], feat_cols, "team_")
+    logging.info("engineered team HR-danger features (by game)=%s", len([c for c in agg.columns if c.startswith("team_")]))
+    return agg
 
 
 def _team_rollup_latest_by_team(batter_roll: pd.DataFrame) -> pd.DataFrame:
@@ -303,9 +349,9 @@ def _team_rollup_latest_by_team(batter_roll: pd.DataFrame) -> pd.DataFrame:
     work = work.sort_values(["_sort_date", "_sort_game_pk"], ascending=[True, True])
     latest = work.groupby([team_col, batter_col], dropna=False).tail(1)
 
-    team_agg = latest.groupby(team_col, dropna=False)[feat_cols].agg(["mean", "max"])
-    team_agg.columns = [f"team_{c}_{m}" for c, m in team_agg.columns]
-    team_agg = team_agg.reset_index().rename(columns={team_col: "team"})
+    latest = latest.rename(columns={team_col: "team"})
+    team_agg = _aggregate_with_top3_mean(latest, ["team"], feat_cols, "team_")
+    logging.info("engineered team HR-danger features (latest by team)=%s", len([c for c in team_agg.columns if c.startswith("team_")]))
     return team_agg
 
 
@@ -351,13 +397,13 @@ def _build_team_rollups_with_context(batter_roll: pd.DataFrame, team_context: pd
         work = _sort_for_latest(work)
         work = work.sort_values(["_sort_date", "_sort_game_pk"], ascending=[True, True])
         latest = work.groupby(["team", batter_col], dropna=False).tail(1)
-        agg = latest.groupby("team", dropna=False)[feat_cols].agg(["mean", "max"])
-        agg.columns = [f"team_{c}_{m}" for c, m in agg.columns]
-        return agg.reset_index()
+        agg = _aggregate_with_top3_mean(latest, ["team"], feat_cols, "team_")
+        logging.info("engineered team HR-danger features (context latest)=%s", len([c for c in agg.columns if c.startswith("team_")]))
+        return agg
 
-    agg = work.groupby(["game_pk", "team"], dropna=False)[feat_cols].agg(["mean", "max"])
-    agg.columns = [f"team_{c}_{m}" for c, m in agg.columns]
-    return agg.reset_index()
+    agg = _aggregate_with_top3_mean(work, ["game_pk", "team"], feat_cols, "team_")
+    logging.info("engineered team HR-danger features (context by game)=%s", len([c for c in agg.columns if c.startswith("team_")]))
+    return agg
 
 
 def _ensure_starter_id_cols(df: pd.DataFrame) -> pd.DataFrame:
@@ -489,6 +535,8 @@ def _starter_features(spine: pd.DataFrame, pitcher_roll: pd.DataFrame, use_lates
 
 def _attach_engineered_features(mart: pd.DataFrame) -> pd.DataFrame:
     out = mart.copy()
+    engineered_starter = 0
+    engineered_matchup_env = 0
 
     def _as_numeric_series(df: pd.DataFrame, value: object, default: float) -> pd.Series:
         if isinstance(value, str) and value in df.columns:
@@ -523,8 +571,93 @@ def _attach_engineered_features(mart: pd.DataFrame) -> pd.DataFrame:
 
     if away_sp_col and home_team_power_col:
         out["starter_hr_suppression_gap_away_vs_home"] = pd.to_numeric(out[away_sp_col], errors="coerce") - pd.to_numeric(out[home_team_power_col], errors="coerce")
+        engineered_matchup_env += 1
     if home_sp_col and away_team_power_col:
         out["starter_hr_suppression_gap_home_vs_away"] = pd.to_numeric(out[home_sp_col], errors="coerce") - pd.to_numeric(out[away_team_power_col], errors="coerce")
+        engineered_matchup_env += 1
+
+    def _first_numeric_matching(cols: list[str], tokens: list[str], starts_with: str) -> pd.Series | None:
+        for c in cols:
+            lc = c.lower()
+            if c.startswith(starts_with) and any(t in lc for t in tokens):
+                series = pd.to_numeric(out[c], errors="coerce")
+                if series.notna().any():
+                    return series
+        return None
+
+    starter_cols = list(out.columns)
+    home_bad_parts = [
+        _first_numeric_matching(starter_cols, ["barrel", "hard_hit", "launch_speed", "launch_angle", "fb", "fly", "air", "hr"], "home_sp_"),
+    ]
+    away_bad_parts = [
+        _first_numeric_matching(starter_cols, ["barrel", "hard_hit", "launch_speed", "launch_angle", "fb", "fly", "air", "hr"], "away_sp_"),
+    ]
+    home_good_parts = [
+        _first_numeric_matching(starter_cols, ["whiff_rate", "chase_rate"], "home_sp_"),
+    ]
+    away_good_parts = [
+        _first_numeric_matching(starter_cols, ["whiff_rate", "chase_rate"], "away_sp_"),
+    ]
+    home_contact = _first_numeric_matching(starter_cols, ["contact_rate"], "home_sp_")
+    away_contact = _first_numeric_matching(starter_cols, ["contact_rate"], "away_sp_")
+    if home_contact is not None:
+        home_good_parts.append(-home_contact)
+    if away_contact is not None:
+        away_good_parts.append(-away_contact)
+
+    home_bad_stack = [s for s in home_bad_parts if s is not None]
+    away_bad_stack = [s for s in away_bad_parts if s is not None]
+    home_good_stack = [s for s in home_good_parts if s is not None]
+    away_good_stack = [s for s in away_good_parts if s is not None]
+    pitcher_supp_cols_used = len(home_bad_stack) + len(away_bad_stack) + len(home_good_stack) + len(away_good_stack)
+    logging.info("pitcher suppression columns selected=%s", pitcher_supp_cols_used)
+
+    if home_bad_stack or home_good_stack:
+        home_bad = pd.concat(home_bad_stack, axis=1).mean(axis=1) if home_bad_stack else pd.Series(0.0, index=out.index)
+        home_good = pd.concat(home_good_stack, axis=1).mean(axis=1) if home_good_stack else pd.Series(0.0, index=out.index)
+        out["home_sp_hr_suppression_score"] = home_good - home_bad
+        engineered_starter += 1
+    if away_bad_stack or away_good_stack:
+        away_bad = pd.concat(away_bad_stack, axis=1).mean(axis=1) if away_bad_stack else pd.Series(0.0, index=out.index)
+        away_good = pd.concat(away_good_stack, axis=1).mean(axis=1) if away_good_stack else pd.Series(0.0, index=out.index)
+        out["away_sp_hr_suppression_score"] = away_good - away_bad
+        engineered_starter += 1
+
+    home_team_danger_col = _pick_contains([c for c in out.columns if c.startswith("home_team_")], DANGER_TOKENS)
+    away_team_danger_col = _pick_contains([c for c in out.columns if c.startswith("away_team_")], DANGER_TOKENS)
+    if home_team_danger_col and "away_sp_hr_suppression_score" in out.columns:
+        out["home_offense_power_vs_away_sp_suppression"] = pd.to_numeric(out[home_team_danger_col], errors="coerce") - pd.to_numeric(out["away_sp_hr_suppression_score"], errors="coerce")
+        engineered_matchup_env += 1
+    if away_team_danger_col and "home_sp_hr_suppression_score" in out.columns:
+        out["away_offense_power_vs_home_sp_suppression"] = pd.to_numeric(out[away_team_danger_col], errors="coerce") - pd.to_numeric(out["home_sp_hr_suppression_score"], errors="coerce")
+        engineered_matchup_env += 1
+
+    home_barrel_col = _pick_contains([c for c in out.columns if c.startswith("home_team_")], ["barrel"])
+    away_barrel_col = _pick_contains([c for c in out.columns if c.startswith("away_team_")], ["barrel"])
+    away_sp_contact_supp = _pick_contains([c for c in out.columns if c.startswith("away_sp_")], ["contact_rate"])
+    home_sp_contact_supp = _pick_contains([c for c in out.columns if c.startswith("home_sp_")], ["contact_rate"])
+    if home_barrel_col and away_sp_contact_supp:
+        out["home_barrel_pressure_vs_away_sp_contact_suppression"] = pd.to_numeric(out[home_barrel_col], errors="coerce") - pd.to_numeric(out[away_sp_contact_supp], errors="coerce")
+        engineered_matchup_env += 1
+    if away_barrel_col and home_sp_contact_supp:
+        out["away_barrel_pressure_vs_home_sp_contact_suppression"] = pd.to_numeric(out[away_barrel_col], errors="coerce") - pd.to_numeric(out[home_sp_contact_supp], errors="coerce")
+        engineered_matchup_env += 1
+
+    if home_team_danger_col and "combined_park_weather_hr_index" in out.columns:
+        out["home_power_env_interaction"] = pd.to_numeric(out[home_team_danger_col], errors="coerce") * pd.to_numeric(out["combined_park_weather_hr_index"], errors="coerce")
+        engineered_matchup_env += 1
+    if away_team_danger_col and "combined_park_weather_hr_index" in out.columns:
+        out["away_power_env_interaction"] = pd.to_numeric(out[away_team_danger_col], errors="coerce") * pd.to_numeric(out["combined_park_weather_hr_index"], errors="coerce")
+        engineered_matchup_env += 1
+    if "home_sp_hr_suppression_score" in out.columns and "env_hr_suppression_proxy" in out.columns:
+        out["home_sp_env_suppression_interaction"] = pd.to_numeric(out["home_sp_hr_suppression_score"], errors="coerce") * pd.to_numeric(out["env_hr_suppression_proxy"], errors="coerce")
+        engineered_matchup_env += 1
+    if "away_sp_hr_suppression_score" in out.columns and "env_hr_suppression_proxy" in out.columns:
+        out["away_sp_env_suppression_interaction"] = pd.to_numeric(out["away_sp_hr_suppression_score"], errors="coerce") * pd.to_numeric(out["env_hr_suppression_proxy"], errors="coerce")
+        engineered_matchup_env += 1
+
+    logging.info("engineered starter suppression features created=%s", engineered_starter)
+    logging.info("engineered matchup/environment interaction features created=%s", engineered_matchup_env)
 
     return out
 

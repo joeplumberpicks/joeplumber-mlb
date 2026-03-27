@@ -95,6 +95,15 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         "launch_angle",
         "release_speed",
         "release_spin_rate",
+        "barrel",
+        "hard_hit",
+        "fly",
+        "fb",
+        "air",
+        "pulled",
+        "iso",
+        "slug",
+        "xbh",
     )
 
     initial_feats = [c for c in df.columns if c not in always_drop]
