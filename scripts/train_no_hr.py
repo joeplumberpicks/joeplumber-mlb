@@ -85,14 +85,6 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         "starter_hr_suppression_gap_home_vs_away",
     }
     roll_tokens = ("_roll3", "_roll7", "_roll15", "_roll30")
-    safe_engineered_tokens = (
-        "hr_danger",
-        "suppression",
-        "env_interaction",
-        "vs_",
-        "top3",
-        "danger_score",
-    )
     banned_substrings = (
         "game_pk",
         "game_id",
@@ -100,6 +92,14 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         "date",
         "_id",
         "lineup_id",
+    )
+    safe_engineered_tokens = (
+        "hr_danger",
+        "suppression",
+        "env_interaction",
+        "vs_",
+        "top3",
+        "danger_score",
     )
 
     initial_feats = [c for c in df.columns if c not in always_drop]
@@ -112,6 +112,8 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         is_safe_engineered = any(tok in lc for tok in safe_engineered_tokens)
         is_banned_roll = any(tok in lc for tok in banned_substrings)
         is_weather_prefield = lc.startswith("weather_")
+        is_safe_engineered = any(tok in lc for tok in safe_engineered_tokens)
+        is_banned_roll = any(tok in lc for tok in banned_substrings)
 
         if (
             (is_roll and not is_banned_roll)
