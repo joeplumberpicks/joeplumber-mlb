@@ -85,36 +85,6 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         "starter_hr_suppression_gap_home_vs_away",
     }
     roll_tokens = ("_roll3", "_roll7", "_roll15", "_roll30")
-    trusted_stat_family_tokens = (
-        "whiff_rate",
-        "contact_rate",
-        "chase_rate",
-        "swing_rate",
-        "zone_swing_rate",
-        "launch_speed",
-        "launch_angle",
-        "release_speed",
-        "release_spin_rate",
-        "barrel",
-        "hard_hit",
-        "hardhit",
-        "fly",
-        "fly_ball",
-        "flyball",
-        "fb",
-        "fb_rate",
-        "air",
-        "air_ball",
-        "airball",
-        "air_rate",
-        "pulled",
-        "pulled_air",
-        "pull_air",
-        "iso",
-        "slug",
-        "slg",
-        "xbh",
-    )
     safe_engineered_tokens = (
         "hr_danger",
         "suppression",
@@ -127,6 +97,7 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         "game_pk",
         "game_id",
         "game_date",
+        "date",
         "_id",
         "lineup_id",
     )
@@ -138,13 +109,12 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         lc = c.lower()
         is_roll = any(tok in lc for tok in roll_tokens)
         is_explicit_allow = c in explicit_allow
-        has_trusted_stat_family = any(tok in lc for tok in trusted_stat_family_tokens)
         is_safe_engineered = any(tok in lc for tok in safe_engineered_tokens)
         is_banned_roll = any(tok in lc for tok in banned_substrings)
         is_weather_prefield = lc.startswith("weather_")
 
         if (
-            ((is_roll and has_trusted_stat_family) and not is_banned_roll)
+            (is_roll and not is_banned_roll)
             or is_explicit_allow
             or is_weather_prefield
             or is_safe_engineered
