@@ -596,6 +596,11 @@ def _attach_engineered_features(mart: pd.DataFrame) -> pd.DataFrame:
     engineered_starter = 0
     engineered_matchup_env = 0
     engineered_lineup = 0
+    engineered_starter_v2 = 0
+    engineered_gap_v2 = 0
+    engineered_game_fragility = 0
+    engineered_env_v2 = 0
+    engineered_bullpen = 0
 
     def _as_numeric_series(df: pd.DataFrame, value: object, default: float) -> pd.Series:
         if isinstance(value, str) and value in df.columns:
@@ -680,6 +685,38 @@ def _attach_engineered_features(mart: pd.DataFrame) -> pd.DataFrame:
         out["away_sp_hr_suppression_score"] = away_good - away_bad
         engineered_starter += 1
 
+    # Starter HR suppression V2
+    home_damage_cols = _collect_prefixed_numeric_cols("home_sp_", ["hr_per_bf", "hr_rate", "barrel", "hard_hit", "hardhit", "launch_speed", "launch_angle", "fb_rate", "fly_ball", "flyball", "air_ball", "airball"])
+    away_damage_cols = _collect_prefixed_numeric_cols("away_sp_", ["hr_per_bf", "hr_rate", "barrel", "hard_hit", "hardhit", "launch_speed", "launch_angle", "fb_rate", "fly_ball", "flyball", "air_ball", "airball"])
+    home_miss_bat_cols = _collect_prefixed_numeric_cols("home_sp_", ["whiff_rate", "chase_rate"])
+    away_miss_bat_cols = _collect_prefixed_numeric_cols("away_sp_", ["whiff_rate", "chase_rate"])
+    home_ground_cols = _collect_prefixed_numeric_cols("home_sp_", ["gb_rate", "ground_ball"])
+    away_ground_cols = _collect_prefixed_numeric_cols("away_sp_", ["gb_rate", "ground_ball"])
+    home_contact_cols_v2 = _collect_prefixed_numeric_cols("home_sp_", ["contact_rate"])
+    away_contact_cols_v2 = _collect_prefixed_numeric_cols("away_sp_", ["contact_rate"])
+
+    if home_damage_cols:
+        out["home_sp_hr_damage_allowed_score"] = out[home_damage_cols].apply(pd.to_numeric, errors="coerce").mean(axis=1)
+        engineered_starter_v2 += 1
+    if away_damage_cols:
+        out["away_sp_hr_damage_allowed_score"] = out[away_damage_cols].apply(pd.to_numeric, errors="coerce").mean(axis=1)
+        engineered_starter_v2 += 1
+
+    if any([home_damage_cols, home_miss_bat_cols, home_ground_cols, home_contact_cols_v2]):
+        home_damage = out[home_damage_cols].apply(pd.to_numeric, errors="coerce").mean(axis=1) if home_damage_cols else pd.Series(0.0, index=out.index)
+        home_miss = out[home_miss_bat_cols].apply(pd.to_numeric, errors="coerce").mean(axis=1) if home_miss_bat_cols else pd.Series(0.0, index=out.index)
+        home_ground = out[home_ground_cols].apply(pd.to_numeric, errors="coerce").mean(axis=1) if home_ground_cols else pd.Series(0.0, index=out.index)
+        home_contact = out[home_contact_cols_v2].apply(pd.to_numeric, errors="coerce").mean(axis=1) if home_contact_cols_v2 else pd.Series(0.0, index=out.index)
+        out["home_sp_hr_suppression_score_v2"] = (home_miss + home_ground) - (home_damage + home_contact)
+        engineered_starter_v2 += 1
+    if any([away_damage_cols, away_miss_bat_cols, away_ground_cols, away_contact_cols_v2]):
+        away_damage = out[away_damage_cols].apply(pd.to_numeric, errors="coerce").mean(axis=1) if away_damage_cols else pd.Series(0.0, index=out.index)
+        away_miss = out[away_miss_bat_cols].apply(pd.to_numeric, errors="coerce").mean(axis=1) if away_miss_bat_cols else pd.Series(0.0, index=out.index)
+        away_ground = out[away_ground_cols].apply(pd.to_numeric, errors="coerce").mean(axis=1) if away_ground_cols else pd.Series(0.0, index=out.index)
+        away_contact = out[away_contact_cols_v2].apply(pd.to_numeric, errors="coerce").mean(axis=1) if away_contact_cols_v2 else pd.Series(0.0, index=out.index)
+        out["away_sp_hr_suppression_score_v2"] = (away_miss + away_ground) - (away_damage + away_contact)
+        engineered_starter_v2 += 1
+
     home_danger_mean_cols = [c for c in out.columns if c.startswith("home_team_") and c.endswith("_mean") and any(tok in c.lower() for tok in DANGER_TOKENS)]
     away_danger_mean_cols = [c for c in out.columns if c.startswith("away_team_") and c.endswith("_mean") and any(tok in c.lower() for tok in DANGER_TOKENS)]
     home_danger_top3_cols = [c for c in out.columns if c.startswith("home_team_") and c.endswith("_top3_mean") and any(tok in c.lower() for tok in DANGER_TOKENS)]
@@ -724,6 +761,22 @@ def _attach_engineered_features(mart: pd.DataFrame) -> pd.DataFrame:
         out["away_team_top3_hitter_hr_danger"] = pd.to_numeric(out["away_team_hr_danger_top3_score"], errors="coerce")
         engineered_lineup += 1
 
+    # Offense vs starter pressure gap V2
+    away_sp_supp_v2_col = "away_sp_hr_suppression_score_v2" if "away_sp_hr_suppression_score_v2" in out.columns else "away_sp_hr_suppression_score" if "away_sp_hr_suppression_score" in out.columns else None
+    home_sp_supp_v2_col = "home_sp_hr_suppression_score_v2" if "home_sp_hr_suppression_score_v2" in out.columns else "home_sp_hr_suppression_score" if "home_sp_hr_suppression_score" in out.columns else None
+    if "home_team_hr_danger_score" in out.columns and away_sp_supp_v2_col:
+        out["home_offense_vs_away_sp_hr_gap"] = pd.to_numeric(out["home_team_hr_danger_score"], errors="coerce") - pd.to_numeric(out[away_sp_supp_v2_col], errors="coerce")
+        engineered_gap_v2 += 1
+    if "away_team_hr_danger_score" in out.columns and home_sp_supp_v2_col:
+        out["away_offense_vs_home_sp_hr_gap"] = pd.to_numeric(out["away_team_hr_danger_score"], errors="coerce") - pd.to_numeric(out[home_sp_supp_v2_col], errors="coerce")
+        engineered_gap_v2 += 1
+    if "home_team_hr_danger_top3_score" in out.columns and away_sp_supp_v2_col:
+        out["home_top3_vs_away_sp_hr_gap"] = pd.to_numeric(out["home_team_hr_danger_top3_score"], errors="coerce") - pd.to_numeric(out[away_sp_supp_v2_col], errors="coerce")
+        engineered_gap_v2 += 1
+    if "away_team_hr_danger_top3_score" in out.columns and home_sp_supp_v2_col:
+        out["away_top3_vs_home_sp_hr_gap"] = pd.to_numeric(out["away_team_hr_danger_top3_score"], errors="coerce") - pd.to_numeric(out[home_sp_supp_v2_col], errors="coerce")
+        engineered_gap_v2 += 1
+
     home_team_danger_col = "home_team_hr_danger_score" if "home_team_hr_danger_score" in out.columns else _pick_contains([c for c in out.columns if c.startswith("home_team_")], DANGER_TOKENS)
     away_team_danger_col = "away_team_hr_danger_score" if "away_team_hr_danger_score" in out.columns else _pick_contains([c for c in out.columns if c.startswith("away_team_")], DANGER_TOKENS)
     if home_team_danger_col and "away_sp_hr_suppression_score" in out.columns:
@@ -752,6 +805,66 @@ def _attach_engineered_features(mart: pd.DataFrame) -> pd.DataFrame:
         out["away_barrel_pressure_vs_home_sp_contact_suppression"] = pd.to_numeric(out[away_barrel_col], errors="coerce") - pd.to_numeric(out[home_sp_contact_supp], errors="coerce")
         engineered_matchup_env += 1
 
+    # Optional bullpen context (if available in schema)
+    home_bullpen_col = _pick_contains(list(out.columns), ["home_bullpen_hr_rate", "home_bullpen_hr_per_bf", "home_bullpen_barrel_allowed", "home_bullpen_hard_hit_allowed", "home_bp_hr_rate", "home_bp_hr_per_bf"])
+    away_bullpen_col = _pick_contains(list(out.columns), ["away_bullpen_hr_rate", "away_bullpen_hr_per_bf", "away_bullpen_barrel_allowed", "away_bullpen_hard_hit_allowed", "away_bp_hr_rate", "away_bp_hr_per_bf"])
+    if home_bullpen_col:
+        out["home_bullpen_hr_suppression"] = -pd.to_numeric(out[home_bullpen_col], errors="coerce")
+        engineered_bullpen += 1
+    if away_bullpen_col:
+        out["away_bullpen_hr_suppression"] = -pd.to_numeric(out[away_bullpen_col], errors="coerce")
+        engineered_bullpen += 1
+    if "home_bullpen_hr_suppression" in out.columns and "away_bullpen_hr_suppression" in out.columns:
+        out["game_bullpen_hr_fragility"] = -(pd.to_numeric(out["home_bullpen_hr_suppression"], errors="coerce") + pd.to_numeric(out["away_bullpen_hr_suppression"], errors="coerce")) / 2.0
+        engineered_bullpen += 1
+
+    # Game-level explosion / fragility features
+    if "home_team_hr_danger_top3_score" in out.columns and "away_team_hr_danger_top3_score" in out.columns:
+        out["game_combined_top3_hr_danger"] = pd.to_numeric(out["home_team_hr_danger_top3_score"], errors="coerce") + pd.to_numeric(out["away_team_hr_danger_top3_score"], errors="coerce")
+        engineered_game_fragility += 1
+    if "home_team_hr_danger_score" in out.columns and "away_team_hr_danger_score" in out.columns:
+        out["game_combined_mean_hr_danger"] = (pd.to_numeric(out["home_team_hr_danger_score"], errors="coerce") + pd.to_numeric(out["away_team_hr_danger_score"], errors="coerce")) / 2.0
+        engineered_game_fragility += 1
+    if "home_team_max_hitter_hr_danger" in out.columns and "away_team_max_hitter_hr_danger" in out.columns:
+        out["game_combined_max_hr_danger"] = pd.concat(
+            [
+                pd.to_numeric(out["home_team_max_hitter_hr_danger"], errors="coerce"),
+                pd.to_numeric(out["away_team_max_hitter_hr_danger"], errors="coerce"),
+            ],
+            axis=1,
+        ).max(axis=1)
+        engineered_game_fragility += 1
+    weaker_sp_col = None
+    if "home_sp_hr_suppression_score_v2" in out.columns and "away_sp_hr_suppression_score_v2" in out.columns:
+        out["weaker_sp_hr_suppression"] = pd.concat(
+            [
+                pd.to_numeric(out["home_sp_hr_suppression_score_v2"], errors="coerce"),
+                pd.to_numeric(out["away_sp_hr_suppression_score_v2"], errors="coerce"),
+            ],
+            axis=1,
+        ).min(axis=1)
+        weaker_sp_col = "weaker_sp_hr_suppression"
+        engineered_game_fragility += 1
+    elif "home_sp_hr_suppression_score" in out.columns and "away_sp_hr_suppression_score" in out.columns:
+        out["weaker_sp_hr_suppression"] = pd.concat(
+            [
+                pd.to_numeric(out["home_sp_hr_suppression_score"], errors="coerce"),
+                pd.to_numeric(out["away_sp_hr_suppression_score"], errors="coerce"),
+            ],
+            axis=1,
+        ).min(axis=1)
+        weaker_sp_col = "weaker_sp_hr_suppression"
+        engineered_game_fragility += 1
+
+    if "game_combined_top3_hr_danger" in out.columns and "combined_park_weather_hr_index" in out.columns:
+        out["game_hr_environment_pressure"] = pd.to_numeric(out["game_combined_top3_hr_danger"], errors="coerce") * pd.to_numeric(out["combined_park_weather_hr_index"], errors="coerce")
+        engineered_game_fragility += 1
+    if "game_hr_environment_pressure" in out.columns and weaker_sp_col:
+        out["game_hr_fragility_score"] = pd.to_numeric(out["game_hr_environment_pressure"], errors="coerce") - pd.to_numeric(out[weaker_sp_col], errors="coerce")
+        if "game_bullpen_hr_fragility" in out.columns:
+            out["game_hr_fragility_score"] = out["game_hr_fragility_score"] + pd.to_numeric(out["game_bullpen_hr_fragility"], errors="coerce").fillna(0.0)
+        engineered_game_fragility += 1
+
     if home_team_danger_col and "combined_park_weather_hr_index" in out.columns:
         out["home_hr_danger_env_interaction"] = pd.to_numeric(out[home_team_danger_col], errors="coerce") * pd.to_numeric(out["combined_park_weather_hr_index"], errors="coerce")
         out["home_power_env_interaction"] = out["home_hr_danger_env_interaction"]
@@ -775,9 +888,31 @@ def _attach_engineered_features(mart: pd.DataFrame) -> pd.DataFrame:
         out["away_sp_env_suppression_interaction"] = out["away_sp_suppression_env_interaction"]
         engineered_matchup_env += 1
 
+    # V2 environment interactions
+    if "home_offense_vs_away_sp_hr_gap" in out.columns and "combined_park_weather_hr_index" in out.columns:
+        out["home_hr_gap_env_interaction"] = pd.to_numeric(out["home_offense_vs_away_sp_hr_gap"], errors="coerce") * pd.to_numeric(out["combined_park_weather_hr_index"], errors="coerce")
+        engineered_env_v2 += 1
+    if "away_offense_vs_home_sp_hr_gap" in out.columns and "combined_park_weather_hr_index" in out.columns:
+        out["away_hr_gap_env_interaction"] = pd.to_numeric(out["away_offense_vs_home_sp_hr_gap"], errors="coerce") * pd.to_numeric(out["combined_park_weather_hr_index"], errors="coerce")
+        engineered_env_v2 += 1
+    if "game_hr_fragility_score" in out.columns and "combined_park_weather_hr_index" in out.columns:
+        out["game_fragility_env_interaction"] = pd.to_numeric(out["game_hr_fragility_score"], errors="coerce") * pd.to_numeric(out["combined_park_weather_hr_index"], errors="coerce")
+        engineered_env_v2 += 1
+    if weaker_sp_col and "combined_park_weather_hr_index" in out.columns:
+        out["weaker_sp_env_penalty"] = -pd.to_numeric(out[weaker_sp_col], errors="coerce") * pd.to_numeric(out["combined_park_weather_hr_index"], errors="coerce")
+        engineered_env_v2 += 1
+
     logging.info("engineered lineup concentration features created=%s", engineered_lineup)
     logging.info("engineered starter suppression features created=%s", engineered_starter)
     logging.info("engineered matchup/environment interaction features created=%s", engineered_matchup_env)
+    logging.info("V2 starter suppression features created=%s", engineered_starter_v2)
+    logging.info("offense vs starter gap features created=%s", engineered_gap_v2)
+    logging.info("game-level HR fragility features created=%s", engineered_game_fragility)
+    if engineered_bullpen:
+        logging.info("bullpen HR context features created=%s", engineered_bullpen)
+    else:
+        logging.info("bullpen HR context features created=0 (unavailable in current schema)")
+    logging.info("V2 environment interaction features created=%s", engineered_env_v2)
 
     return out
 

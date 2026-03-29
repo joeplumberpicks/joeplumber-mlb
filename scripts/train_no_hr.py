@@ -101,6 +101,11 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         "vs_",
         "top3",
         "danger_score",
+        "fragility",
+        "damage_allowed",
+        "hr_gap",
+        "pressure",
+        "v2",
     )
 
     initial_feats = [c for c in df.columns if c not in always_drop]
