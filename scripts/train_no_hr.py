@@ -111,6 +111,8 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         lc = c.lower()
         is_roll = any(tok in lc for tok in roll_tokens)
         is_explicit_allow = c in explicit_allow
+        is_safe_engineered = any(tok in lc for tok in safe_engineered_tokens)
+        is_banned_roll = any(tok in lc for tok in banned_substrings)
         is_weather_prefield = lc.startswith("weather_")
         is_safe_engineered = any(tok in lc for tok in safe_engineered_tokens)
         is_banned_roll = any(tok in lc for tok in banned_substrings)
