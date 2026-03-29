@@ -74,7 +74,8 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         "canonical_park_key",
         target_col,
     }
-    trusted_explicit_keep = {
+
+    explicit_allow = {
         "season",
         "temperature",
         "wind_speed",
@@ -104,7 +105,8 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
 
     initial_feats = [c for c in df.columns if c not in always_drop]
     dropped_cols: list[str] = []
-    candidate_kept_cols: list[str] = []
+    allow_kept_cols: list[str] = []
+
     for c in initial_feats:
         lc = c.lower()
         is_roll = any(tok in lc for tok in roll_tokens)
@@ -129,26 +131,22 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
     assert isinstance(dropped_cols, list)
 
     X = df[allow_kept_cols].copy()
-
     for c in X.columns:
-        if pd.api.types.is_bool_dtype(X[c]):
-            X[c] = X[c].astype("Int64")
-        if not pd.api.types.is_numeric_dtype(X[c]):
-            X[c] = pd.to_numeric(X[c], errors="coerce")
+        X[c] = pd.to_numeric(X[c], errors="coerce")
 
-    X = X.replace([np.inf, -np.inf], np.nan)
-    keep = [c for c in X.columns if X[c].notna().any()]
-    X = X[keep].astype("float32") if keep else pd.DataFrame({"bias": np.zeros(len(df), dtype="float32")})
+    all_null = [c for c in X.columns if X[c].notna().sum() == 0]
+    if all_null:
+        X = X.drop(columns=all_null)
 
-    logging.info("feature selection initial feature count=%s", len(initial_feats))
-    logging.info("feature selection kept count=%s", len(keep))
+    logging.info("feature selection initial count=%s", len(initial_feats))
+    logging.info("feature selection kept count=%s", len(X.columns))
     logging.info("feature selection dropped count=%s", len(dropped_cols))
-    logging.info("feature selection first 50 kept columns=%s", keep[:50])
-    logging.info("feature selection first 50 dropped columns=%s", dropped_cols[:50])
+    logging.info("feature selection kept sample=%s", list(X.columns)[:40])
+    logging.info("feature selection dropped sample=%s", dropped_cols[:40])
     logging.info(
         "engineered features kept count=%s sample=%s",
-        len([c for c in allow_kept_cols if any(tok in c.lower() for tok in safe_engineered_tokens)]),
-        [c for c in allow_kept_cols if any(tok in c.lower() for tok in safe_engineered_tokens)][:10],
+        len([c for c in X.columns if any(tok in c.lower() for tok in safe_engineered_tokens)]),
+        [c for c in X.columns if any(tok in c.lower() for tok in safe_engineered_tokens)][:10],
     )
     return X, list(X.columns)
 
