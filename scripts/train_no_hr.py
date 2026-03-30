@@ -71,14 +71,38 @@ def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]
         "away_team_launch_angle_mean_roll15_mean",
         "temperature",
         "wind_speed",
-        "wind_out_to_center",
-        "park_hr_factor",
     ]
-    available = [c for c in core_features if c in df.columns]
-    missing = [c for c in core_features if c not in df.columns]
 
-    X = df.reindex(columns=available).copy()
-    X = X.apply(pd.to_numeric, errors="coerce")
+    feature_data: dict[str, pd.Series] = {}
+    available: list[str] = []
+    missing: list[str] = []
+
+    for c in core_features:
+        if c in {"home_sp_hr_rate_roll15", "away_sp_hr_rate_roll15"}:
+            continue
+        if c in df.columns:
+            feature_data[c] = pd.to_numeric(df[c], errors="coerce")
+            available.append(c)
+        else:
+            missing.append(c)
+
+    home_sp_candidates = ["home_sp_hr_rate_roll15", "home_sp_hr_roll15", "home_sp_hr_allowed_roll15"]
+    away_sp_candidates = ["away_sp_hr_rate_roll15", "away_sp_hr_roll15", "away_sp_hr_allowed_roll15"]
+    home_sp_source = next((c for c in home_sp_candidates if c in df.columns), None)
+    away_sp_source = next((c for c in away_sp_candidates if c in df.columns), None)
+
+    if home_sp_source is not None:
+        feature_data["home_sp_hr_rate_roll15"] = pd.to_numeric(df[home_sp_source], errors="coerce")
+        available.append("home_sp_hr_rate_roll15")
+    else:
+        missing.append("home_sp_hr_rate_roll15")
+    if away_sp_source is not None:
+        feature_data["away_sp_hr_rate_roll15"] = pd.to_numeric(df[away_sp_source], errors="coerce")
+        available.append("away_sp_hr_rate_roll15")
+    else:
+        missing.append("away_sp_hr_rate_roll15")
+
+    X = pd.DataFrame(feature_data, index=df.index)
     X = X.fillna(0.0).astype("float32")
 
     logger.info("feature selection requested core count=%s", len(core_features))
