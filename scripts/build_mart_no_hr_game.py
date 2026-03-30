@@ -293,6 +293,70 @@ def _enforce_prior_to_game_rolling(df: pd.DataFrame, entity_col: str, source_nam
     return out
 
 
+def _prepare_cross_season_rolling_source(
+    current_df: pd.DataFrame,
+    prior_df: pd.DataFrame,
+    entity_col: str,
+    season: int,
+    prior_season: int,
+    source_name: str,
+) -> pd.DataFrame:
+    curr = current_df.copy()
+    prev = prior_df.copy()
+
+    if not prev.empty:
+        prev["__row_origin"] = "prior"
+    if not curr.empty:
+        curr["__row_origin"] = "current"
+
+    combined = pd.concat([prev, curr], ignore_index=True, sort=False) if (not prev.empty or not curr.empty) else pd.DataFrame()
+    if combined.empty:
+        logging.info(
+            "cross-season rolling source=%s requested_season=%s prior_season=%s combined_rows=0",
+            source_name,
+            season,
+            prior_season,
+        )
+        return combined
+
+    if "season" not in combined.columns:
+        if "game_date" in combined.columns:
+            combined["season"] = pd.to_datetime(combined["game_date"], errors="coerce").dt.year
+        else:
+            combined["season"] = pd.NA
+    else:
+        combined["season"] = pd.to_numeric(combined["season"], errors="coerce")
+
+    combined["__source_season"] = combined["season"]
+    combined = _enforce_prior_to_game_rolling(combined, entity_col, f"{source_name}_cross_season")
+    requested = combined[pd.to_numeric(combined["season"], errors="coerce") == season].copy()
+
+    combined_entities = int(pd.to_numeric(combined.get(entity_col), errors="coerce").dropna().nunique()) if entity_col in combined.columns else 0
+    requested_entities = int(pd.to_numeric(requested.get(entity_col), errors="coerce").dropna().nunique()) if entity_col in requested.columns else 0
+    prior_contribution_detected = bool((pd.to_numeric(requested.get("__source_season"), errors="coerce") == prior_season).fillna(False).any())
+
+    logging.info(
+        "cross-season rolling source=%s requested_season=%s prior_season=%s combined_rows=%s combined_entities=%s",
+        source_name,
+        season,
+        prior_season,
+        len(combined),
+        combined_entities,
+    )
+    logging.info(
+        "post-combined shift requested rows %s=%s requested_entities=%s",
+        source_name,
+        len(requested),
+        requested_entities,
+    )
+    logging.info(
+        "cross-season stabilization source=%s prior_contribution_detected=%s",
+        source_name,
+        prior_contribution_detected,
+    )
+    return requested.drop(columns=["__row_origin"], errors="ignore")
+
+
 def _sort_for_latest(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
     if "game_date" in work.columns:
@@ -951,20 +1015,34 @@ def main() -> None:
     all_batter_roll = read_parquet(dirs["processed_dir"] / "batter_game_rolling.parquet")
     all_pitcher_roll = read_parquet(dirs["processed_dir"] / "pitcher_game_rolling.parquet")
 
-    curr_batter = _usable_batter_rows(_filter_season(all_batter_roll, args.season))
-    prev_batter = _usable_batter_rows(_filter_season(all_batter_roll, args.season - 1))
-    curr_pitcher = _usable_pitcher_rows(_filter_season(all_pitcher_roll, args.season))
-    prev_pitcher = _usable_pitcher_rows(_filter_season(all_pitcher_roll, args.season - 1))
+    curr_batter_raw = _usable_batter_rows(_filter_season(all_batter_roll, args.season))
+    prev_batter_raw = _usable_batter_rows(_filter_season(all_batter_roll, args.season - 1))
+    curr_pitcher_raw = _usable_pitcher_rows(_filter_season(all_pitcher_roll, args.season))
+    prev_pitcher_raw = _usable_pitcher_rows(_filter_season(all_pitcher_roll, args.season - 1))
 
     batter_entity_col = _pick(all_batter_roll, ["batter_id", "batter", "player_id"])
     pitcher_entity_col = _pick(all_pitcher_roll, ["pitcher_id", "pitcher", "mlbam_pitcher_id", "player_id"])
     if batter_entity_col is None or pitcher_entity_col is None:
         raise ValueError("Could not determine batter/pitcher entity key columns for prior-to-game shift enforcement")
 
-    curr_batter = _enforce_prior_to_game_rolling(curr_batter, batter_entity_col, "batter_game_rolling_current")
-    prev_batter = _enforce_prior_to_game_rolling(prev_batter, batter_entity_col, "batter_game_rolling_prior")
-    curr_pitcher = _enforce_prior_to_game_rolling(curr_pitcher, pitcher_entity_col, "pitcher_game_rolling_current")
-    prev_pitcher = _enforce_prior_to_game_rolling(prev_pitcher, pitcher_entity_col, "pitcher_game_rolling_prior")
+    curr_batter = _prepare_cross_season_rolling_source(
+        current_df=curr_batter_raw,
+        prior_df=prev_batter_raw,
+        entity_col=batter_entity_col,
+        season=args.season,
+        prior_season=args.season - 1,
+        source_name="batter",
+    )
+    curr_pitcher = _prepare_cross_season_rolling_source(
+        current_df=curr_pitcher_raw,
+        prior_df=prev_pitcher_raw,
+        entity_col=pitcher_entity_col,
+        season=args.season,
+        prior_season=args.season - 1,
+        source_name="pitcher",
+    )
+    prev_batter = _enforce_prior_to_game_rolling(prev_batter_raw, batter_entity_col, "batter_game_rolling_prior")
+    prev_pitcher = _enforce_prior_to_game_rolling(prev_pitcher_raw, pitcher_entity_col, "pitcher_game_rolling_prior")
 
     logging.info(
         "batter rolling usable rows season=%s:%s prior=%s:%s",
