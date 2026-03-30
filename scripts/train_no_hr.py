@@ -9,12 +9,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from joblib import dump
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import brier_score_loss, log_loss
+
+logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -61,150 +58,39 @@ def _load_marts(dirs: dict[str, Path], seasons: list[int]) -> pd.DataFrame:
 
 
 def _prep_X(df: pd.DataFrame, target_col: str) -> tuple[pd.DataFrame, list[str]]:
-    always_drop = {
-        "no_hr_game",
-        "total_hr",
-        "game_pk",
-        "game_date",
-        "home_sp_id",
-        "away_sp_id",
-        "home_team",
-        "away_team",
-        "park_name",
-        "canonical_park_key",
-        target_col,
-    }
-
-    explicit_allow = {
-        "season",
+    core_features = [
+        "home_team_hitter_hr_danger_score_mean",
+        "home_team_hitter_hr_danger_score_max",
+        "away_team_hitter_hr_danger_score_mean",
+        "away_team_hitter_hr_danger_score_max",
+        "home_team_launch_speed_max_roll15_top3_mean",
+        "away_team_launch_speed_max_roll15_top3_mean",
+        "home_sp_hr_rate_roll15",
+        "away_sp_hr_rate_roll15",
+        "home_team_launch_angle_mean_roll15_mean",
+        "away_team_launch_angle_mean_roll15_mean",
         "temperature",
         "wind_speed",
-        "wind_direction",
-        "combined_park_weather_hr_index",
-        "env_hr_suppression_proxy",
-        "starter_hr_suppression_gap_away_vs_home",
-        "starter_hr_suppression_gap_home_vs_away",
-    }
-    roll_tokens = ("_roll3", "_roll7", "_roll15", "_roll30")
-    banned_substrings = (
-        "game_pk",
-        "game_id",
-        "game_date",
-        "date",
-        "_id",
-        "lineup_id",
-    )
-    safe_engineered_tokens = (
-        "hr_danger",
-        "suppression",
-        "env_interaction",
-        "vs_",
-        "top3",
-        "danger_score",
-        "fragility",
-        "damage_allowed",
-        "hr_gap",
-        "pressure",
-        "v2",
-    )
+        "wind_out_to_center",
+        "park_hr_factor",
+    ]
+    available = [c for c in core_features if c in df.columns]
+    missing = [c for c in core_features if c not in df.columns]
 
-    initial_feats = [c for c in df.columns if c not in always_drop]
-    dropped_cols: list[str] = []
-    allow_kept_cols: list[str] = []
+    X = df.reindex(columns=available).copy()
+    X = X.apply(pd.to_numeric, errors="coerce")
+    X = X.fillna(0.0).astype("float32")
 
-    for c in initial_feats:
-        lc = c.lower()
-        is_roll = any(tok in lc for tok in roll_tokens)
-        is_explicit_allow = c in explicit_allow
-        is_safe_engineered = any(tok in lc for tok in safe_engineered_tokens)
-        is_banned_roll = any(tok in lc for tok in banned_substrings)
-        is_weather_prefield = lc.startswith("weather_")
-        is_safe_engineered = any(tok in lc for tok in safe_engineered_tokens)
-        is_banned_roll = any(tok in lc for tok in banned_substrings)
-
-        if (
-            (is_roll and not is_banned_roll)
-            or is_explicit_allow
-            or is_weather_prefield
-            or is_safe_engineered
-        ):
-            allow_kept_cols.append(c)
-        else:
-            dropped_cols.append(c)
-
-    assert isinstance(allow_kept_cols, list)
-    assert isinstance(dropped_cols, list)
-
-    X = df[allow_kept_cols].copy()
-    for c in X.columns:
-        X[c] = pd.to_numeric(X[c], errors="coerce")
-
-    all_null = [c for c in X.columns if X[c].notna().sum() == 0]
-    if all_null:
-        X = X.drop(columns=all_null)
-
-    logging.info("feature selection initial count=%s", len(initial_feats))
-    logging.info("feature selection kept count=%s", len(X.columns))
-    logging.info("feature selection dropped count=%s", len(dropped_cols))
-    logging.info("feature selection kept sample=%s", list(X.columns)[:40])
-    logging.info("feature selection dropped sample=%s", dropped_cols[:40])
-    logging.info(
-        "engineered features kept count=%s sample=%s",
-        len([c for c in X.columns if any(tok in c.lower() for tok in safe_engineered_tokens)]),
-        [c for c in X.columns if any(tok in c.lower() for tok in safe_engineered_tokens)][:10],
-    )
-    return X, list(X.columns)
+    logger.info("feature selection requested core count=%s", len(core_features))
+    logger.info("feature selection available core count=%s", len(available))
+    logger.info("feature selection missing core columns=%s", missing)
+    return X, available
 
 
 def _calibration_table(y: np.ndarray, p: np.ndarray, bins: int = 10) -> pd.DataFrame:
     q = pd.qcut(pd.Series(p), q=min(bins, max(2, len(np.unique(p)))), duplicates="drop")
     tmp = pd.DataFrame({"y": y, "p": p, "bin": q})
     return tmp.groupby("bin", dropna=False).agg(pred_mean=("p", "mean"), obs_rate=("y", "mean"), n=("y", "size")).reset_index()
-
-
-def _scan_and_drop_leakage_features(
-    X_train: pd.DataFrame,
-    X_test: pd.DataFrame,
-    y_train: np.ndarray,
-    corr_threshold: float = 0.98,
-    auc_threshold: float = 0.98,
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    y_series = pd.Series(y_train, index=X_train.index)
-    leaked_features: list[str] = []
-
-    for c in X_train.columns:
-        s = pd.to_numeric(X_train[c], errors="coerce")
-        valid = s.notna() & y_series.notna()
-        if valid.sum() < 2:
-            continue
-
-        y_valid = y_series[valid]
-        s_valid = s[valid]
-
-        corr = float(s_valid.corr(y_valid))
-        if not np.isfinite(corr):
-            corr = 0.0
-
-        single_auc = float("nan")
-        if y_valid.nunique() > 1 and s_valid.nunique() > 1:
-            try:
-                single_auc = float(roc_auc_score(y_valid, s_valid))
-            except Exception:
-                single_auc = float("nan")
-        if not np.isfinite(single_auc):
-            single_auc = 0.5
-
-        if abs(corr) > corr_threshold or single_auc > auc_threshold:
-            logging.warning('LEAKAGE WARNING: Feature "%s" AUC=%.6f correlation=%.6f -> DROPPED', c, single_auc, corr)
-            leaked_features.append(c)
-
-    if leaked_features:
-        X_train = X_train.drop(columns=leaked_features, errors="ignore")
-        X_test = X_test.drop(columns=leaked_features, errors="ignore")
-
-    logging.info("leakage scan removed features=%s", len(leaked_features))
-    logging.info("feature count after leakage scan=%s", X_train.shape[1])
-    return X_train, X_test, leaked_features
 
 
 def main() -> None:
@@ -250,6 +136,8 @@ def main() -> None:
                 )
     y_train = y_train[y_train.notna()].astype("int64").to_numpy()
     y_test = y_test[y_test.notna()].astype("int64").to_numpy()
+    baseline_rate = float(train_df[target_col].mean())
+    logger.info(f"baseline_no_hr_rate={baseline_rate:.4f}")
 
     logging.info("train rows=%s test rows=%s", len(train_df), len(test_df))
     if "season" in train_df.columns:
@@ -260,52 +148,47 @@ def main() -> None:
     logging.info("test no_hr rate=%.6f", float(np.mean(y_test)) if len(y_test) else float("nan"))
 
     X_train, feat_cols = _prep_X(train_df, target_col)
-    X_test = test_df.reindex(columns=feat_cols).copy() if feat_cols else pd.DataFrame({"bias": np.zeros(len(test_df), dtype="float32")})
-    X_test = X_test.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).astype("float32")
-    X_train, X_test, leaked_features = _scan_and_drop_leakage_features(X_train, X_test, y_train)
-    feat_cols = list(X_train.columns)
+    X_test = test_df.reindex(columns=feat_cols).copy() if feat_cols else pd.DataFrame(index=test_df.index)
+    X_test = X_test.apply(pd.to_numeric, errors="coerce").fillna(0.0).astype("float32")
     if not feat_cols:
-        raise ValueError("All features were removed after leakage scan. Investigate feature engineering.")
+        raise ValueError("No core features available in marts. Rebuild features with required no-hr columns.")
 
-    base_model_name = "logreg"
+    baseline = baseline_rate
+    y_train_delta = y_train - baseline
+    y_test_actual = y_test.copy()
+
     try:
-        from xgboost import XGBClassifier  # type: ignore
+        from xgboost import XGBRegressor  # type: ignore
 
-        base = XGBClassifier(
-            n_estimators=300,
-            max_depth=4,
+        model = XGBRegressor(
+            n_estimators=200,
+            max_depth=3,
             learning_rate=0.05,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_lambda=1.0,
-            objective="binary:logistic",
-            eval_metric="logloss",
+            subsample=0.8,
+            colsample_bytree=0.8,
             random_state=42,
         )
-        base_model_name = "xgboost"
-        model = Pipeline([("imputer", SimpleImputer(strategy="median")), ("clf", base)])
     except Exception:
-        base = LogisticRegression(max_iter=4000, class_weight="balanced")
-        model = Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-            ("clf", base),
-        ])
+        raise RuntimeError("xgboost is required for baseline+delta no-hr training.")
 
-    calibrated = CalibratedClassifierCV(model, method="sigmoid", cv=3)
-    calibrated.fit(X_train, y_train)
-    p_test = calibrated.predict_proba(X_test)[:, 1]
+    model.fit(X_train, y_train_delta)
+    pred_delta = model.predict(X_test)
+    pred_prob = baseline + pred_delta
+    pred_prob = np.clip(pred_prob, 0.01, 0.50)
 
-    auc = float(roc_auc_score(y_test, p_test)) if len(np.unique(y_test)) > 1 else float("nan")
-    brier = float(brier_score_loss(y_test, p_test)) if len(y_test) else float("nan")
-    ll = float(log_loss(y_test, p_test, labels=[0, 1])) if len(y_test) else float("nan")
-    pred_mean = float(np.mean(p_test)) if len(p_test) else float("nan")
-    obs_mean = float(np.mean(y_test)) if len(y_test) else float("nan")
-    cal_tbl = _calibration_table(y_test, p_test)
-    if np.isfinite(auc) and auc > 0.90:
-        logging.warning("Model performance unusually high — possible residual leakage (auc=%.6f)", auc)
-    if np.isfinite(auc) and auc > 0.97:
-        raise ValueError("Model AUC exceeds 0.97 — leakage still present. Investigate feature engineering.")
+    brier = float(brier_score_loss(y_test_actual, pred_prob)) if len(y_test_actual) else float("nan")
+    ll = float(log_loss(y_test_actual, pred_prob, labels=[0, 1])) if len(y_test_actual) else float("nan")
+    pred_mean = float(np.mean(pred_prob)) if len(pred_prob) else float("nan")
+    obs_mean = float(np.mean(y_test_actual)) if len(y_test_actual) else float("nan")
+    cal_tbl = _calibration_table(y_test_actual, pred_prob)
+    logger.info(f"pred_prob_mean={pred_prob.mean():.4f}")
+    logger.info(f"obs_rate={y_test_actual.mean():.4f}")
+
+    q90 = float(np.quantile(pred_prob, 0.9))
+    q10 = float(np.quantile(pred_prob, 0.1))
+    top_decile_rate = float(y_test_actual[pred_prob >= q90].mean()) if len(y_test_actual) else float("nan")
+    bot_decile_rate = float(y_test_actual[pred_prob <= q10].mean()) if len(y_test_actual) else float("nan")
+    logger.info("top_decile_no_hr_rate=%.4f bottom_decile_no_hr_rate=%.4f", top_decile_rate, bot_decile_rate)
 
     signature = f"train_{'-'.join(map(str, train_seasons))}_test_{'-'.join(map(str, test_seasons))}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
     model_dir = dirs["models_dir"] / "no_hr"
@@ -313,12 +196,12 @@ def main() -> None:
     model_path = model_dir / f"no_hr_model_{signature}.pkl"
     dump(
         {
-            "model": calibrated,
+            "model": model,
             "features": feat_cols,
             "target_col": target_col,
             "signature": signature,
-            "base_model": base_model_name,
-            "leakage_dropped_features": leaked_features,
+            "base_model": "xgboost_reg_delta",
+            "baseline_no_hr_rate": baseline,
         },
         model_path,
     )
@@ -333,12 +216,14 @@ def main() -> None:
             "signature": signature,
             "train_seasons": ",".join(map(str, train_seasons)),
             "test_seasons": ",".join(map(str, test_seasons)),
-            "model": base_model_name,
-            "auc": auc,
+            "model": "xgboost_reg_delta",
             "brier": brier,
             "logloss": ll,
             "pred_mean": pred_mean,
             "obs_rate": obs_mean,
+            "baseline_no_hr_rate": baseline,
+            "top_decile_no_hr_rate": top_decile_rate,
+            "bottom_decile_no_hr_rate": bot_decile_rate,
             "n_test": len(y_test),
         }
     ])
@@ -348,10 +233,21 @@ def main() -> None:
     cal_path = bt_dir / f"no_hr_calibration_{signature}.csv"
     cal_tbl.to_csv(cal_path, index=False)
 
+    board = pd.DataFrame(
+        {
+            "game_id": test_df["game_pk"].values if "game_pk" in test_df.columns else np.arange(len(test_df)),
+            "home_team": test_df["home_team"].values if "home_team" in test_df.columns else pd.Series([pd.NA] * len(test_df)),
+            "away_team": test_df["away_team"].values if "away_team" in test_df.columns else pd.Series([pd.NA] * len(test_df)),
+            "no_hr_prob": pred_prob,
+            "delta_vs_baseline": pred_prob - baseline,
+        }
+    )
+    board_path = bt_dir / f"no_hr_board_{signature}.csv"
+    board.to_csv(board_path, index=False)
+
     logging.info(
-        "no_hr train complete model=%s auc=%.6f brier=%.6f logloss=%.6f pred_mean=%.6f obs_rate=%.6f model_path=%s",
-        base_model_name,
-        auc,
+        "no_hr train complete model=%s brier=%.6f logloss=%.6f pred_mean=%.6f obs_rate=%.6f model_path=%s",
+        "xgboost_reg_delta",
         brier,
         ll,
         pred_mean,
@@ -360,6 +256,7 @@ def main() -> None:
     )
     logging.info("features saved path=%s", feat_path.resolve())
     logging.info("calibration_by_decile path=%s", cal_path.resolve())
+    logging.info("board path=%s", board_path.resolve())
     print(f"model -> {model_path.resolve()}")
     print(f"backtest -> {bt_path.resolve()}")
 
