@@ -293,6 +293,70 @@ def _enforce_prior_to_game_rolling(df: pd.DataFrame, entity_col: str, source_nam
     return out
 
 
+def _prepare_cross_season_rolling_source(
+    current_df: pd.DataFrame,
+    prior_df: pd.DataFrame,
+    entity_col: str,
+    season: int,
+    prior_season: int,
+    source_name: str,
+) -> pd.DataFrame:
+    curr = current_df.copy()
+    prev = prior_df.copy()
+
+    if not prev.empty:
+        prev["__row_origin"] = "prior"
+    if not curr.empty:
+        curr["__row_origin"] = "current"
+
+    combined = pd.concat([prev, curr], ignore_index=True, sort=False) if (not prev.empty or not curr.empty) else pd.DataFrame()
+    if combined.empty:
+        logging.info(
+            "cross-season rolling source=%s requested_season=%s prior_season=%s combined_rows=0",
+            source_name,
+            season,
+            prior_season,
+        )
+        return combined
+
+    if "season" not in combined.columns:
+        if "game_date" in combined.columns:
+            combined["season"] = pd.to_datetime(combined["game_date"], errors="coerce").dt.year
+        else:
+            combined["season"] = pd.NA
+    else:
+        combined["season"] = pd.to_numeric(combined["season"], errors="coerce")
+
+    combined["__source_season"] = combined["season"]
+    combined = _enforce_prior_to_game_rolling(combined, entity_col, f"{source_name}_cross_season")
+    requested = combined[pd.to_numeric(combined["season"], errors="coerce") == season].copy()
+
+    combined_entities = int(pd.to_numeric(combined.get(entity_col), errors="coerce").dropna().nunique()) if entity_col in combined.columns else 0
+    requested_entities = int(pd.to_numeric(requested.get(entity_col), errors="coerce").dropna().nunique()) if entity_col in requested.columns else 0
+    prior_contribution_detected = bool((pd.to_numeric(requested.get("__source_season"), errors="coerce") == prior_season).fillna(False).any())
+
+    logging.info(
+        "cross-season rolling source=%s requested_season=%s prior_season=%s combined_rows=%s combined_entities=%s",
+        source_name,
+        season,
+        prior_season,
+        len(combined),
+        combined_entities,
+    )
+    logging.info(
+        "post-combined shift requested rows %s=%s requested_entities=%s",
+        source_name,
+        len(requested),
+        requested_entities,
+    )
+    logging.info(
+        "cross-season stabilization source=%s prior_contribution_detected=%s",
+        source_name,
+        prior_contribution_detected,
+    )
+    return requested.drop(columns=["__row_origin"], errors="ignore")
+
+
 def _sort_for_latest(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
     if "game_date" in work.columns:
@@ -917,6 +981,105 @@ def _attach_engineered_features(mart: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _ensure_no_hr_core_feature_columns(mart: pd.DataFrame) -> pd.DataFrame:
+    out = mart.copy()
+
+    def _numeric(col: str) -> pd.Series:
+        if col in out.columns:
+            return pd.to_numeric(out[col], errors="coerce")
+        return pd.Series(np.nan, index=out.index, dtype="float64")
+
+    def _ensure_sp_hr_rate(side: str) -> None:
+        target_col = f"{side}_sp_hr_rate_roll15"
+        if target_col in out.columns:
+            out[target_col] = pd.to_numeric(out[target_col], errors="coerce").fillna(0.03)
+            return
+
+        direct_candidates = [
+            f"{side}_sp_hr_roll15",
+            f"{side}_sp_hr_allowed_roll15",
+            f"{side}_sp_hr_per_bf_roll15",
+        ]
+        for c in direct_candidates:
+            if c in out.columns:
+                out[target_col] = pd.to_numeric(out[c], errors="coerce").fillna(0.03)
+                return
+
+        num_candidates = [
+            f"{side}_sp_hr_roll15",
+            f"{side}_sp_hr_allowed_roll15",
+            f"{side}_sp_hr_roll15_sum",
+            f"{side}_sp_hr_allowed_roll15_sum",
+        ]
+        den_candidates = [
+            f"{side}_sp_batters_faced_roll15",
+            f"{side}_sp_bf_roll15",
+            f"{side}_sp_outs_recorded_roll15",
+            f"{side}_sp_outs_roll15",
+        ]
+        num = pd.Series(np.nan, index=out.index, dtype="float64")
+        den = pd.Series(np.nan, index=out.index, dtype="float64")
+        for c in num_candidates:
+            if c in out.columns:
+                num = _numeric(c)
+                break
+        for c in den_candidates:
+            if c in out.columns:
+                den = _numeric(c)
+                break
+        if den.notna().any():
+            rate = num / den.replace(0, np.nan)
+            out[target_col] = pd.to_numeric(rate, errors="coerce").fillna(0.03)
+        else:
+            out[target_col] = pd.Series(0.03, index=out.index, dtype="float64")
+
+    _ensure_sp_hr_rate("home")
+    _ensure_sp_hr_rate("away")
+
+    if "wind_out_to_center" in out.columns:
+        out["wind_out_to_center"] = pd.to_numeric(out["wind_out_to_center"], errors="coerce").fillna(0.0)
+    else:
+        direction_col = next((c for c in ["wind_direction", "weather_wind_direction", "wind_dir"] if c in out.columns), None)
+        speed_col = next((c for c in ["wind_speed", "weather_wind_speed"] if c in out.columns), None)
+        if direction_col is not None and speed_col is not None:
+            direction = out[direction_col].astype(str).str.lower()
+            speed = pd.to_numeric(out[speed_col], errors="coerce").fillna(0.0)
+            blowing_out = direction.str.contains("out|center_out|out_to_center", na=False)
+            out["wind_out_to_center"] = np.where(blowing_out, speed, 0.0)
+        else:
+            out["wind_out_to_center"] = pd.Series(0.0, index=out.index, dtype="float64")
+
+    if "park_hr_factor" in out.columns:
+        out["park_hr_factor"] = pd.to_numeric(out["park_hr_factor"], errors="coerce").fillna(1.0)
+    else:
+        park_candidates = ["hr_factor", "park_factor", "home_run_factor"]
+        park_source = next((c for c in park_candidates if c in out.columns), None)
+        if park_source is not None:
+            out["park_hr_factor"] = pd.to_numeric(out[park_source], errors="coerce").fillna(1.0)
+        else:
+            out["park_hr_factor"] = pd.Series(1.0, index=out.index, dtype="float64")
+
+    logging.info(
+        "ensured no_hr trainer core columns present: home_sp_hr_rate_roll15 non_null=%s",
+        int(out["home_sp_hr_rate_roll15"].notna().sum()),
+    )
+    logging.info(
+        "ensured no_hr trainer core columns present: away_sp_hr_rate_roll15 non_null=%s",
+        int(out["away_sp_hr_rate_roll15"].notna().sum()),
+    )
+    logging.info(
+        "ensured no_hr trainer core columns present: wind_out_to_center non_null=%s unique_sample=%s",
+        int(out["wind_out_to_center"].notna().sum()),
+        out["wind_out_to_center"].dropna().unique()[:5].tolist(),
+    )
+    logging.info(
+        "ensured no_hr trainer core columns present: park_hr_factor non_null=%s mean=%.4f",
+        int(out["park_hr_factor"].notna().sum()),
+        float(pd.to_numeric(out["park_hr_factor"], errors="coerce").fillna(1.0).mean()) if len(out) else 1.0,
+    )
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build No-HR game feature mart")
     p.add_argument("--season", type=int, required=True)
@@ -951,20 +1114,34 @@ def main() -> None:
     all_batter_roll = read_parquet(dirs["processed_dir"] / "batter_game_rolling.parquet")
     all_pitcher_roll = read_parquet(dirs["processed_dir"] / "pitcher_game_rolling.parquet")
 
-    curr_batter = _usable_batter_rows(_filter_season(all_batter_roll, args.season))
-    prev_batter = _usable_batter_rows(_filter_season(all_batter_roll, args.season - 1))
-    curr_pitcher = _usable_pitcher_rows(_filter_season(all_pitcher_roll, args.season))
-    prev_pitcher = _usable_pitcher_rows(_filter_season(all_pitcher_roll, args.season - 1))
+    curr_batter_raw = _usable_batter_rows(_filter_season(all_batter_roll, args.season))
+    prev_batter_raw = _usable_batter_rows(_filter_season(all_batter_roll, args.season - 1))
+    curr_pitcher_raw = _usable_pitcher_rows(_filter_season(all_pitcher_roll, args.season))
+    prev_pitcher_raw = _usable_pitcher_rows(_filter_season(all_pitcher_roll, args.season - 1))
 
     batter_entity_col = _pick(all_batter_roll, ["batter_id", "batter", "player_id"])
     pitcher_entity_col = _pick(all_pitcher_roll, ["pitcher_id", "pitcher", "mlbam_pitcher_id", "player_id"])
     if batter_entity_col is None or pitcher_entity_col is None:
         raise ValueError("Could not determine batter/pitcher entity key columns for prior-to-game shift enforcement")
 
-    curr_batter = _enforce_prior_to_game_rolling(curr_batter, batter_entity_col, "batter_game_rolling_current")
-    prev_batter = _enforce_prior_to_game_rolling(prev_batter, batter_entity_col, "batter_game_rolling_prior")
-    curr_pitcher = _enforce_prior_to_game_rolling(curr_pitcher, pitcher_entity_col, "pitcher_game_rolling_current")
-    prev_pitcher = _enforce_prior_to_game_rolling(prev_pitcher, pitcher_entity_col, "pitcher_game_rolling_prior")
+    curr_batter = _prepare_cross_season_rolling_source(
+        current_df=curr_batter_raw,
+        prior_df=prev_batter_raw,
+        entity_col=batter_entity_col,
+        season=args.season,
+        prior_season=args.season - 1,
+        source_name="batter",
+    )
+    curr_pitcher = _prepare_cross_season_rolling_source(
+        current_df=curr_pitcher_raw,
+        prior_df=prev_pitcher_raw,
+        entity_col=pitcher_entity_col,
+        season=args.season,
+        prior_season=args.season - 1,
+        source_name="pitcher",
+    )
+    prev_batter = _enforce_prior_to_game_rolling(prev_batter_raw, batter_entity_col, "batter_game_rolling_prior")
+    prev_pitcher = _enforce_prior_to_game_rolling(prev_pitcher_raw, pitcher_entity_col, "pitcher_game_rolling_prior")
 
     logging.info(
         "batter rolling usable rows season=%s:%s prior=%s:%s",
@@ -1118,6 +1295,7 @@ def main() -> None:
     mart["pitcher_feature_snapshot_season"] = pitcher_snapshot_season
 
     mart = _attach_engineered_features(mart)
+    mart = _ensure_no_hr_core_feature_columns(mart)
 
     out_dir = dirs["processed_dir"] / "marts" / "no_hr"
     out_dir.mkdir(parents=True, exist_ok=True)

@@ -13,7 +13,7 @@ from src.utils.io import read_parquet, write_parquet
 BATTER_TEAM_CANDIDATES = ["bat_team", "team", "batting_team", "batter_team", "offense_team"]
 BATTER_ID_CANDIDATES = ["batter_id", "mlbam_batter_id", "batter", "player_id"]
 PITCHER_ID_CANDIDATES = ["pitcher", "pitcher_id", "mlbam_pitcher_id", "player_id"]
-HR_CANDIDATES = ["bat_hr", "hr"]
+HR_CANDIDATES = ["bat_hr", "hr", "is_hr"]
 EVENTS_TEAM_CANDIDATES = ["batting_team", "bat_team", "team", "offense_team"]
 INNING_HALF_CANDIDATES = ["inning_topbot", "topbot", "inning_half", "inning_top_bot"]
 HOME_TEAM_CANDIDATES = ["home_team"]
@@ -223,6 +223,32 @@ def build_hr_batter_features(
     )
     hr = hr.drop(columns=["pitcher"], errors="ignore")
 
+    # Elite HR Engine matchup/conditions features.
+    hr["matchup_hr_index"] = pd.to_numeric(hr.get("bat_hr_power_index_roll15_mean"), errors="coerce") * pd.to_numeric(
+        hr.get("opp_pit_hr_rate_roll15"), errors="coerce"
+    )
+    hr["matchup_power_vs_contact"] = pd.to_numeric(hr.get("bat_hard_hit_rate_roll15"), errors="coerce") * (
+        1.0 - pd.to_numeric(hr.get("opp_pit_contact_rate_roll15"), errors="coerce")
+    )
+
+    temp = pd.to_numeric(hr.get("temperature"), errors="coerce")
+    wind_speed = pd.to_numeric(hr.get("wind_speed"), errors="coerce")
+    wind_out_to_center = pd.to_numeric(hr.get("wind_out_to_center"), errors="coerce")
+    hr["hr_weather_boost"] = temp * 0.02 + wind_speed * wind_out_to_center * 0.05
+    hr["hr_park_factor_adj"] = pd.to_numeric(hr.get("park_hr_factor"), errors="coerce")
+
+    power_col = "bat_hr_power_index_roll15_mean"
+    if power_col in hr.columns:
+        team_context = (
+            hr.groupby(["game_pk", "batter_team"], dropna=False)[power_col]
+            .agg(
+                team_hr_power_mean="mean",
+                team_hr_power_max="max",
+                team_hr_power_top3_mean=lambda s: s.dropna().nlargest(3).mean() if len(s.dropna()) else pd.NA,
+            )
+            .reset_index()
+        )
+        hr = hr.merge(team_context, on=["game_pk", "batter_team"], how="left")
 
     if season is not None:
         target_paths = target_input_candidates(dirs["processed_dir"], "hr_batter", season)
