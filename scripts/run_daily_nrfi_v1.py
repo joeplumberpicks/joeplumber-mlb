@@ -4,8 +4,8 @@ import argparse
 import logging
 import math
 import os
-import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +18,16 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
+from src.live.daily_context import (
+    build_game_level_lineup_features,
+    load_live_spine,
+    load_live_weather,
+    load_projected_lineups,
+    merge_live_context,
+    resolve_live_paths,
+    run_live_preflight,
+    summarize_live_context,
+)
 from src.utils.logging import configure_logging, log_header
 from src.utils.team_ids import normalize_team_abbr, team_id_to_abbr
 
@@ -80,7 +90,11 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run daily NRFI v1.0 scoring with optional schedule-spine auto-build.")
     p.add_argument("--date", required=True, help="YYYY-MM-DD")
     p.add_argument("--season", type=int, default=None)
-    p.add_argument("--auto-build", action="store_true")
+    p.add_argument("--auto-build", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--skip-lineups", action="store_true")
+    p.add_argument("--skip-weather", action="store_true")
+    p.add_argument("--permissive-live-context", action="store_true")
+    p.add_argument("--outdir-name", default="nrfi")
     p.add_argument("--allow-mart-miss", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--config", type=Path, default=Path("configs/project.yaml"))
     p.add_argument("--no-board", action="store_true", help="Disable printing the console NRFI board.")
@@ -94,13 +108,6 @@ def _grade_from_prob(prob: float) -> str:
         if p >= threshold:
             return grade
     return "C-"
-
-
-def _run_cmd(cmd: list[str], cwd: Path) -> None:
-    logging.info("Running: %s", " ".join(cmd))
-    proc = subprocess.run(cmd, cwd=str(cwd), check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(f"Command failed (exit={proc.returncode}): {' '.join(cmd)}")
 
 
 def _has_targets(df: pd.DataFrame) -> bool:
@@ -533,37 +540,37 @@ def main() -> None:
     log_header("scripts/run_daily_nrfi_v1.py", repo_root, config_path, dirs)
 
     data_root = dirs["data_root"]
-
-    if args.auto_build:
-        _run_cmd(
-            [
-                sys.executable,
-                "scripts/ingest/ingest_schedule_games.py",
-                "--date",
-                args.date,
-                "--season",
-                str(season),
-                "--game-types",
-                "S,R",
-                "--config",
-                str(args.config),
-            ],
-            cwd=repo_root,
-        )
-        _run_cmd(
-            [
-                sys.executable,
-                "scripts/live/build_spine_from_schedule.py",
-                "--season",
-                str(season),
-                "--date",
-                args.date,
-                "--config",
-                str(args.config),
-                "--force",
-            ],
-            cwd=repo_root,
-        )
+    run_live_preflight(
+        repo_root=repo_root,
+        config_path=config_path,
+        season=season,
+        date_str=args.date,
+        auto_build=bool(args.auto_build),
+        force_spine=True,
+        build_lineups=not args.skip_lineups,
+        build_weather=not args.skip_weather,
+        permissive_live_context=bool(args.permissive_live_context),
+    )
+    live_paths = resolve_live_paths(config=config, season=season, date_str=args.date)
+    live_spine = load_live_spine(live_paths["live_spine_path"])
+    live_weather = load_live_weather(live_paths["live_weather_path"]) if not args.skip_weather else pd.DataFrame()
+    projected_lineups = (
+        load_projected_lineups(live_paths["projected_lineups_path"]) if not args.skip_lineups else pd.DataFrame()
+    )
+    batter_roll_path = dirs["processed_dir"] / "batter_game_rolling.parquet"
+    batter_roll = pd.read_parquet(batter_roll_path) if batter_roll_path.exists() else pd.DataFrame()
+    lineup_game = build_game_level_lineup_features(projected_lineups, batter_roll, date_ts)
+    live_context = merge_live_context(live_spine, live_weather, lineup_game)
+    smoke = summarize_live_context(live_context)
+    print(f"=== JOE PLUMBER DAILY RUN :: {args.date} ===")
+    print(
+        "live_feature_smoke "
+        f"games={smoke['games']} "
+        f"pct_with_starters={smoke['pct_with_starters']:.2f} "
+        f"pct_with_weather={smoke['pct_with_weather']:.2f} "
+        f"away_lineup_found={smoke['away_lineup_found']} "
+        f"home_lineup_found={smoke['home_lineup_found']}"
+    )
 
     mart_path = data_root / "marts" / "by_season" / f"nrfi_features_{season}.parquet"
     if not mart_path.exists():
@@ -581,12 +588,13 @@ def main() -> None:
     model_path = data_root / "models" / "nrfi_xgb" / "releases" / "v1.0" / "nrfi_model.json"
     features_path = data_root / "models" / "nrfi_xgb" / "releases" / "v1.0" / "features_240.txt"
 
-    daily_out_path = data_root / "outputs" / "nrfi_xgb" / "v1.0" / "daily" / f"{args.date}_predictions.csv"
-    public_out_path = data_root / "outputs" / "nrfi_xgb" / "v1.0" / "public" / f"{args.date}_A_tier_picks.csv"
+    out_dir = data_root / "outputs" / "daily" / args.outdir_name
+    daily_out_path = out_dir / f"nrfi_board_{season}_{args.date}.csv"
+    daily_parquet_out_path = out_dir / f"nrfi_board_{season}_{args.date}.parquet"
+    public_out_path = out_dir / f"nrfi_board_public_{season}_{args.date}.csv"
     ledger_path = data_root / "public_ledgers" / "nrfi_xgb" / "v1.0" / "ledger.csv"
 
     daily_out_path.parent.mkdir(parents=True, exist_ok=True)
-    public_out_path.parent.mkdir(parents=True, exist_ok=True)
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
 
     mart = pd.read_parquet(mart_path)
@@ -602,6 +610,11 @@ def main() -> None:
         logging.warning("No rows in mart for date; building live features from rolling carryover.")
         daily = _build_live_features(data_root=data_root, season=season, date_str=args.date)
         used_live_fallback = True
+    daily = daily.merge(
+        live_context.drop(columns=["game_date", "season", "away_team", "home_team"], errors="ignore"),
+        on="game_pk",
+        how="left",
+    )
 
     features = _load_features(features_path)
     X = daily.reindex(columns=features).copy()
@@ -628,27 +641,68 @@ def main() -> None:
         daily = daily.assign(actual="", win="")
 
     daily["game_date"] = pd.to_datetime(daily.get("game_date"), errors="coerce").dt.strftime("%Y-%m-%d")
+    daily["season"] = season
+    daily["has_weather"] = pd.Series(daily.get("has_weather", False)).fillna(False).astype(bool)
+    daily["has_projected_lineups"] = pd.Series(daily.get("has_projected_lineups", False)).fillna(False).astype(bool)
+    daily["feature_source_summary"] = "live_spine|carry_rollups"
+    if not args.skip_lineups:
+        daily["feature_source_summary"] = daily["feature_source_summary"] + "|projected_lineups"
+    if not args.skip_weather:
+        daily["feature_source_summary"] = daily["feature_source_summary"] + "|live_weather"
+    if not used_live_fallback:
+        daily["feature_source_summary"] = daily["feature_source_summary"] + "|fallback_mart"
+    daily["model_version"] = MODEL_VERSION
+    daily["run_date"] = args.date
+    daily["created_at_utc"] = datetime.now(timezone.utc).isoformat()
 
     required = [
         "game_date",
+        "season",
         "game_pk",
         "away_team",
         "home_team",
+        "away_sp_id",
+        "home_sp_id",
+        "away_sp_name",
+        "home_sp_name",
         "p_nrfi",
         "p_yrfi",
         "pick",
         "pick_prob",
         "grade",
+        "has_weather",
+        "has_projected_lineups",
+        "away_lineup_completeness_score",
+        "home_lineup_completeness_score",
+        "away_lineup_quality_score",
+        "home_lineup_quality_score",
+        "feature_source_summary",
+        "model_version",
+        "run_date",
+        "created_at_utc",
         "actual",
         "win",
     ]
     for c in required:
         if c not in daily.columns:
-            daily[c] = ""
+            daily[c] = pd.NA
     daily_out = daily[required].copy()
     daily_out.to_csv(daily_out_path, index=False)
+    daily_out.to_parquet(daily_parquet_out_path, index=False)
 
-    public_cols = ["game_date", "away_team", "home_team", "pick", "grade", "pick_prob", "p_nrfi", "p_yrfi", "game_pk"]
+    public_cols = [
+        "game_date",
+        "away_team",
+        "home_team",
+        "pick",
+        "grade",
+        "pick_prob",
+        "p_nrfi",
+        "p_yrfi",
+        "game_pk",
+        "has_weather",
+        "has_projected_lineups",
+    ]
     a_tier = daily[daily["grade"].isin(A_TIER)].copy()
     for c in public_cols:
         if c not in a_tier.columns:
@@ -687,6 +741,7 @@ def main() -> None:
         ledger_path,
     )
     print(f"daily_out={daily_out_path}")
+    print(f"daily_out_parquet={daily_parquet_out_path}")
     print(f"public_out={public_out_path}")
     print(f"ledger_out={ledger_path}")
 
