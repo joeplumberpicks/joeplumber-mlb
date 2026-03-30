@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -16,6 +17,16 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
+from src.live.daily_context import (
+    build_game_level_lineup_features,
+    load_live_spine,
+    load_live_weather,
+    load_projected_lineups,
+    merge_live_context,
+    resolve_live_paths,
+    run_live_preflight,
+    summarize_live_context,
+)
 from src.utils.logging import configure_logging, log_header
 from src.utils.team_ids import normalize_team_abbr
 
@@ -37,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--season", type=int, required=True)
     p.add_argument("--date", required=True, help="YYYY-MM-DD")
     p.add_argument("--fallback-season", type=int, default=2025)
+    p.add_argument("--auto-build", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--skip-lineups", action="store_true")
+    p.add_argument("--skip-weather", action="store_true")
+    p.add_argument("--permissive-live-context", action="store_true")
+    p.add_argument("--outdir-name", default="moneyline")
     return p.parse_args()
 
 
@@ -191,7 +207,19 @@ def main() -> None:
     configure_logging(dirs["logs_dir"] / "run_daily_moneyline_v1.log")
     log_header("scripts/live/run_daily_moneyline_v1.py", repo_root, config_path, dirs)
 
-    spine_path = dirs["processed_dir"] / "live" / f"model_spine_game_{args.season}_{args.date}.parquet"
+    run_live_preflight(
+        repo_root=repo_root,
+        config_path=config_path,
+        season=args.season,
+        date_str=args.date,
+        auto_build=bool(args.auto_build),
+        force_spine=True,
+        build_lineups=not args.skip_lineups,
+        build_weather=not args.skip_weather,
+        permissive_live_context=bool(args.permissive_live_context),
+    )
+    live_paths = resolve_live_paths(config=config, season=args.season, date_str=args.date)
+    spine_path = live_paths["live_spine_path"]
     fallback_mart_path = dirs["marts_dir"] / "by_season" / f"moneyline_features_{args.fallback_season}.parquet"
     batter_roll_path = dirs["processed_dir"] / "batter_game_rolling.parquet"
     pitcher_roll_path = dirs["processed_dir"] / "pitcher_game_rolling.parquet"
@@ -202,8 +230,26 @@ def main() -> None:
     if not fallback_mart_path.exists():
         raise FileNotFoundError(f"Fallback moneyline mart not found: {fallback_mart_path}")
 
-    live_df = pd.read_parquet(spine_path).copy()
-    required = ["game_pk", "game_date", "home_team", "away_team", "home_sp_id", "away_sp_id", "venue_id"]
+    live_df = load_live_spine(spine_path).copy()
+    live_weather = load_live_weather(live_paths["live_weather_path"]) if not args.skip_weather else pd.DataFrame()
+    projected_lineups = (
+        load_projected_lineups(live_paths["projected_lineups_path"]) if not args.skip_lineups else pd.DataFrame()
+    )
+    batter_roll_for_lineups = pd.read_parquet(batter_roll_path).copy() if batter_roll_path.exists() else pd.DataFrame()
+    lineup_game = build_game_level_lineup_features(projected_lineups, batter_roll_for_lineups, date_ts)
+    live_context = merge_live_context(live_df, live_weather, lineup_game)
+    smoke = summarize_live_context(live_context)
+    print(
+        "live_feature_smoke "
+        f"games={smoke['games']} "
+        f"pct_with_starters={smoke['pct_with_starters']:.2f} "
+        f"pct_with_weather={smoke['pct_with_weather']:.2f} "
+        f"away_lineup_found={smoke['away_lineup_found']} "
+        f"home_lineup_found={smoke['home_lineup_found']}"
+    )
+
+    live_df = live_context.copy()
+    required = ["game_pk", "game_date", "home_team", "away_team", "home_sp_id", "away_sp_id"]
     missing = [c for c in required if c not in live_df.columns]
     if missing:
         raise ValueError(f"Live spine missing required columns: {missing}")
@@ -301,6 +347,8 @@ def main() -> None:
                 X[col] = pd.to_numeric(away_v, errors="coerce") - pd.to_numeric(home_v, errors="coerce")
                 if X[col].notna().any():
                     diff_off_populated += 1
+        elif col in merged.columns:
+            X[col] = pd.to_numeric(merged[col], errors="coerce")
 
     # fallback mart: fill remaining feature gaps without overwriting rolling-derived values
     home_num_cols = set(home_latest.columns) if not home_latest.empty else set()
@@ -404,7 +452,11 @@ def main() -> None:
         float(np.max(p_home_win)) if len(p_home_win) else float("nan"),
     )
 
-    out = merged[["game_date", "game_pk", "away_team", "home_team"]].copy()
+    base_cols = ["game_date", "season", "game_pk", "away_team", "home_team", "away_sp_id", "home_sp_id", "away_sp_name", "home_sp_name"]
+    for c in base_cols:
+        if c not in merged.columns:
+            merged[c] = pd.NA
+    out = merged[base_cols].copy()
     out = out.assign(
         p_home_win_raw=p_home_win_raw,
         p_home_win=p_home_win,
@@ -417,17 +469,36 @@ def main() -> None:
     out["grade"] = out["pick_prob"].map(grade_from_conf)
     out["home_fair_odds"] = out["p_home_win"].map(american_odds_from_prob)
     out["away_fair_odds"] = out["p_away_win"].map(american_odds_from_prob)
+    out["has_weather"] = pd.Series(merged.get("has_weather", False)).fillna(False).astype(bool)
+    out["has_projected_lineups"] = pd.Series(merged.get("has_projected_lineups", False)).fillna(False).astype(bool)
+    for c in [
+        "away_lineup_completeness_score",
+        "home_lineup_completeness_score",
+        "away_lineup_quality_score",
+        "home_lineup_quality_score",
+    ]:
+        out[c] = pd.to_numeric(merged.get(c), errors="coerce")
+    out["feature_source_summary"] = "live_spine|carry_rollups|fallback_mart"
+    if not args.skip_lineups:
+        out["feature_source_summary"] += "|projected_lineups"
+    if not args.skip_weather:
+        out["feature_source_summary"] += "|live_weather"
+    out["model_version"] = model_path.stem
+    out["run_date"] = args.date
+    out["created_at_utc"] = datetime.now(timezone.utc).isoformat()
     out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce").dt.strftime("%Y-%m-%d")
 
-    daily_dir = dirs["outputs_dir"] / "moneyline_sim" / "v1.0" / "daily"
-    public_dir = dirs["outputs_dir"] / "moneyline_sim" / "v1.0" / "public"
+    daily_dir = dirs["outputs_dir"] / "daily" / args.outdir_name
+    public_dir = daily_dir
     daily_dir.mkdir(parents=True, exist_ok=True)
     public_dir.mkdir(parents=True, exist_ok=True)
 
-    daily_path = daily_dir / f"{args.date}_moneyline_predictions.csv"
-    public_path = public_dir / f"{args.date}_moneyline_A_tier_picks.csv"
+    daily_path = daily_dir / f"moneyline_board_{args.season}_{args.date}.csv"
+    daily_parquet_path = daily_dir / f"moneyline_board_{args.season}_{args.date}.parquet"
+    public_path = public_dir / f"moneyline_board_public_{args.season}_{args.date}.csv"
 
     out.to_csv(daily_path, index=False)
+    out.to_parquet(daily_parquet_path, index=False)
     out[out["grade"].isin(A_TIER)].sort_values("pick_prob", ascending=False, kind="mergesort").to_csv(public_path, index=False)
 
     _print_board(out, args.date)
@@ -442,6 +513,7 @@ def main() -> None:
         public_path,
     )
     print(f"daily_out={daily_path}")
+    print(f"daily_out_parquet={daily_parquet_path}")
     print(f"public_out={public_path}")
 
 
