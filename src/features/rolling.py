@@ -58,6 +58,77 @@ def _rolling_from_source(source_df: pd.DataFrame, entity: str, windows: list[int
         return df
 
     logging.info("Applying %s rolling windows: %s with shift=%s", entity, windows, shift_n)
+
+    # Elite HR Engine feature blocks (safe/no-leakage with shift).
+    if entity == "batter":
+        launch_speed = pd.to_numeric(df.get("launch_speed"), errors="coerce") if "launch_speed" in df.columns else pd.Series(pd.NA, index=df.index, dtype="Float64")
+        launch_angle = pd.to_numeric(df.get("launch_angle"), errors="coerce") if "launch_angle" in df.columns else pd.Series(pd.NA, index=df.index, dtype="Float64")
+
+        df["barrel_proxy"] = ((launch_speed >= 95) & launch_angle.between(20, 35)).astype("Int64")
+        df["hard_hit"] = (launch_speed >= 95).astype("Int64")
+        df["sweet_spot"] = launch_angle.between(10, 35).astype("Int64")
+
+        df["hr_power_index"] = launch_speed * 0.4 + launch_angle * 0.3 + pd.to_numeric(df["barrel_proxy"], errors="coerce") * 0.3
+
+        for w in [3, 7, 15, 30]:
+            df[f"barrel_rate_roll{w}"] = (
+                df.groupby(canonical_id)["barrel_proxy"].transform(lambda s: s.shift(shift_n).rolling(w, min_periods=1).mean())
+            )
+            df[f"hard_hit_rate_roll{w}"] = (
+                df.groupby(canonical_id)["hard_hit"].transform(lambda s: s.shift(shift_n).rolling(w, min_periods=1).mean())
+            )
+            df[f"sweet_spot_rate_roll{w}"] = (
+                df.groupby(canonical_id)["sweet_spot"].transform(lambda s: s.shift(shift_n).rolling(w, min_periods=1).mean())
+            )
+
+        for w in [7, 15, 30]:
+            df[f"hr_power_index_roll{w}_mean"] = (
+                df.groupby(canonical_id)["hr_power_index"].transform(lambda s: s.shift(shift_n).rolling(w, min_periods=1).mean())
+            )
+            df[f"hr_power_index_roll{w}_max"] = (
+                df.groupby(canonical_id)["hr_power_index"].transform(lambda s: s.shift(shift_n).rolling(w, min_periods=1).max())
+            )
+
+    if entity == "pitcher":
+        launch_speed = pd.to_numeric(df.get("launch_speed"), errors="coerce") if "launch_speed" in df.columns else pd.Series(pd.NA, index=df.index, dtype="Float64")
+        launch_angle = pd.to_numeric(df.get("launch_angle"), errors="coerce") if "launch_angle" in df.columns else pd.Series(pd.NA, index=df.index, dtype="Float64")
+
+        df["barrel_proxy"] = ((launch_speed >= 95) & launch_angle.between(20, 35)).astype("Int64")
+        df["hard_hit"] = (launch_speed >= 95).astype("Int64")
+
+        if "is_hr_allowed" in df.columns:
+            df["pitcher_hr_allowed"] = pd.to_numeric(df["is_hr_allowed"], errors="coerce")
+        elif "hr_allowed" in df.columns:
+            df["pitcher_hr_allowed"] = pd.to_numeric(df["hr_allowed"], errors="coerce")
+        elif "hr" in df.columns:
+            df["pitcher_hr_allowed"] = pd.to_numeric(df["hr"], errors="coerce")
+        else:
+            df["pitcher_hr_allowed"] = pd.NA
+
+        if "contact_rate" in df.columns:
+            contact_base = pd.to_numeric(df["contact_rate"], errors="coerce")
+        elif "is_in_play" in df.columns:
+            contact_base = pd.to_numeric(df["is_in_play"], errors="coerce")
+        elif "k" in df.columns:
+            contact_base = 1.0 - pd.to_numeric(df["k"], errors="coerce")
+        else:
+            contact_base = pd.Series(pd.NA, index=df.index, dtype="Float64")
+        df["pit_contact_proxy"] = contact_base
+
+        for w in [7, 15, 30]:
+            df[f"pit_hr_rate_roll{w}"] = (
+                df.groupby(canonical_id)["pitcher_hr_allowed"].transform(lambda s: s.shift(shift_n).rolling(w, min_periods=1).mean())
+            )
+            df[f"pit_barrel_rate_roll{w}"] = (
+                df.groupby(canonical_id)["barrel_proxy"].transform(lambda s: s.shift(shift_n).rolling(w, min_periods=1).mean())
+            )
+            df[f"pit_hard_hit_rate_roll{w}"] = (
+                df.groupby(canonical_id)["hard_hit"].transform(lambda s: s.shift(shift_n).rolling(w, min_periods=1).mean())
+            )
+            df[f"pit_contact_rate_roll{w}"] = (
+                df.groupby(canonical_id)["pit_contact_proxy"].transform(lambda s: s.shift(shift_n).rolling(w, min_periods=1).mean())
+            )
+
     numeric_cols = [c for c in df.select_dtypes(include=["number"]).columns if c not in {canonical_id, "season"}]
     for col in numeric_cols:
         for win in windows:
