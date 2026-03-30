@@ -981,6 +981,105 @@ def _attach_engineered_features(mart: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _ensure_no_hr_core_feature_columns(mart: pd.DataFrame) -> pd.DataFrame:
+    out = mart.copy()
+
+    def _numeric(col: str) -> pd.Series:
+        if col in out.columns:
+            return pd.to_numeric(out[col], errors="coerce")
+        return pd.Series(np.nan, index=out.index, dtype="float64")
+
+    def _ensure_sp_hr_rate(side: str) -> None:
+        target_col = f"{side}_sp_hr_rate_roll15"
+        if target_col in out.columns:
+            out[target_col] = pd.to_numeric(out[target_col], errors="coerce").fillna(0.03)
+            return
+
+        direct_candidates = [
+            f"{side}_sp_hr_roll15",
+            f"{side}_sp_hr_allowed_roll15",
+            f"{side}_sp_hr_per_bf_roll15",
+        ]
+        for c in direct_candidates:
+            if c in out.columns:
+                out[target_col] = pd.to_numeric(out[c], errors="coerce").fillna(0.03)
+                return
+
+        num_candidates = [
+            f"{side}_sp_hr_roll15",
+            f"{side}_sp_hr_allowed_roll15",
+            f"{side}_sp_hr_roll15_sum",
+            f"{side}_sp_hr_allowed_roll15_sum",
+        ]
+        den_candidates = [
+            f"{side}_sp_batters_faced_roll15",
+            f"{side}_sp_bf_roll15",
+            f"{side}_sp_outs_recorded_roll15",
+            f"{side}_sp_outs_roll15",
+        ]
+        num = pd.Series(np.nan, index=out.index, dtype="float64")
+        den = pd.Series(np.nan, index=out.index, dtype="float64")
+        for c in num_candidates:
+            if c in out.columns:
+                num = _numeric(c)
+                break
+        for c in den_candidates:
+            if c in out.columns:
+                den = _numeric(c)
+                break
+        if den.notna().any():
+            rate = num / den.replace(0, np.nan)
+            out[target_col] = pd.to_numeric(rate, errors="coerce").fillna(0.03)
+        else:
+            out[target_col] = pd.Series(0.03, index=out.index, dtype="float64")
+
+    _ensure_sp_hr_rate("home")
+    _ensure_sp_hr_rate("away")
+
+    if "wind_out_to_center" in out.columns:
+        out["wind_out_to_center"] = pd.to_numeric(out["wind_out_to_center"], errors="coerce").fillna(0.0)
+    else:
+        direction_col = next((c for c in ["wind_direction", "weather_wind_direction", "wind_dir"] if c in out.columns), None)
+        speed_col = next((c for c in ["wind_speed", "weather_wind_speed"] if c in out.columns), None)
+        if direction_col is not None and speed_col is not None:
+            direction = out[direction_col].astype(str).str.lower()
+            speed = pd.to_numeric(out[speed_col], errors="coerce").fillna(0.0)
+            blowing_out = direction.str.contains("out|center_out|out_to_center", na=False)
+            out["wind_out_to_center"] = np.where(blowing_out, speed, 0.0)
+        else:
+            out["wind_out_to_center"] = pd.Series(0.0, index=out.index, dtype="float64")
+
+    if "park_hr_factor" in out.columns:
+        out["park_hr_factor"] = pd.to_numeric(out["park_hr_factor"], errors="coerce").fillna(1.0)
+    else:
+        park_candidates = ["hr_factor", "park_factor", "home_run_factor"]
+        park_source = next((c for c in park_candidates if c in out.columns), None)
+        if park_source is not None:
+            out["park_hr_factor"] = pd.to_numeric(out[park_source], errors="coerce").fillna(1.0)
+        else:
+            out["park_hr_factor"] = pd.Series(1.0, index=out.index, dtype="float64")
+
+    logging.info(
+        "ensured no_hr trainer core columns present: home_sp_hr_rate_roll15 non_null=%s",
+        int(out["home_sp_hr_rate_roll15"].notna().sum()),
+    )
+    logging.info(
+        "ensured no_hr trainer core columns present: away_sp_hr_rate_roll15 non_null=%s",
+        int(out["away_sp_hr_rate_roll15"].notna().sum()),
+    )
+    logging.info(
+        "ensured no_hr trainer core columns present: wind_out_to_center non_null=%s unique_sample=%s",
+        int(out["wind_out_to_center"].notna().sum()),
+        out["wind_out_to_center"].dropna().unique()[:5].tolist(),
+    )
+    logging.info(
+        "ensured no_hr trainer core columns present: park_hr_factor non_null=%s mean=%.4f",
+        int(out["park_hr_factor"].notna().sum()),
+        float(pd.to_numeric(out["park_hr_factor"], errors="coerce").fillna(1.0).mean()) if len(out) else 1.0,
+    )
+    return out
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build No-HR game feature mart")
     p.add_argument("--season", type=int, required=True)
@@ -1196,6 +1295,7 @@ def main() -> None:
     mart["pitcher_feature_snapshot_season"] = pitcher_snapshot_season
 
     mart = _attach_engineered_features(mart)
+    mart = _ensure_no_hr_core_feature_columns(mart)
 
     out_dir = dirs["processed_dir"] / "marts" / "no_hr"
     out_dir.mkdir(parents=True, exist_ok=True)
