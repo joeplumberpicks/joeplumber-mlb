@@ -185,6 +185,12 @@ def _is_bad_name(name: str) -> bool:
         return True
     if "era" in low:
         return True
+    if low.startswith("home run odds") or low.startswith("umpire:"):
+        return True
+    if low in {"line", "o/u", "none"}:
+        return True
+    if "lineup has not been posted yet" in low:
+        return True
     if re.fullmatch(r"[a-z]{1,4}", low):
         return True
     return False
@@ -217,7 +223,8 @@ def _resolve_player_ids(out: pd.DataFrame, batter_path: Path, slate_date: pd.Tim
         .drop_duplicates(subset=["batter_team", "name_norm"], keep="last")[["batter_team", "name_norm", "batter_id"]]
     )
 
-    out["name_norm"] = _norm_name(out["player_name"])
+    out["player_name_clean"] = out["player_name"].astype(str).map(_clean_player_name)
+    out["name_norm"] = _norm_name(out["player_name_clean"])
     fill = out["batter_id"].isna()
     if fill.any():
         resolved = (
@@ -226,7 +233,7 @@ def _resolve_player_ids(out: pd.DataFrame, batter_path: Path, slate_date: pd.Tim
         )
         out.loc[fill, "batter_id"] = pd.to_numeric(resolved, errors="coerce").astype("Int64").values
 
-    return out.drop(columns=["name_norm"], errors="ignore")
+    return out.drop(columns=["name_norm", "player_name_clean"], errors="ignore")
 
 
 def _team_aliases(spine: pd.DataFrame) -> dict[str, str]:
@@ -349,6 +356,8 @@ def _parse_team_card(card: BeautifulSoup, team: str) -> list[dict[str, object]]:
                 if nxt in STOP_TOKENS or nxt in POS_SET:
                     break
                 if nxt in LINEUP_START_TOKENS:
+                    break
+                if nxt.startswith("Umpire:") or "lineup has not been posted yet" in nxt.lower():
                     break
                 if re.fullmatch(r"\d+", nxt):
                     j += 1
