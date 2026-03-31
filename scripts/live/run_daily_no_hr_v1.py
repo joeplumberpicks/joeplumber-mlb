@@ -16,7 +16,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.live.daily_context import run_live_preflight
+from src.live.daily_context import (
+    build_game_level_lineup_features,
+    load_live_lineups,
+    load_live_spine,
+    load_live_weather,
+    merge_live_context,
+    resolve_live_paths,
+    run_live_preflight,
+    summarize_live_context,
+)
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
 from src.utils.io import read_parquet, write_parquet
@@ -170,6 +179,24 @@ def main() -> None:
         permissive_live_context=args.permissive_live_context,
     )
     logging.info("live preflight status=%s", preflight)
+    live_paths = resolve_live_paths(config=config, season=season, date_str=args.date)
+    live_spine = load_live_spine(live_paths["live_spine_path"])
+    live_weather = load_live_weather(config=config, season=season, date_str=args.date) if not args.skip_weather else pd.DataFrame()
+    live_lineups = load_live_lineups(config=config, season=season, date_str=args.date) if not args.skip_lineups else pd.DataFrame()
+    batter_roll_path = dirs["processed_dir"] / "batter_game_rolling.parquet"
+    batter_roll = pd.read_parquet(batter_roll_path).copy() if batter_roll_path.exists() else pd.DataFrame()
+    lineup_game = build_game_level_lineup_features(live_lineups, batter_roll, pd.to_datetime(args.date, errors="coerce"))
+    live_context = merge_live_context(live_spine, live_weather, lineup_game)
+    smoke = summarize_live_context(live_context)
+    logging.info(
+        "live_feature_smoke games=%s pct_with_starters=%.2f pct_with_weather=%.2f pct_with_lineups=%.2f away_lineup_found=%s home_lineup_found=%s",
+        smoke["games"],
+        smoke["pct_with_starters"],
+        smoke["pct_with_weather"],
+        smoke["pct_with_lineups"],
+        smoke["away_lineup_found"],
+        smoke["home_lineup_found"],
+    )
 
     # Build the no-hr mart for the requested season
     mart_cmd = [
@@ -200,6 +227,7 @@ def main() -> None:
     mart = _safe_game_filter(mart, args.date)
     if mart.empty:
         raise ValueError(f"No rows found in no-HR mart for season={season} date={args.date}")
+    mart = merge_live_context(mart, live_weather, lineup_game)
 
     # Prepare scoring matrix in exact training-feature order
     X = pd.DataFrame(index=mart.index)

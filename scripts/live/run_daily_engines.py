@@ -103,9 +103,27 @@ def main() -> None:
             _run(cmd, repo_root)
             produced.append(f"moneyline_board_{args.season}_{args.date}")
         elif engine == "no_hr":
-            raise RuntimeError(
-                "No HR daily runner entrypoint is not available yet. Provide a runnable no_hr daily script to enable this engine."
-            )
+            cmd = [
+                sys.executable,
+                "scripts/live/run_daily_no_hr_v1.py",
+                "--date",
+                args.date,
+                "--season",
+                str(args.season),
+                "--config",
+                str(args.config),
+                "--board-top",
+                str(args.board_top),
+                "--no-auto-build",
+            ]
+            if args.skip_lineups:
+                cmd.append("--skip-lineups")
+            if args.skip_weather:
+                cmd.append("--skip-weather")
+            if args.permissive_live_context:
+                cmd.append("--permissive-live-context")
+            _run(cmd, repo_root)
+            produced.append(f"no_hr_board_{args.season}_{args.date}")
         else:
             raise ValueError(f"Unknown engine: {engine}")
 

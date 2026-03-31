@@ -20,9 +20,9 @@ from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
 from src.live.daily_context import (
     build_game_level_lineup_features,
+    load_live_lineups,
     load_live_spine,
     load_live_weather,
-    load_projected_lineups,
     merge_live_context,
     resolve_live_paths,
     run_live_preflight,
@@ -553,9 +553,11 @@ def main() -> None:
     )
     live_paths = resolve_live_paths(config=config, season=season, date_str=args.date)
     live_spine = load_live_spine(live_paths["live_spine_path"])
-    live_weather = load_live_weather(live_paths["live_weather_path"]) if not args.skip_weather else pd.DataFrame()
+    live_weather = (
+        load_live_weather(config=config, season=season, date_str=args.date) if not args.skip_weather else pd.DataFrame()
+    )
     projected_lineups = (
-        load_projected_lineups(live_paths["projected_lineups_path"]) if not args.skip_lineups else pd.DataFrame()
+        load_live_lineups(config=config, season=season, date_str=args.date) if not args.skip_lineups else pd.DataFrame()
     )
     batter_roll_path = dirs["processed_dir"] / "batter_game_rolling.parquet"
     batter_roll = pd.read_parquet(batter_roll_path) if batter_roll_path.exists() else pd.DataFrame()
@@ -568,6 +570,7 @@ def main() -> None:
         f"games={smoke['games']} "
         f"pct_with_starters={smoke['pct_with_starters']:.2f} "
         f"pct_with_weather={smoke['pct_with_weather']:.2f} "
+        f"pct_with_lineups={smoke['pct_with_lineups']:.2f} "
         f"away_lineup_found={smoke['away_lineup_found']} "
         f"home_lineup_found={smoke['home_lineup_found']}"
     )
