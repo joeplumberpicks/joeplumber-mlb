@@ -20,11 +20,16 @@ def _pick(cols: list[str], candidates: list[str]) -> str | None:
     return None
 
 
-def _run_cmd(cmd: list[str], repo_root: Path) -> None:
+def _run_cmd(cmd: list[str], repo_root: Path, *, raise_on_error: bool = True) -> bool:
     logging.info("live preflight running: %s", " ".join(cmd))
     proc = subprocess.run(cmd, cwd=str(repo_root), check=False)
     if proc.returncode != 0:
-        raise RuntimeError(f"Command failed (exit={proc.returncode}): {' '.join(cmd)}")
+        msg = f"Command failed (exit={proc.returncode}): {' '.join(cmd)}"
+        if raise_on_error:
+            raise RuntimeError(msg)
+        logging.warning(msg)
+        return False
+    return True
 
 
 def resolve_live_paths(*, config: dict, season: int, date_str: str) -> dict[str, Path]:
@@ -32,7 +37,11 @@ def resolve_live_paths(*, config: dict, season: int, date_str: str) -> dict[str,
     return {
         "live_spine_path": dirs["processed_dir"] / "live" / f"model_spine_game_{season}_{date_str}.parquet",
         "projected_lineups_path": dirs["processed_dir"] / "live" / f"projected_lineups_{season}_{date_str}.parquet",
+        "confirmed_lineups_path": dirs["processed_dir"] / "live" / f"confirmed_lineups_{season}_{date_str}.parquet",
+        "live_lineups_path": dirs["processed_dir"] / "live" / f"lineups_{season}_{date_str}.parquet",
         "live_weather_path": dirs["processed_dir"] / "live" / f"weather_game_{season}_{date_str}.parquet",
+        "raw_live_weather_path": dirs["raw_dir"] / "live" / f"weather_game_{season}_{date_str}.parquet",
+        "processed_weather_fallback_path": dirs["processed_dir"] / "weather_game.parquet",
         "live_schedule_path": dirs["raw_dir"] / "live" / f"games_schedule_{season}_{date_str}.parquet",
         "live_schedule_cumulative_path": dirs["raw_dir"] / "live" / f"games_schedule_{season}.parquet",
     }
@@ -87,44 +96,36 @@ def run_live_preflight(
         _run_cmd(spine_cmd, repo_root)
 
         if build_lineups:
-            try:
-                _run_cmd(
-                    [
-                        sys.executable,
-                        "scripts/live/build_projected_lineups.py",
-                        "--season",
-                        str(season),
-                        "--date",
-                        date_str,
-                        "--config",
-                        str(config_path),
-                    ],
-                    repo_root,
-                )
-            except Exception:
-                if not permissive_live_context:
-                    raise
-                logging.exception("Projected lineups build failed but permissive mode is enabled.")
+            _run_cmd(
+                [
+                    sys.executable,
+                    "scripts/live/build_live_lineups.py",
+                    "--season",
+                    str(season),
+                    "--date",
+                    date_str,
+                    "--config",
+                    str(config_path),
+                ],
+                repo_root,
+                raise_on_error=not permissive_live_context,
+            )
 
         if build_weather:
-            try:
-                _run_cmd(
-                    [
-                        sys.executable,
-                        "scripts/live/build_live_weather.py",
-                        "--season",
-                        str(season),
-                        "--date",
-                        date_str,
-                        "--config",
-                        str(config_path),
-                    ],
-                    repo_root,
-                )
-            except Exception:
-                if not permissive_live_context:
-                    raise
-                logging.exception("Live weather build failed but permissive mode is enabled.")
+            _run_cmd(
+                [
+                    sys.executable,
+                    "scripts/live/build_live_weather.py",
+                    "--season",
+                    str(season),
+                    "--date",
+                    date_str,
+                    "--config",
+                    str(config_path),
+                ],
+                repo_root,
+                raise_on_error=not permissive_live_context,
+            )
 
     out = dict(paths)
     for key, p in paths.items():
@@ -159,9 +160,31 @@ def load_live_spine(live_spine_path: Path) -> pd.DataFrame:
     return out
 
 
-def load_live_weather(live_weather_path: Path) -> pd.DataFrame:
-    if not live_weather_path.exists():
+def load_live_weather(
+    live_weather_path: Path | None = None,
+    *,
+    config: dict | None = None,
+    season: int | None = None,
+    date_str: str | None = None,
+) -> pd.DataFrame:
+    candidates: list[Path] = []
+    if config is not None and season is not None and date_str is not None:
+        paths = resolve_live_paths(config=config, season=season, date_str=date_str)
+        candidates.extend(
+            [
+                paths["live_weather_path"],
+                paths["raw_live_weather_path"],
+                paths["processed_weather_fallback_path"],
+            ]
+        )
+    elif live_weather_path is not None:
+        candidates.append(live_weather_path)
+
+    live_weather_path = next((p for p in candidates if p.exists()), None)
+    if live_weather_path is None:
+        logging.info("live weather source=none")
         return pd.DataFrame(columns=["game_pk", "weather_data_available"])
+    logging.info("live weather source=%s", live_weather_path)
 
     wx = pd.read_parquet(live_weather_path).copy()
     if wx.empty:
@@ -192,6 +215,56 @@ def load_live_weather(live_weather_path: Path) -> pd.DataFrame:
 
     wx["weather_data_available"] = True
     return wx
+
+
+def load_live_lineups(
+    *,
+    config: dict,
+    season: int,
+    date_str: str,
+) -> pd.DataFrame:
+    paths = resolve_live_paths(config=config, season=season, date_str=date_str)
+    loaded: list[tuple[str, pd.DataFrame]] = []
+    for key in ["confirmed_lineups_path", "projected_lineups_path", "live_lineups_path"]:
+        p = paths[key]
+        if not p.exists():
+            continue
+        logging.info("live lineup source candidate=%s", p)
+        lu = pd.read_parquet(p).copy()
+        if lu.empty:
+            continue
+        team_col = _pick(list(lu.columns), ["batter_team", "team", "team_abbrev", "batting_team"])
+        if team_col:
+            lu["batter_team"] = lu[team_col].map(normalize_team_abbr)
+        if "game_pk" in lu.columns:
+            lu["game_pk"] = pd.to_numeric(lu["game_pk"], errors="coerce").astype("Int64")
+        if "lineup_slot" in lu.columns:
+            lu["lineup_slot"] = pd.to_numeric(lu["lineup_slot"], errors="coerce")
+        lu["_lineup_source_key"] = key
+        loaded.append((key, lu))
+    if loaded:
+        by_key = {k: df for k, df in loaded}
+        out = by_key.get("confirmed_lineups_path", pd.DataFrame())
+        if "projected_lineups_path" in by_key:
+            proj = by_key["projected_lineups_path"]
+            if out.empty:
+                out = proj.copy()
+            elif "game_pk" in out.columns and "game_pk" in proj.columns:
+                confirmed_games = set(pd.to_numeric(out["game_pk"], errors="coerce").dropna().astype(int).tolist())
+                proj_use = proj[~pd.to_numeric(proj["game_pk"], errors="coerce").astype("Int64").isin(list(confirmed_games))]
+                out = pd.concat([out, proj_use], ignore_index=True, sort=False)
+        if "live_lineups_path" in by_key:
+            legacy = by_key["live_lineups_path"]
+            if out.empty:
+                out = legacy.copy()
+            elif "game_pk" in out.columns and "game_pk" in legacy.columns:
+                covered_games = set(pd.to_numeric(out["game_pk"], errors="coerce").dropna().astype(int).tolist())
+                legacy_use = legacy[~pd.to_numeric(legacy["game_pk"], errors="coerce").astype("Int64").isin(list(covered_games))]
+                out = pd.concat([out, legacy_use], ignore_index=True, sort=False)
+        logging.info("live lineup source=resolved rows=%s", len(out))
+        return out
+    logging.info("live lineup source=none")
+    return pd.DataFrame()
 
 
 def load_projected_lineups(projected_lineups_path: Path) -> pd.DataFrame:
@@ -437,7 +510,7 @@ def merge_live_context(spine: pd.DataFrame, weather: pd.DataFrame, lineup_featur
 
     if not lineup_features.empty:
         out = out.merge(lineup_features, on="game_pk", how="left")
-        out["lineup_source"] = "projected_lineups"
+        out["lineup_source"] = "live_lineups"
     else:
         out["lineup_source"] = pd.NA
 
@@ -478,6 +551,7 @@ def summarize_live_context(ctx: pd.DataFrame) -> dict[str, float | int]:
         "games": n,
         "pct_with_starters": float(starters.mean() * 100.0),
         "pct_with_weather": float(has_weather.mean() * 100.0),
+        "pct_with_lineups": float(has_lineups.mean() * 100.0),
         "pct_with_projected_lineups": float(has_lineups.mean() * 100.0),
         "away_lineup_found": away_found,
         "home_lineup_found": home_found,

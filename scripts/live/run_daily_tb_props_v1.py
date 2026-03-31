@@ -16,7 +16,14 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.reference.build_weather_game import normalize_weather_frame
+from src.live.daily_context import (
+    build_game_level_lineup_features,
+    load_live_lineups,
+    load_live_weather,
+    merge_live_context,
+    run_live_preflight,
+    summarize_live_context,
+)
 from src.props.hitter_prop_common import poisson_prob_at_least
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
@@ -414,6 +421,17 @@ def main() -> None:
     dirs = resolve_data_dirs(config=config, prefer_drive=True)
     configure_logging(dirs["logs_dir"] / "run_daily_tb_props_v1.log")
     log_header("scripts/live/run_daily_tb_props_v1.py", repo_root, config_path, dirs)
+    run_live_preflight(
+        repo_root=repo_root,
+        config_path=config_path,
+        season=args.season,
+        date_str=args.date,
+        auto_build=True,
+        force_spine=True,
+        build_lineups=True,
+        build_weather=True,
+        permissive_live_context=True,
+    )
 
     spine_path = dirs["processed_dir"] / "live" / f"model_spine_game_{args.season}_{args.date}.parquet"
     if not spine_path.exists():
@@ -422,10 +440,6 @@ def main() -> None:
         )
     bat_path = dirs["processed_dir"] / "batter_game_rolling.parquet"
     pit_path = dirs["processed_dir"] / "pitcher_game_rolling.parquet"
-    live_dir = dirs["processed_dir"] / "live"
-    lineup_path = live_dir / f"lineups_{args.season}_{args.date}.parquet"
-    confirmed_lineup_path = live_dir / f"confirmed_lineups_{args.season}_{args.date}.parquet"
-    projected_lineup_path = live_dir / f"projected_lineups_{args.season}_{args.date}.parquet"
 
     spine = pd.read_parquet(spine_path).copy()
     batter = pd.read_parquet(bat_path).copy()
@@ -433,9 +447,6 @@ def main() -> None:
 
     parks_path = dirs["reference_dir"] / "parks.parquet"
     parks_dyn_path = dirs["reference_dir"] / "parks_dynamic_2026.parquet"
-    weather_live_processed_path = dirs["processed_dir"] / "live" / f"weather_game_{args.season}_{args.date}.parquet"
-    weather_live_raw_path = dirs["raw_dir"] / "live" / f"weather_game_{args.season}_{args.date}.parquet"
-    weather_fallback_path = dirs["processed_dir"] / "weather_game.parquet"
 
     game_cols = [c for c in ["game_pk", "away_team", "home_team", "home_sp_id", "away_sp_id", "temperature", "wind_speed", "park_factor_hits_blend", "park_factor_hits_hist", "venue_id", "canonical_park_key", "park_id"] if c in spine.columns]
     g = spine[game_cols].copy()
@@ -446,43 +457,15 @@ def main() -> None:
     away_games["home_away"] = 0.0
     team_games = pd.concat([home_games, away_games], ignore_index=True, sort=False)
 
-    weather_source_path: Path | None = None
-    weather_source_kind = "none"
-    wg = pd.DataFrame()
-    if weather_live_processed_path.exists():
-        weather_source_path = weather_live_processed_path
-        weather_source_kind = "processed_live"
-    elif weather_live_raw_path.exists():
-        weather_source_path = weather_live_raw_path
-        weather_source_kind = "raw_live"
-    elif weather_fallback_path.exists():
-        weather_source_path = weather_fallback_path
-        weather_source_kind = "processed_fallback"
-
-    if weather_source_path is not None:
-        try:
-            wg = pd.read_parquet(weather_source_path).copy()
-            if weather_source_kind == "raw_live":
-                wg = normalize_weather_frame(wg, fallback_season=args.season)
-            logging.info("tb_prop live weather_source kind=%s path=%s rows=%s", weather_source_kind, weather_source_path, len(wg))
-            if "game_pk" in wg.columns:
-                wg["game_pk"] = pd.to_numeric(wg["game_pk"], errors="coerce").astype("Int64")
-                keep = [c for c in ["game_pk", "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"] if c in wg.columns]
-                if len(keep) > 1:
-                    g = g.merge(wg[keep].drop_duplicates(subset=["game_pk"], keep="last"), on="game_pk", how="left", suffixes=("", "_wg"))
-                    for c in ["temperature", "wind_speed", "weather_wind_out", "weather_wind_in"]:
-                        if f"{c}_wg" in g.columns:
-                            g[c] = pd.to_numeric(g.get(c), errors="coerce").fillna(pd.to_numeric(g.get(f"{c}_wg"), errors="coerce"))
-                            g = g.drop(columns=[f"{c}_wg"], errors="ignore")
-        except Exception:
-            logging.exception("tb_prop live optional weather join failed; continuing")
-    else:
-        logging.warning(
-            "tb_prop live optional weather table missing checked processed_live=%s raw_live=%s fallback=%s",
-            weather_live_processed_path,
-            weather_live_raw_path,
-            weather_fallback_path,
-        )
+    wg = load_live_weather(config=config, season=args.season, date_str=args.date)
+    if not wg.empty and "game_pk" in wg.columns:
+        keep = [c for c in ["game_pk", "temperature", "wind_speed", "weather_wind_out", "weather_wind_in"] if c in wg.columns]
+        if len(keep) > 1:
+            g = g.merge(wg[keep].drop_duplicates(subset=["game_pk"], keep="last"), on="game_pk", how="left", suffixes=("", "_wg"))
+            for c in ["temperature", "wind_speed", "weather_wind_out", "weather_wind_in"]:
+                if f"{c}_wg" in g.columns:
+                    g[c] = pd.to_numeric(g.get(c), errors="coerce").fillna(pd.to_numeric(g.get(f"{c}_wg"), errors="coerce"))
+                    g = g.drop(columns=[f"{c}_wg"], errors="ignore")
 
     if parks_path.exists():
         try:
@@ -518,47 +501,32 @@ def main() -> None:
     else:
         logging.warning("tb_prop live optional dynamic parks table missing: %s", parks_dyn_path)
 
-    confirmed = pd.DataFrame()
-    if confirmed_lineup_path.exists():
-        confirmed = _normalize_live_lineups(
-            pd.read_parquet(confirmed_lineup_path).copy(),
-            team_games=team_games,
-            source_label="confirmed_lineups",
-            default_status="confirmed",
-        )
-
-    projected = pd.DataFrame()
-    if projected_lineup_path.exists():
-        projected = _normalize_live_lineups(
-            pd.read_parquet(projected_lineup_path).copy(),
-            team_games=team_games,
-            source_label="projected_lineups",
-            default_status="projected",
-        )
-        projected = _validate_lineup_rows(projected, label="projected_lineups")
-
-    if confirmed.empty and projected.empty and lineup_path.exists():
-        projected = _normalize_live_lineups(
-            pd.read_parquet(lineup_path).copy(),
-            team_games=team_games,
-            source_label="lineups_compat",
-            default_status="projected",
-        )
-        projected = _validate_lineup_rows(projected, label="lineups_compat")
-
-    confirmed_games = set(pd.to_numeric(confirmed.get("game_pk"), errors="coerce").dropna().astype(int).tolist()) if not confirmed.empty else set()
-    projected_use = projected[~pd.to_numeric(projected.get("game_pk"), errors="coerce").astype("Int64").isin(list(confirmed_games))].copy() if not projected.empty else pd.DataFrame()
-    selected = pd.concat([confirmed, projected_use], ignore_index=True, sort=False)
+    loaded_live_lineups = load_live_lineups(config=config, season=args.season, date_str=args.date)
+    selected = _normalize_live_lineups(
+        loaded_live_lineups,
+        team_games=team_games,
+        source_label="live_lineups",
+        default_status="projected",
+    )
+    selected = _validate_lineup_rows(selected, label="live_lineups")
+    lineup_game = build_game_level_lineup_features(loaded_live_lineups, batter, slate_date)
+    game_context = merge_live_context(g[["game_pk", "away_team", "home_team"]].copy(), wg, lineup_game)
+    smoke = summarize_live_context(game_context)
+    logging.info(
+        "live_feature_smoke games=%s pct_with_weather=%.2f pct_with_lineups=%.2f away_lineup_found=%s home_lineup_found=%s",
+        smoke["games"],
+        smoke["pct_with_weather"],
+        smoke["pct_with_lineups"],
+        smoke["away_lineup_found"],
+        smoke["home_lineup_found"],
+    )
 
     selected_games = set(pd.to_numeric(selected.get("game_pk"), errors="coerce").dropna().astype(int).tolist()) if not selected.empty else set()
     slate_games = set(pd.to_numeric(g.get("game_pk"), errors="coerce").dropna().astype(int).tolist())
     missing_games = sorted(slate_games - selected_games)
     fallback = pd.DataFrame()
     if missing_games:
-        if confirmed.empty and projected.empty:
-            logging.info("Using fallback lineup builder (no confirmed or projected lineups found)")
-        else:
-            logging.info("Using fallback lineup builder for games missing both confirmed and projected lineups")
+        logging.info("Using fallback lineup builder for games missing live lineups")
         fallback_all = _build_fallback_lineups(batter=batter, slate_date=slate_date, season=args.season, team_games=team_games)
         if not fallback_all.empty:
             fallback = fallback_all[pd.to_numeric(fallback_all["game_pk"], errors="coerce").astype("Int64").isin(missing_games)].copy()
@@ -573,8 +541,8 @@ def main() -> None:
         )
         slate_team_list = sorted(team_games["batter_team"].astype(str).str.upper().dropna().unique().tolist())
         raise ValueError(
-            "No lineup candidates were available from confirmed, projected, compatibility, or fallback sources. "
-            f"confirmed_rows={len(confirmed)} projected_rows={len(projected_use)} fallback_rows={len(fallback)} "
+            "No lineup candidates were available from live or fallback sources. "
+            f"live_rows={len(selected)} fallback_rows={len(fallback)} "
             f"slate_teams={slate_team_list} batter_teams_available={batter_teams_available}"
         )
 
@@ -705,18 +673,14 @@ def main() -> None:
         feature_name_map = pd.Series(dtype="object")
 
     logging.info(
-        "tb_prop live lineup_source_summary confirmed_rows=%s confirmed_games=%s projected_rows=%s projected_games_used=%s fallback_rows=%s fallback_games=%s total_rows=%s total_games=%s",
-        len(confirmed),
-        len(confirmed_games),
-        len(projected),
-        int(projected_use["game_pk"].nunique()) if not projected_use.empty else 0,
+        "tb_prop live lineup_source_summary live_rows=%s live_games=%s fallback_rows=%s fallback_games=%s total_rows=%s total_games=%s",
+        len(selected) - len(fallback),
+        int((selected[~selected["lineup_source"].eq("fallback")] if "lineup_source" in selected.columns else selected)["game_pk"].nunique()) if not selected.empty else 0,
         len(fallback),
         int(fallback["game_pk"].nunique()) if not fallback.empty else 0,
         len(selected),
         int(selected["game_pk"].nunique()) if not selected.empty else 0,
     )
-    logging.info("tb_prop live confirmed_lineup_rows=%s", len(confirmed))
-    logging.info("tb_prop live projected_lineup_rows=%s", len(projected_use))
     logging.info("tb_prop live fallback_lineup_rows=%s", len(fallback))
     logging.info("tb_prop live final_lineup_candidate_rows=%s", len(selected))
     if not selected.empty and {"game_pk", "lineup_source"}.issubset(selected.columns):
