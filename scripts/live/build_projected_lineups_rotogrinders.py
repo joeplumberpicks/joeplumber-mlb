@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -64,12 +64,13 @@ TEAM_ALIASES = {
 
 VALID_POSITIONS = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH", "OF"}
 
+SLOT_RE = re.compile(r"^\*?\s*(\d)\s*$")
+TIME_RE = re.compile(r"^\*?\s*\d{1,2}:\d{2}\s*[AP]M\s*ET\s*$", flags=re.IGNORECASE)
 BATS_RE = re.compile(r"^\((L|R|S)\)$", flags=re.IGNORECASE)
-SLOT_RE = re.compile(r"^\d$")
+WEATHER_RE = re.compile(r"(mph|humidity|forecast|precipitation|°)", flags=re.IGNORECASE)
+PCT_RE = re.compile(r"^\d+(\.\d+)?%$")
+NUM_RE = re.compile(r"^\d+(\.\d+)?$")
 SALARY_RE = re.compile(r"^\$\d")
-OWN_RE = re.compile(r"^\d+(\.\d+)?%$")
-PROJ_RE = re.compile(r"^\d+(\.\d+)?$")
-TIME_RE = re.compile(r"\d{1,2}:\d{2}\s*[AP]M\s*ET", flags=re.IGNORECASE)
 
 
 def parse_args() -> argparse.Namespace:
@@ -97,15 +98,15 @@ def _normalize_text(s: object) -> str:
     return s
 
 
+def _norm_name_value(s: object) -> str:
+    s = _normalize_text(s).lower()
+    s = re.sub(r"[^\w\s]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def _norm_name(series: pd.Series) -> pd.Series:
-    return (
-        series.fillna("")
-        .astype(str)
-        .str.lower()
-        .str.replace(r"[^\w\s]", "", regex=True)
-        .str.replace(r"\s+", " ", regex=True)
-        .str.strip()
-    )
+    return series.map(_norm_name_value)
 
 
 def _to_canonical_team(team_token: object) -> str | None:
@@ -138,45 +139,45 @@ def _build_team_game_map(spine: pd.DataFrame) -> pd.DataFrame:
     return team_games.drop_duplicates(subset=["game_pk", "canonical_team"]).copy()
 
 
-def _resolve_player_ids(out: pd.DataFrame, batter_path: Path, slate_date: pd.Timestamp) -> pd.DataFrame:
-    if out.empty or not batter_path.exists():
-        return out
-
+def _load_batter_lookup(batter_path: Path, slate_date: pd.Timestamp) -> pd.DataFrame:
     batter = pd.read_parquet(batter_path).copy()
     team_col = _pick(list(batter.columns), ["batter_team", "team", "team_abbrev", "team_name", "batting_team"])
     bid_col = _pick(list(batter.columns), ["batter_id", "player_id"])
     name_col = _pick(list(batter.columns), ["player_name", "batter_name", "name", "batter"])
 
     if team_col is None or bid_col is None or name_col is None:
-        logging.warning("rotogrinders id resolver skipped missing columns batter_cols=%s", sorted(batter.columns))
-        return out
+        raise RuntimeError(f"Could not build batter lookup from columns: {sorted(batter.columns)}")
 
     batter["game_date"] = pd.to_datetime(batter.get("game_date"), errors="coerce")
     batter = batter[batter["game_date"] < slate_date].copy()
-    if batter.empty:
-        return out
-
     batter["canonical_team"] = batter[team_col].map(_to_canonical_team)
     batter["batter_id"] = pd.to_numeric(batter[bid_col], errors="coerce").astype("Int64")
     batter["name_norm"] = _norm_name(batter[name_col])
 
+    batter = batter.dropna(subset=["canonical_team"])
     lookup = (
         batter.sort_values(["game_date"])
-        .dropna(subset=["batter_id", "canonical_team"])
-        .drop_duplicates(subset=["canonical_team", "name_norm"], keep="last")[["canonical_team", "name_norm", "batter_id"]]
+        .drop_duplicates(subset=["canonical_team", "name_norm"], keep="last")[["canonical_team", "name_norm", "batter_id", "game_date"]]
+        .copy()
     )
+    return lookup
+
+
+def _resolve_player_ids(out: pd.DataFrame, lookup: pd.DataFrame) -> pd.DataFrame:
+    if out.empty:
+        return out
 
     out["name_norm"] = _norm_name(out["player_name"])
-    fill_mask = out["batter_id"].isna()
-    if fill_mask.any():
-        resolved = out.loc[fill_mask, ["canonical_team", "name_norm"]].merge(
-            lookup,
-            on=["canonical_team", "name_norm"],
-            how="left",
-        )["batter_id"]
-        out.loc[fill_mask, "batter_id"] = pd.to_numeric(resolved, errors="coerce").astype("Int64").values
-
-    return out.drop(columns=["name_norm"], errors="ignore")
+    fill = out.merge(
+        lookup[["canonical_team", "name_norm", "batter_id"]],
+        on=["canonical_team", "name_norm"],
+        how="left",
+        suffixes=("", "_lk"),
+    )
+    if "batter_id_lk" in fill.columns:
+        fill["batter_id"] = fill["batter_id"].fillna(fill["batter_id_lk"])
+        fill = fill.drop(columns=["batter_id_lk"], errors="ignore")
+    return fill.drop(columns=["name_norm"], errors="ignore")
 
 
 def _load_html(url: str, html_path: Path | None) -> str:
@@ -223,7 +224,9 @@ def _extract_visible_lines(html: str) -> list[str]:
 
 
 def _find_game_blocks(lines: list[str]) -> list[tuple[int, int]]:
-    idxs = [i for i, t in enumerate(lines) if TIME_RE.search(t)]
+    idxs = [i for i, t in enumerate(lines) if TIME_RE.match(t)]
+    if not idxs:
+        return [(0, len(lines))]
     blocks: list[tuple[int, int]] = []
     for n, start in enumerate(idxs):
         end = idxs[n + 1] if n + 1 < len(idxs) else len(lines)
@@ -231,51 +234,41 @@ def _find_game_blocks(lines: list[str]) -> list[tuple[int, int]]:
     return blocks
 
 
-def _find_teams_in_block(block: list[str]) -> list[str]:
-    teams: list[str] = []
-    for tok in block:
-        team = _to_canonical_team(tok)
-        if team and team not in teams:
-            teams.append(team)
-        if len(teams) == 2:
-            break
-    return teams
-
-
-def _parse_team_lineup(team: str, tokens: list[str], default_status: str) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    status = default_status
+def _parse_lineup_chunks(lines: list[str]) -> list[dict[str, object]]:
+    """
+    Parse slot/name/bats/position chunks without needing team names.
+    """
+    chunks: list[dict[str, object]] = []
     i = 0
+    current_status = "confirmed"
 
-    while i < len(tokens):
-        tok = tokens[i]
+    while i < len(lines):
+        tok = lines[i]
         low = tok.lower()
 
         if "lineup not released" in low:
-            status = "projected"
+            current_status = "projected"
             i += 1
             continue
 
         if SLOT_RE.fullmatch(tok):
             slot = int(tok)
-
-            if i + 3 < len(tokens):
-                name = _normalize_text(tokens[i + 1])
-                bats_tok = _normalize_text(tokens[i + 2])
-                pos_tok = _normalize_text(tokens[i + 3])
+            if i + 3 < len(lines):
+                name = _normalize_text(lines[i + 1])
+                bats_tok = _normalize_text(lines[i + 2])
+                pos_tok = _normalize_text(lines[i + 3])
 
                 bats_m = BATS_RE.fullmatch(bats_tok)
                 pos = pos_tok.upper().split("/")[0]
 
                 if bats_m and pos in VALID_POSITIONS:
-                    rows.append(
+                    chunks.append(
                         {
-                            "canonical_team": team,
                             "player_name": name,
                             "lineup_slot": slot,
                             "position": pos,
                             "bats": bats_m.group(1).upper(),
-                            "lineup_status": status,
+                            "lineup_status": current_status,
                             "source_text": f"{tok} {name} {bats_tok} {pos_tok}",
                         }
                     )
@@ -283,64 +276,96 @@ def _parse_team_lineup(team: str, tokens: list[str], default_status: str) -> lis
                     continue
         i += 1
 
-    return rows
+    return chunks
 
 
-def _split_block_into_team_sections(block: list[str], teams: list[str]) -> dict[str, list[str]]:
-    if len(teams) != 2:
-        return {}
+def _split_game_into_lineups(block: list[str]) -> list[list[dict[str, object]]]:
+    """
+    Within one game block, split continuous parsed chunks into separate team lineups.
+    A new lineup starts when slot sequence restarts at 1 after already having rows.
+    """
+    chunks = _parse_lineup_chunks(block)
+    if not chunks:
+        return []
 
-    # find first occurrence of each team token in block
-    positions = []
-    for team in teams:
-        pos = None
-        for i, tok in enumerate(block):
-            if _to_canonical_team(tok) == team:
-                pos = i
-                break
-        positions.append(pos)
+    lineups: list[list[dict[str, object]]] = []
+    current: list[dict[str, object]] = []
+    seen_slots: set[int] = set()
 
-    if positions[0] is None or positions[1] is None:
-        return {}
+    for row in chunks:
+        slot = int(row["lineup_slot"])
+        if current and (slot == 1 or slot in seen_slots):
+            lineups.append(current)
+            current = []
+            seen_slots = set()
 
-    # order by appearance
-    ordered = sorted(zip(teams, positions), key=lambda x: x[1])
-    (team_a, pos_a), (team_b, pos_b) = ordered
+        current.append(row)
+        seen_slots.add(slot)
 
-    return {
-        team_a: block[pos_a:pos_b],
-        team_b: block[pos_b:],
-    }
+    if current:
+        lineups.append(current)
+
+    return lineups
 
 
-def _parse_rotogrinders_lines(lines: list[str]) -> pd.DataFrame:
+def _infer_team_for_lineup(
+    lineup_rows: list[dict[str, object]],
+    lookup: pd.DataFrame,
+    slate_teams: set[str],
+) -> tuple[str | None, dict[str, int]]:
+    counts: dict[str, int] = {}
+    lineup_names = {_norm_name_value(r["player_name"]) for r in lineup_rows}
+
+    matches = lookup[lookup["name_norm"].isin(lineup_names)]
+    if matches.empty:
+        return None, counts
+
+    for team, n in matches.groupby("canonical_team")["name_norm"].nunique().to_dict().items():
+        if team in slate_teams:
+            counts[team] = n
+
+    if not counts:
+        return None, counts
+
+    best_team = sorted(counts.items(), key=lambda x: (-x[1], x[0]))[0][0]
+    return best_team, counts
+
+
+def _parse_rotogrinders_lines(lines: list[str], lookup: pd.DataFrame, slate_teams: set[str]) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     diagnostics: list[dict[str, object]] = []
 
     for start, end in _find_game_blocks(lines):
         block = lines[start:end]
-        teams = _find_teams_in_block(block)
-        if len(teams) != 2:
-            diagnostics.append({"time": lines[start], "reason": "team_detect_failed", "teams": teams})
-            continue
+        lineups = _split_game_into_lineups(block)
 
-        sections = _split_block_into_team_sections(block, teams)
-        if len(sections) != 2:
-            diagnostics.append({"time": lines[start], "reason": "team_section_split_failed", "teams": teams})
-            continue
+        inferred: list[tuple[str | None, dict[str, int], int]] = []
+        for idx, lineup_rows in enumerate(lineups):
+            team, counts = _infer_team_for_lineup(lineup_rows, lookup, slate_teams)
+            inferred.append((team, counts, len(lineup_rows)))
 
-        game_rows = 0
-        for team in teams:
-            team_rows = _parse_team_lineup(team, sections[team], default_status="confirmed")
-            rows.extend(team_rows)
-            game_rows += len(team_rows)
+            if team is not None:
+                for row in lineup_rows:
+                    rows.append(
+                        {
+                            "canonical_team": team,
+                            "player_name": row["player_name"],
+                            "lineup_slot": row["lineup_slot"],
+                            "position": row["position"],
+                            "bats": row["bats"],
+                            "lineup_status": row["lineup_status"],
+                            "source_text": row["source_text"],
+                        }
+                    )
 
         diagnostics.append(
             {
-                "time": lines[start],
-                "teams": teams,
-                "rows": game_rows,
-                "rows_by_team": {t: len([r for r in rows if r["canonical_team"] == t]) for t in teams},
+                "time": lines[start] if start < len(lines) else "UNKNOWN",
+                "num_lineups_found": len(lineups),
+                "inferred": [
+                    {"team": team, "match_counts": counts, "rows": nrows}
+                    for team, counts, nrows in inferred
+                ],
             }
         )
 
@@ -364,10 +389,16 @@ def main() -> None:
     if not spine_path.exists():
         raise FileNotFoundError(f"Live spine not found: {spine_path}")
 
+    batter_path = dirs["processed_dir"] / "batter_game_rolling.parquet"
+    if not batter_path.exists():
+        raise FileNotFoundError(f"Batter rolling file not found: {batter_path}")
+
     spine = pd.read_parquet(spine_path).copy()
     spine["game_pk"] = pd.to_numeric(spine.get("game_pk"), errors="coerce").astype("Int64")
     team_games = _build_team_game_map(spine)
     slate_canonical = set(team_games["canonical_team"].dropna().astype(str).unique().tolist())
+
+    lookup = _load_batter_lookup(batter_path, slate_date)
 
     html = _load_html(args.url, args.html_path)
 
@@ -380,7 +411,7 @@ def main() -> None:
     logging.info("rotogrinders visible lines count=%s", len(lines))
     logging.info("rotogrinders sample lines 260:340=%s", lines[260:340])
 
-    raw = _parse_rotogrinders_lines(lines)
+    raw = _parse_rotogrinders_lines(lines, lookup, slate_canonical)
     if raw.empty:
         raise RuntimeError("No lineup rows parsed from RotoGrinders page")
 
@@ -411,7 +442,7 @@ def main() -> None:
     out["lineup_source"] = SOURCE_NAME
     out["source_timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    out = _resolve_player_ids(out, dirs["processed_dir"] / "batter_game_rolling.parquet", slate_date)
+    out = _resolve_player_ids(out, lookup)
 
     out = out[
         [
