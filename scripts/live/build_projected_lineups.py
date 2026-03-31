@@ -217,7 +217,8 @@ def _resolve_player_ids(out: pd.DataFrame, batter_path: Path, slate_date: pd.Tim
         .drop_duplicates(subset=["batter_team", "name_norm"], keep="last")[["batter_team", "name_norm", "batter_id"]]
     )
 
-    out["name_norm"] = _norm_name(out["player_name"])
+    out["player_name_clean"] = out["player_name"].astype(str).map(_clean_player_name)
+    out["name_norm"] = _norm_name(out["player_name_clean"])
     fill = out["batter_id"].isna()
     if fill.any():
         resolved = (
@@ -226,7 +227,7 @@ def _resolve_player_ids(out: pd.DataFrame, batter_path: Path, slate_date: pd.Tim
         )
         out.loc[fill, "batter_id"] = pd.to_numeric(resolved, errors="coerce").astype("Int64").values
 
-    return out.drop(columns=["name_norm"], errors="ignore")
+    return out.drop(columns=["name_norm", "player_name_clean"], errors="ignore")
 
 
 def _team_aliases(spine: pd.DataFrame) -> dict[str, str]:
@@ -313,26 +314,30 @@ def _parse_team_from_text(text: str, aliases: dict[str, str]) -> str | None:
     return _extract_team_abbr(text, aliases)
 
 
-def _parse_team_card(card: BeautifulSoup, team: str) -> list[dict[str, object]]:
-    tokens = [t.strip() for t in card.stripped_strings if t and t.strip()]
+def _extract_side_tokens(side_node) -> list[str]:
+    return [t.strip() for t in side_node.stripped_strings if t and t.strip()]
+
+
+def _parse_side_tokens(tokens: list[str], team: str) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    started = False
+    start_idx = None
+    for i, tok in enumerate(tokens):
+        if tok in LINEUP_START_TOKENS:
+            start_idx = i + 1
+            break
+    if start_idx is None:
+        return rows
+
     i = 0
+    i = start_idx
 
     while i < len(tokens):
         tok = tokens[i]
-
-        if not started:
-            if tok in LINEUP_START_TOKENS:
-                started = True
-            i += 1
-            continue
-
         if tok in STOP_TOKENS or tok.startswith("Umpire:"):
             break
         if "Home Run Odds" in tok or "Starting Pitcher Intel" in tok:
             break
-        if tok.startswith("The ") and "lineup has not been posted yet" in tok:
+        if "lineup has not been posted yet" in tok.lower():
             break
 
         if tok in POS_SET:
@@ -349,6 +354,8 @@ def _parse_team_card(card: BeautifulSoup, team: str) -> list[dict[str, object]]:
                 if nxt in STOP_TOKENS or nxt in POS_SET:
                     break
                 if nxt in LINEUP_START_TOKENS:
+                    break
+                if "lineup has not been posted yet" in nxt.lower():
                     break
                 if re.fullmatch(r"\d+", nxt):
                     j += 1
@@ -384,7 +391,7 @@ def _parse_team_card(card: BeautifulSoup, team: str) -> list[dict[str, object]]:
 
         i += 1
 
-    return rows
+    return rows[:9]
 
 
 def _parse_rotowire_cards(soup: BeautifulSoup, aliases: dict[str, str]) -> pd.DataFrame:
@@ -408,33 +415,91 @@ def _parse_rotowire_cards(soup: BeautifulSoup, aliases: dict[str, str]) -> pd.Da
             seen.add(cid)
             uniq_cards.append(c)
 
-    raw_nodes_scanned = 0
-    lineup_nodes_found = 0
+    parsed_counts_by_team: dict[str, int] = {}
+    duplicate_team_player_pairs = 0
+    side_selectors = [
+        "div.lineup__main",
+        "div[class*='lineup__main']",
+        "div.lineup__list",
+        "div[class*='lineup__list']",
+        "div.lineup__body",
+        "div[class*='lineup__body']",
+    ]
 
     for card in uniq_cards:
         card_lines = [t.strip() for t in card.stripped_strings if t and t.strip()]
         if not card_lines:
             continue
 
-        team = _parse_team_from_text(" ".join(card_lines[:12]), aliases)
-        if team is None:
+        team_labels = [
+            t.strip() for n in card.select("div.lineup__team, div[class*='lineup__team'], span[class*='lineup__team']")
+            for t in n.stripped_strings if t and t.strip()
+        ]
+        if len(team_labels) < 2:
+            team_labels = card_lines[:16]
+
+        away_team = _parse_team_from_text(team_labels[0], aliases) if len(team_labels) >= 1 else None
+        home_team = _parse_team_from_text(team_labels[1], aliases) if len(team_labels) >= 2 else None
+        if away_team is None or home_team is None:
             continue
 
-        lineup_nodes = card.select(
-            "ul[class*='lineup'] li, ol[class*='lineup'] li, "
-            "div[class*='lineup__list'] div, div[class*='lineup__player'], "
-            "table[class*='lineup'] tr"
-        )
-        raw_nodes_scanned += len(lineup_nodes)
-        lineup_nodes_found += len(lineup_nodes)
+        side_nodes: list[object] = []
+        for sel in side_selectors:
+            side_nodes.extend(list(card.select(sel)))
 
-        rows.extend(_parse_team_card(card, team))
+        uniq_side_nodes = []
+        seen_side_ids: set[int] = set()
+        for node in side_nodes:
+            nid = id(node)
+            if nid in seen_side_ids:
+                continue
+            seen_side_ids.add(nid)
+            uniq_side_nodes.append(node)
+
+        side_nodes_with_start = []
+        for node in uniq_side_nodes:
+            tokens = _extract_side_tokens(node)
+            if any(tok in LINEUP_START_TOKENS for tok in tokens):
+                side_nodes_with_start.append((node, tokens))
+
+        if len(side_nodes_with_start) < 2:
+            logging.warning("rotowire side parsing failed for card; skipping card")
+            continue
+
+        away_rows = _parse_side_tokens(side_nodes_with_start[0][1], away_team)
+        home_rows = _parse_side_tokens(side_nodes_with_start[1][1], home_team)
+
+        logging.info(
+            "rotowire card parsed away_team=%s away_count=%s away_first3=%s home_team=%s home_count=%s home_first3=%s",
+            away_team,
+            len(away_rows),
+            [r["player_name"] for r in away_rows[:3]],
+            home_team,
+            len(home_rows),
+            [r["player_name"] for r in home_rows[:3]],
+        )
+
+        rows.extend(away_rows)
+        rows.extend(home_rows)
+
+        parsed_counts_by_team[away_team] = parsed_counts_by_team.get(away_team, 0) + len(away_rows)
+        parsed_counts_by_team[home_team] = parsed_counts_by_team.get(home_team, 0) + len(home_rows)
+
+    if rows:
+        seen_pairs: set[tuple[str, str]] = set()
+        for row in rows:
+            pair = (str(row["batter_team"]).upper(), str(row["player_name"]).strip().lower())
+            if pair in seen_pairs:
+                duplicate_team_player_pairs += 1
+            else:
+                seen_pairs.add(pair)
 
     logging.info(
-        "rotowire parser nodes raw_nodes_scanned=%s lineup_nodes_found=%s game_cards=%s",
-        raw_nodes_scanned,
-        lineup_nodes_found,
+        "rotowire parser card_diagnostics game_cards=%s parsed_rows=%s parsed_row_counts_by_team=%s duplicate_team_player_pairs=%s",
         len(uniq_cards),
+        len(rows),
+        parsed_counts_by_team,
+        duplicate_team_player_pairs,
     )
     return pd.DataFrame(rows)
 
@@ -470,6 +535,43 @@ def _filter_valid_hitter_rows(df: pd.DataFrame) -> pd.DataFrame:
         final_counts,
     )
     return clean
+
+
+def _log_identical_first_five(out: pd.DataFrame, team_games: pd.DataFrame) -> None:
+    if out.empty:
+        return
+    first_five = (
+        out.sort_values(["game_pk", "batter_team", "lineup_slot"])
+        .groupby(["game_pk", "batter_team"], as_index=False)
+        .head(5)
+        .groupby(["game_pk", "batter_team"])["player_name"]
+        .apply(lambda s: tuple(s.astype(str).tolist()))
+        .reset_index(name="first_five")
+    )
+    if first_five.empty:
+        return
+    merged = team_games[["game_pk", "batter_team", "opponent_team"]].drop_duplicates().merge(
+        first_five,
+        on=["game_pk", "batter_team"],
+        how="left",
+    ).merge(
+        first_five.rename(columns={"batter_team": "opponent_team", "first_five": "opp_first_five"}),
+        on=["game_pk", "opponent_team"],
+        how="left",
+    )
+    bad = merged[
+        merged["first_five"].notna()
+        & merged["opp_first_five"].notna()
+        & (merged["first_five"] == merged["opp_first_five"])
+    ]
+    if len(bad):
+        logging.warning(
+            "rotowire identical_first5_detected pairs=%s samples=%s",
+            len(bad),
+            bad[["game_pk", "batter_team", "opponent_team", "first_five"]].head(5).to_dict(orient="records"),
+        )
+    else:
+        logging.info("rotowire identical_first5_detected pairs=0")
 
 
 def _scrape_rotowire_projected(url: str, aliases: dict[str, str]) -> tuple[pd.DataFrame, str, dict[str, object]]:
@@ -632,6 +734,7 @@ def main() -> None:
     out = out.dropna(subset=["player_name"]).copy()
     ui_mask = out["player_name"].str.lower().str.contains("|".join(UI_BLOCKLIST), regex=True, na=False)
     out = out[~ui_mask].copy()
+    _log_identical_first_five(out, team_games)
 
     logging.info(
         "projected_lineups prewrite total_rows=%s unique_games=%s unique_teams=%s resolved_batter_ids=%s sample_rows=%s",
