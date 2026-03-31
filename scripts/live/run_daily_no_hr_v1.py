@@ -11,11 +11,12 @@ import numpy as np
 import pandas as pd
 from joblib import load
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+# Make repo root importable when running from scripts/live/
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.live.daily_context import resolve_live_paths, run_live_preflight
+from src.live.daily_context import run_live_preflight
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
 from src.utils.io import read_parquet, write_parquet
@@ -69,8 +70,10 @@ def _grade_from_prob(p: float) -> str:
 
 
 def _print_board(board: pd.DataFrame, date_str: str, top_n: int = 15) -> None:
-    if board is None or board.empty:
-        print(f"\nJOE PLUMBER NO-HR BOARD — {date_str}\n-----------------------------------\n(no games)\n")
+    if board.empty:
+        print(f"\nJOE PLUMBER NO-HR BOARD — {date_str}")
+        print("-----------------------------------")
+        print("(no games)\n")
         return
 
     view = board.copy()
@@ -120,6 +123,27 @@ def _safe_game_filter(df: pd.DataFrame, date_str: str) -> pd.DataFrame:
     return filtered if not filtered.empty else out
 
 
+def _load_model_bundle(model_path: Path) -> tuple[object, list[str], float]:
+    bundle = load(model_path)
+
+    if isinstance(bundle, dict):
+        model = bundle.get("model")
+        feat_cols = list(bundle.get("features", []))
+        baseline = float(bundle.get("baseline_no_hr_rate", 0.1085))
+    else:
+        raise ValueError(
+            f"Unexpected no-hr model artifact format at {model_path}. Expected dict-like bundle."
+        )
+
+    if model is None:
+        raise ValueError(f"Model bundle missing 'model' key: {model_path}")
+
+    if not feat_cols:
+        raise ValueError(f"Model bundle missing/empty 'features' key: {model_path}")
+
+    return model, feat_cols, baseline
+
+
 def main() -> None:
     args = parse_args()
     season = args.season or int(str(args.date)[:4])
@@ -130,10 +154,10 @@ def main() -> None:
     dirs = resolve_data_dirs(config=config, prefer_drive=True)
 
     configure_logging(dirs["logs_dir"] / "run_daily_no_hr_v1.log")
-    log_header("scripts/run_daily_no_hr_v1.py", repo_root, config_path, dirs)
-
+    log_header("scripts/live/run_daily_no_hr_v1.py", repo_root, config_path, dirs)
     logging.info("requested season=%s date=%s", season, args.date)
 
+    # Build live context: schedule/spine + projected lineups + weather
     preflight = run_live_preflight(
         repo_root=repo_root,
         config_path=config_path,
@@ -147,25 +171,22 @@ def main() -> None:
     )
     logging.info("live preflight status=%s", preflight)
 
-    _run_cmd(
-        [
-            sys.executable,
-            "scripts/build_mart_no_hr_game.py",
-            "--season",
-            str(season),
-            "--config",
-            str(config_path),
-            "--force" if args.force_mart or True else "",
-        ],
-        repo_root,
-    )
+    # Build the no-hr mart for the requested season
+    mart_cmd = [
+        sys.executable,
+        "scripts/build_mart_no_hr_game.py",
+        "--season",
+        str(season),
+        "--config",
+        str(config_path),
+    ]
+    if args.force_mart or True:
+        mart_cmd.append("--force")
+    _run_cmd(mart_cmd, repo_root)
 
     model_dir = dirs["models_dir"] / "no_hr"
     model_path = _resolve_model_path(model_dir, args.model_path)
-    bundle = load(model_path)
-    model = bundle["model"]
-    feat_cols = list(bundle.get("features", []))
-    baseline = float(bundle.get("baseline_no_hr_rate", 0.1085))
+    model, feat_cols, baseline = _load_model_bundle(model_path)
 
     logging.info("using model_path=%s", model_path)
     logging.info("using baseline_no_hr_rate=%.6f", baseline)
@@ -176,26 +197,29 @@ def main() -> None:
         raise FileNotFoundError(f"No-HR mart not found: {mart_path.resolve()}")
 
     mart = read_parquet(mart_path)
-    mart = _safe_game_filter(mart, args.date).copy()
+    mart = _safe_game_filter(mart, args.date)
     if mart.empty:
         raise ValueError(f"No rows found in no-HR mart for season={season} date={args.date}")
 
+    # Prepare scoring matrix in exact training-feature order
     X = pd.DataFrame(index=mart.index)
     missing_features: list[str] = []
-    for f in feat_cols:
-        if f in mart.columns:
-            X[f] = pd.to_numeric(mart[f], errors="coerce")
+    for feature in feat_cols:
+        if feature in mart.columns:
+            X[feature] = pd.to_numeric(mart[feature], errors="coerce")
         else:
-            X[f] = np.nan
-            missing_features.append(f)
+            X[feature] = np.nan
+            missing_features.append(feature)
 
     X = X.fillna(0.0).astype("float32")
+
     pred_delta = model.predict(X)
     pred_prob = np.clip(baseline + pred_delta, 0.01, 0.50)
 
-    out = mart[[c for c in ["game_pk", "game_date", "away_team", "home_team"] if c in mart.columns]].copy()
+    out_cols = [c for c in ["game_pk", "game_date", "away_team", "home_team"] if c in mart.columns]
+    out = mart[out_cols].copy()
     out["baseline_no_hr_rate"] = baseline
-    out["p_no_hr"] = pred_prob
+    out["p_no_hr"] = pd.to_numeric(pred_prob, errors="coerce")
     out["delta_vs_baseline"] = out["p_no_hr"] - baseline
     out["grade"] = out["p_no_hr"].apply(_grade_from_prob)
     out = out.sort_values(["p_no_hr", "delta_vs_baseline"], ascending=[False, False]).reset_index(drop=True)
@@ -206,7 +230,6 @@ def main() -> None:
 
     csv_path = outputs_dir / f"no_hr_board_{season}_{args.date}.csv"
     parquet_path = outputs_dir / f"no_hr_board_{season}_{args.date}.parquet"
-
     out.to_csv(csv_path, index=False)
     write_parquet(out, parquet_path)
 
