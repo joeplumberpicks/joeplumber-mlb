@@ -64,7 +64,7 @@ TEAM_ALIASES = {
 
 POS_TOKEN_RE = re.compile(r"\((L|R|S)\)\s+([A-Z0-9/]+)\b")
 SLOT_RE = re.compile(r"^\*?\s*(\d)\s*$")
-TIME_RE = re.compile(r"^\d{1,2}:\d{2}\s*[AP]M\s*ET$", flags=re.IGNORECASE)
+TIME_RE = re.compile(r"^\*?\s*\d{1,2}:\d{2}\s*[AP]M\s*ET\s*$", flags=re.IGNORECASE)
 WEATHER_RE = re.compile(r"(mph|humidity|forecast|precipitation|°)", flags=re.IGNORECASE)
 
 
@@ -246,15 +246,11 @@ def _load_html(url: str, html_path: Path | None) -> str:
 def _extract_visible_lines(html: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     lines: list[str] = []
-    seen: set[str] = set()
 
     for s in soup.stripped_strings:
         t = _normalize_text(s)
         if not t:
             continue
-        if t in seen:
-            continue
-        seen.add(t)
         lines.append(t)
 
     return lines
@@ -270,7 +266,6 @@ def _parse_rotogrinders_lines(lines: list[str]) -> pd.DataFrame:
             i += 1
             continue
 
-        # Find the next two team lines after the time.
         teams = []
         j = i + 1
         while j < len(lines) and len(teams) < 2:
@@ -286,7 +281,6 @@ def _parse_rotogrinders_lines(lines: list[str]) -> pd.DataFrame:
         away_team, home_team = teams[0], teams[1]
         game_rows = 0
 
-        # Parse from after team discovery until next game time.
         current_team = None
         current_status = "confirmed"
         pending_slot = None
@@ -318,7 +312,6 @@ def _parse_rotogrinders_lines(lines: list[str]) -> pd.DataFrame:
                 k += 1
                 continue
 
-            # pitcher lines contain SP and should be ignored
             if " SP " in f" {line} ":
                 k += 1
                 continue
@@ -391,13 +384,14 @@ def main() -> None:
 
     lines = _extract_visible_lines(html)
     logging.info("rotogrinders visible lines count=%s", len(lines))
+    logging.info("rotogrinders sample lines 260:340=%s", lines[260:340])
 
     raw = _parse_rotogrinders_lines(lines)
     if raw.empty:
         raise RuntimeError("No lineup rows parsed from RotoGrinders page")
 
     raw = raw.dropna(subset=["canonical_team", "player_name", "lineup_slot", "position"]).copy()
-    raw = raw[raw["position"].isin(POS_SET)].copy()
+    raw = raw[raw["position"].isin({"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH", "OF"})].copy()
     raw = raw.drop_duplicates(subset=["canonical_team", "player_name"], keep="first").copy()
     raw = raw.sort_values(["canonical_team", "lineup_slot", "player_name"]).copy()
     raw = raw.drop_duplicates(subset=["canonical_team", "lineup_slot"], keep="first").copy()
