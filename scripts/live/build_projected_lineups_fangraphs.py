@@ -5,10 +5,10 @@ import logging
 import re
 import sys
 from datetime import datetime, timezone
-from io import StringIO
 from pathlib import Path
 
 import pandas as pd
+from bs4 import BeautifulSoup
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -89,6 +89,7 @@ TEAM_ABBR_TO_CANONICAL = {
 
 POS_SET = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH", "OF"}
 POSITION_SLOT_RE = re.compile(r"\b(C|1B|2B|3B|SS|LF|CF|RF|DH|OF)\s*\((\d)\)\b", flags=re.IGNORECASE)
+HEADER_RE = re.compile(r"^2026\s+(.+?)\s+Lineups$", flags=re.IGNORECASE)
 
 
 def parse_args() -> argparse.Namespace:
@@ -126,19 +127,6 @@ def _norm_name(series: pd.Series) -> pd.Series:
     )
 
 
-def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if isinstance(out.columns, pd.MultiIndex):
-        flat = []
-        for col in out.columns:
-            parts = [_normalize_text(x) for x in col if _normalize_text(x)]
-            flat.append(" | ".join(parts))
-        out.columns = flat
-    else:
-        out.columns = [_normalize_text(c) for c in out.columns]
-    return out
-
-
 def _to_canonical_team(team_token: object) -> str | None:
     tok = _normalize_text(team_token)
     if not tok:
@@ -149,22 +137,6 @@ def _to_canonical_team(team_token: object) -> str | None:
     if upper in TEAM_ABBR_TO_CANONICAL:
         return TEAM_ABBR_TO_CANONICAL[upper]
     return None
-
-
-def _parse_position_slot(cell: object) -> tuple[str | None, int | None]:
-    text = _normalize_text(cell)
-    if not text:
-        return None, None
-    m = POSITION_SLOT_RE.search(text)
-    if not m:
-        return None, None
-    pos = m.group(1).upper()
-    slot = int(m.group(2))
-    if pos not in POS_SET:
-        return None, None
-    if slot not in range(1, 10):
-        return None, None
-    return pos, slot
 
 
 def _build_team_game_map(spine: pd.DataFrame) -> pd.DataFrame:
@@ -195,10 +167,7 @@ def _resolve_player_ids(out: pd.DataFrame, batter_path: Path, slate_date: pd.Tim
     name_col = _pick(list(batter.columns), ["player_name", "batter_name", "name", "batter"])
 
     if team_col is None or bid_col is None or name_col is None:
-        logging.warning(
-            "fangraphs id resolver skipped missing columns batter_cols=%s",
-            sorted(batter.columns),
-        )
+        logging.warning("fangraphs id resolver skipped missing columns batter_cols=%s", sorted(batter.columns))
         return out
 
     batter["game_date"] = pd.to_datetime(batter.get("game_date"), errors="coerce")
@@ -229,90 +198,134 @@ def _resolve_player_ids(out: pd.DataFrame, batter_path: Path, slate_date: pd.Tim
     return out.drop(columns=["name_norm"], errors="ignore")
 
 
-def _select_date_column(df: pd.DataFrame, slate_date: pd.Timestamp) -> str | None:
-    mmdd = f"{slate_date.month}/{slate_date.day}"
-    weekday_abbrev = slate_date.strftime("%a")
+def _extract_visible_lines(html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    lines: list[str] = []
+    seen: set[str] = set()
 
-    cols = [_normalize_text(c) for c in df.columns]
-
-    for c in cols:
-        if mmdd in c:
-            return c
-
-    for c in cols:
-        if weekday_abbrev in c and re.search(r"\d{1,2}/\d{1,2}", c):
-            return c
-
-    for c in cols:
-        if c in {"Name", "Role", "Ovr", "Last 7 Days"}:
+    for s in soup.stripped_strings:
+        t = _normalize_text(s)
+        if not t:
             continue
-        if re.search(r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b", c):
-            return c
+        if t in seen:
+            continue
+        seen.add(t)
+        lines.append(t)
 
-    return None
+    return lines
 
 
-def _extract_tables_with_team_names(html: str) -> list[tuple[str, pd.DataFrame]]:
-    team_tables: list[tuple[str, pd.DataFrame]] = []
+def _is_noise_line(line: str) -> bool:
+    low = line.lower()
+    if line in {"Name", "Role", "Ovr", "Last 7 Days"}:
+        return True
+    if re.match(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+\d{1,2}/\d{1,2}(?:\s+vs\.\s+[LR])?$", line):
+        return True
+    if re.match(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$", line):
+        return True
+    if re.match(r"^\d{1,2}/\d{1,2}$", line):
+        return True
+    if re.match(r"^vs\.\s+[LR]$", line):
+        return True
+    if low in {"bench", "il", "aaa", "inj"}:
+        return True
+    return False
 
-    headings = re.findall(r"2026\s+([A-Za-z ]+?)\s+Lineups", html)
-    parsed_tables = pd.read_html(StringIO(html))
 
-    for df in parsed_tables:
-        df = _flatten_columns(df)
-        cols = list(df.columns)
+def _extract_lineups_from_text(lines: list[str]) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    diagnostics: list[dict[str, object]] = []
 
-        name_col = _pick(cols, ["Name"])
-        role_col = _pick(cols, ["Role"])
-        if name_col is None or role_col is None:
+    i = 0
+    while i < len(lines):
+        m = HEADER_RE.match(lines[i])
+        if not m:
+            i += 1
             continue
 
-        name_vals = df[name_col].astype(str).tolist()
-        role_vals = df[role_col].astype(str).tolist()
+        team_nickname = _normalize_text(m.group(1))
+        canonical_team = _to_canonical_team(team_nickname)
+        start_i = i + 1
 
-        if not any(v in [str(i) for i in range(1, 10)] for v in role_vals):
-            continue
-
-        sample_names = " | ".join(name_vals[:5])
-
-        matched_team = None
-        for nickname in headings:
-            if nickname not in TEAM_NICKNAME_TO_CANONICAL:
-                continue
-
-            # loose heuristic: just keep order of tables by lineup structure
-            if matched_team is None:
-                matched_team = nickname
+        # find next team header
+        end_i = len(lines)
+        for j in range(start_i, len(lines)):
+            if HEADER_RE.match(lines[j]):
+                end_i = j
                 break
 
-        if matched_team is not None:
-            team_tables.append((matched_team, df))
+        block = lines[start_i:end_i]
+        kept = 0
 
-    # Safer fallback: assign in page order to known nicknames found in HTML
-    if team_tables:
-        ordered_unique = []
-        seen = set()
-        for t in headings:
-            if t in TEAM_NICKNAME_TO_CANONICAL and t not in seen:
-                ordered_unique.append(t)
-                seen.add(t)
+        # scan player rows inside team block
+        # expected repeating pattern:
+        # Name / Role / Ovr / Last7 / [date cells...]
+        k = 0
+        while k < len(block) - 3:
+            name = block[k]
 
-        lineup_like_tables = []
-        for df in parsed_tables:
-            f = _flatten_columns(df)
-            cols = list(f.columns)
-            name_col = _pick(cols, ["Name"])
-            role_col = _pick(cols, ["Role"])
-            if name_col is None or role_col is None:
+            if _is_noise_line(name):
+                k += 1
                 continue
-            role_vals = f[role_col].astype(str).tolist()
-            if any(v in [str(i) for i in range(1, 10)] for v in role_vals):
-                lineup_like_tables.append(f)
 
-        if len(lineup_like_tables) == len(ordered_unique) and len(ordered_unique) > 0:
-            return list(zip(ordered_unique, lineup_like_tables))
+            role = block[k + 1] if k + 1 < len(block) else ""
+            ovr = block[k + 2] if k + 2 < len(block) else ""
+            last7 = block[k + 3] if k + 3 < len(block) else ""
 
-    return team_tables
+            # A valid starter row should have role 1-9 and then later a position-slot token
+            if role not in {str(x) for x in range(1, 10)}:
+                k += 1
+                continue
+
+            # search a short forward window for first position-slot token
+            pos = None
+            slot = None
+            source_text = None
+            for w in range(4, 14):
+                if k + w >= len(block):
+                    break
+                cell = block[k + w]
+                mm = POSITION_SLOT_RE.search(cell)
+                if mm:
+                    pos = mm.group(1).upper()
+                    slot = int(mm.group(2))
+                    source_text = cell
+                    break
+                # stop at obvious next-player boundary
+                if w > 4 and block[k + w] in {str(x) for x in range(1, 10)}:
+                    break
+
+            if pos is not None and slot is not None:
+                rows.append(
+                    {
+                        "canonical_team": canonical_team,
+                        "player_name": name,
+                        "lineup_slot": slot,
+                        "position": pos,
+                        "bats": None,
+                        "source_text": source_text,
+                        "role_raw": role,
+                        "source_team_heading": team_nickname,
+                    }
+                )
+                kept += 1
+                k += 5
+            else:
+                k += 1
+
+        diagnostics.append(
+            {
+                "team": team_nickname,
+                "canonical_team": canonical_team,
+                "block_len": len(block),
+                "kept_rows": kept,
+            }
+        )
+
+        i = end_i
+
+    logging.info("fangraphs text parser diagnostics=%s", diagnostics)
+    return pd.DataFrame(rows)
 
 
 def main() -> None:
@@ -342,82 +355,14 @@ def main() -> None:
     team_games = _build_team_game_map(spine)
     slate_canonical = set(team_games["canonical_team"].dropna().astype(str).unique().tolist())
 
-    team_tables = _extract_tables_with_team_names(html)
-    logging.info("fangraphs extracted team_tables=%s", len(team_tables))
+    lines = _extract_visible_lines(html)
+    logging.info("fangraphs visible lines count=%s", len(lines))
 
-    if not team_tables:
-        raise RuntimeError("No lineup-like tables found in saved FanGraphs HTML")
-
-    rows: list[dict[str, object]] = []
-    diagnostics: list[dict[str, object]] = []
-
-    for team_nickname, df in team_tables:
-        canonical_team = _to_canonical_team(team_nickname)
-        if canonical_team is None:
-            diagnostics.append({"team": team_nickname, "reason": "unknown_team"})
-            continue
-
-        cols = list(df.columns)
-        name_col = _pick(cols, ["Name"])
-        role_col = _pick(cols, ["Role"])
-        date_col = _select_date_column(df, slate_date)
-
-        if name_col is None or role_col is None or date_col is None:
-            diagnostics.append(
-                {
-                    "team": team_nickname,
-                    "canonical_team": canonical_team,
-                    "reason": "missing_required_column",
-                    "cols": cols,
-                }
-            )
-            continue
-
-        kept = 0
-        for _, row in df.iterrows():
-            player_name = _normalize_text(row.get(name_col))
-            role_raw = _normalize_text(row.get(role_col))
-            date_cell = row.get(date_col)
-
-            if not player_name:
-                continue
-            if role_raw not in {str(i) for i in range(1, 10)}:
-                continue
-
-            pos, slot = _parse_position_slot(date_cell)
-            if pos is None or slot is None:
-                continue
-
-            rows.append(
-                {
-                    "canonical_team": canonical_team,
-                    "player_name": player_name,
-                    "lineup_slot": slot,
-                    "position": pos,
-                    "bats": None,
-                    "source_text": _normalize_text(date_cell),
-                    "role_raw": role_raw,
-                    "source_team_heading": team_nickname,
-                }
-            )
-            kept += 1
-
-        diagnostics.append(
-            {
-                "team": team_nickname,
-                "canonical_team": canonical_team,
-                "date_col": date_col,
-                "rows": len(df),
-                "kept_rows": kept,
-            }
-        )
-
-    logging.info("fangraphs table diagnostics=%s", diagnostics)
-
-    raw = pd.DataFrame(rows)
+    raw = _extract_lineups_from_text(lines)
     if raw.empty:
-        raise RuntimeError("No lineup rows parsed from FanGraphs tables")
+        raise RuntimeError("No lineup rows parsed from FanGraphs visible text")
 
+    raw = raw.dropna(subset=["canonical_team", "player_name", "lineup_slot", "position"]).copy()
     raw = raw.drop_duplicates(subset=["canonical_team", "player_name"], keep="first").copy()
     raw = raw.sort_values(["canonical_team", "lineup_slot", "player_name"]).copy()
     raw = raw.drop_duplicates(subset=["canonical_team", "lineup_slot"], keep="first").copy()
