@@ -230,8 +230,6 @@ def _extract_lineups(lines: list[str]) -> pd.DataFrame:
         block = lines[start_i:end_i]
         kept = 0
 
-        # Pattern in pasted text:
-        # player_name / role / ovr / last7 / ... first date cell with POS (slot)
         k = 0
         while k < len(block) - 4:
             name = block[k]
