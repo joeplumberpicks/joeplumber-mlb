@@ -1,32 +1,14 @@
-from __future__ import annotations
-
 import argparse
-import logging
-import re
-import sys
-from datetime import datetime, timezone
-from pathlib import Path
-
-import pandas as pd
 import requests
+import pandas as pd
 from bs4 import BeautifulSoup
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+ROTOWIRE_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
 
-from src.utils.config import get_repo_root, load_config
-from src.utils.drive import resolve_data_dirs
-from src.utils.logging import configure_logging, log_header
+POS_SET = {"C","1B","2B","3B","SS","LF","CF","RF","DH"}
+HAND_SET = {"L","R","S"}
 
-SOURCE_NAME = "rotowire"
-SOURCE_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
-SOURCE_URL_FALLBACK = "https://www.rotowire.com/baseball/daily-lineups.php?date=tomorrow"
-
-POS_SET = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH"}
-HAND_SET = {"L", "R", "S"}
-UI_BLOCKLIST = {"watch now", "tickets", "alerts"}
-LINEUP_START_TOKENS = {"Expected Lineup", "Confirmed Lineup"}
+LINEUP_START = {"Confirmed Lineup", "Expected Lineup"}
 STOP_TOKENS = {
     "Home Run Odds",
     "Starting Pitcher Intel",
@@ -34,150 +16,18 @@ STOP_TOKENS = {
     "LINE",
     "O/U",
 }
-TEAM_NAME_TO_ABBR = {
-    "angels": "LAA",
-    "astros": "HOU",
-    "athletics": "ATH",
-    "blue jays": "TOR",
-    "braves": "ATL",
-    "brewers": "MIL",
-    "cardinals": "STL",
-    "cubs": "CHC",
-    "diamondbacks": "ARI",
-    "dodgers": "LAD",
-    "giants": "SF",
-    "guardians": "CLE",
-    "mariners": "SEA",
-    "marlins": "MIA",
-    "mets": "NYM",
-    "nationals": "WSH",
-    "orioles": "BAL",
-    "padres": "SD",
-    "phillies": "PHI",
-    "pirates": "PIT",
-    "rangers": "TEX",
-    "rays": "TB",
-    "reds": "CIN",
-    "red sox": "BOS",
-    "rockies": "COL",
-    "royals": "KC",
-    "tigers": "DET",
-    "twins": "MIN",
-    "white sox": "CWS",
-    "yankees": "NYY",
-}
-ABBR_TO_CANONICAL = {
-    "ARI": "ARIZONA DIAMONDBACKS",
-    "ATL": "ATLANTA BRAVES",
-    "BAL": "BALTIMORE ORIOLES",
-    "BOS": "BOSTON RED SOX",
-    "CHC": "CHICAGO CUBS",
-    "CWS": "CHICAGO WHITE SOX",
-    "CIN": "CINCINNATI REDS",
-    "CLE": "CLEVELAND GUARDIANS",
-    "COL": "COLORADO ROCKIES",
-    "DET": "DETROIT TIGERS",
-    "HOU": "HOUSTON ASTROS",
-    "KC": "KANSAS CITY ROYALS",
-    "LAA": "LOS ANGELES ANGELS",
-    "LAD": "LOS ANGELES DODGERS",
-    "MIA": "MIAMI MARLINS",
-    "MIL": "MILWAUKEE BREWERS",
-    "MIN": "MINNESOTA TWINS",
-    "NYM": "NEW YORK METS",
-    "NYY": "NEW YORK YANKEES",
-    "ATH": "OAKLAND ATHLETICS",
-    "PHI": "PHILADELPHIA PHILLIES",
-    "PIT": "PITTSBURGH PIRATES",
-    "SD": "SAN DIEGO PADRES",
-    "SF": "SAN FRANCISCO GIANTS",
-    "SFG": "SAN FRANCISCO GIANTS",
-    "SEA": "SEATTLE MARINERS",
-    "STL": "ST. LOUIS CARDINALS",
-    "TB": "TAMPA BAY RAYS",
-    "TBR": "TAMPA BAY RAYS",
-    "TEX": "TEXAS RANGERS",
-    "TOR": "TORONTO BLUE JAYS",
-    "WSH": "WASHINGTON NATIONALS",
-}
-NAME_TO_CANONICAL = {
-    "ARIZONA DIAMONDBACKS": "ARIZONA DIAMONDBACKS",
-    "ATLANTA BRAVES": "ATLANTA BRAVES",
-    "BALTIMORE ORIOLES": "BALTIMORE ORIOLES",
-    "BOSTON RED SOX": "BOSTON RED SOX",
-    "CHICAGO CUBS": "CHICAGO CUBS",
-    "CHICAGO WHITE SOX": "CHICAGO WHITE SOX",
-    "CINCINNATI REDS": "CINCINNATI REDS",
-    "CLEVELAND GUARDIANS": "CLEVELAND GUARDIANS",
-    "COLORADO ROCKIES": "COLORADO ROCKIES",
-    "DETROIT TIGERS": "DETROIT TIGERS",
-    "HOUSTON ASTROS": "HOUSTON ASTROS",
-    "KANSAS CITY ROYALS": "KANSAS CITY ROYALS",
-    "LOS ANGELES ANGELS": "LOS ANGELES ANGELS",
-    "LOS ANGELES DODGERS": "LOS ANGELES DODGERS",
-    "MIAMI MARLINS": "MIAMI MARLINS",
-    "MILWAUKEE BREWERS": "MILWAUKEE BREWERS",
-    "MINNESOTA TWINS": "MINNESOTA TWINS",
-    "NEW YORK METS": "NEW YORK METS",
-    "NEW YORK YANKEES": "NEW YORK YANKEES",
-    "OAKLAND ATHLETICS": "OAKLAND ATHLETICS",
-    "PHILADELPHIA PHILLIES": "PHILADELPHIA PHILLIES",
-    "PITTSBURGH PIRATES": "PITTSBURGH PIRATES",
-    "SAN DIEGO PADRES": "SAN DIEGO PADRES",
-    "SAN FRANCISCO GIANTS": "SAN FRANCISCO GIANTS",
-    "SEATTLE MARINERS": "SEATTLE MARINERS",
-    "ST. LOUIS CARDINALS": "ST. LOUIS CARDINALS",
-    "ST LOUIS CARDINALS": "ST. LOUIS CARDINALS",
-    "TAMPA BAY RAYS": "TAMPA BAY RAYS",
-    "TEXAS RANGERS": "TEXAS RANGERS",
-    "TORONTO BLUE JAYS": "TORONTO BLUE JAYS",
-    "WASHINGTON NATIONALS": "WASHINGTON NATIONALS",
-}
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Scrape projected lineups for live hit props.")
-    p.add_argument("--season", type=int, required=True)
-    p.add_argument("--date", required=True, help="YYYY-MM-DD")
-    p.add_argument("--config", type=Path, default=Path("configs/project.yaml"))
-    return p.parse_args()
-
-
-def _pick(cols: list[str], candidates: list[str]) -> str | None:
-    cset = set(cols)
-    for c in candidates:
-        if c in cset:
-            return c
-    return None
-
-
-def _norm_name(series: pd.Series) -> pd.Series:
-    return (
-        series.fillna("")
-        .astype(str)
-        .str.lower()
-        .str.replace(r"[^a-z0-9 ]+", "", regex=True)
-        .str.replace(r"\s+", " ", regex=True)
-        .str.strip()
-    )
-
 
 def _clean_player_name(text: str) -> str:
-    s = str(text or "").strip()
-    s = re.sub(r"^\s*NONE\s+", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"^\s*\d{1,2}\s+", "", s)
-    s = re.sub(r"^\s*(C|1B|2B|3B|SS|LF|CF|RF|DH|SP|RP)\s+", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
+    text = text.replace("NONE", "").strip()
+    parts = text.split()
+    if parts and parts[0].isdigit():
+        parts = parts[1:]
+    if parts and parts[0] in POS_SET:
+        parts = parts[1:]
+    return " ".join(parts).strip()
 
 def _is_bad_name(name: str) -> bool:
-    low = name.lower().strip()
-    if not low:
-        return True
-    if low in {x.lower() for x in LINEUP_START_TOKENS}:
-        return True
-    if any(x in low for x in UI_BLOCKLIST):
+    if not name:
         return True
     if "lineup" in low:
         return True
@@ -342,8 +192,6 @@ def _parse_side_tokens(tokens: list[str], team: str) -> list[dict[str, object]]:
 
         if tok in POS_SET:
             pos = tok
-            player_name = None
-            bats = None
 
             j = i + 1
             while j < len(tokens):
@@ -365,29 +213,24 @@ def _parse_side_tokens(tokens: list[str], team: str) -> list[dict[str, object]]:
                 player_name = _clean_player_name(nxt)
                 break
 
-            if player_name and not _is_bad_name(player_name):
-                k = j + 1
-                while k < len(tokens):
-                    nxt2 = tokens[k].strip()
-                    if not nxt2:
-                        k += 1
-                        continue
-                    if nxt2 in HAND_SET:
-                        bats = nxt2
-                    break
+            name = _clean_player_name(tokens[i + 1])
 
-                rows.append(
-                    {
-                        "batter_team": team,
-                        "player_name": player_name,
-                        "lineup_slot": len(rows) + 1,
-                        "position": pos,
-                        "bats": bats,
-                    }
-                )
+            bats = None
+            if i + 2 < len(tokens) and tokens[i + 2] in HAND_SET:
+                bats = tokens[i + 2]
 
-                if len(rows) >= 9:
-                    break
+            if not _is_bad_name(name):
+                rows.append({
+                    "batter_team": team,
+                    "player_name": name,
+                    "lineup_slot": slot,
+                    "position": pos,
+                    "bats": bats,
+                })
+                slot += 1
+
+            i += 3
+            continue
 
         i += 1
 
