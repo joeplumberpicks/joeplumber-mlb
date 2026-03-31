@@ -556,8 +556,8 @@ def main() -> None:
     config = load_config(config_path)
     dirs = resolve_data_dirs(config=config, prefer_drive=True)
 
-    configure_logging(dirs["logs_dir"] / "build_projected_lineups.log")
-    log_header("scripts/live/build_projected_lineups.py", repo_root, config_path, dirs)
+    configure_logging(dirs["logs_dir"] / "build_live_lineups.log")
+    log_header("scripts/live/build_live_lineups.py", repo_root, config_path, dirs)
 
     spine_path = dirs["processed_dir"] / "live" / f"model_spine_game_{args.season}_{args.date}.parquet"
     if not spine_path.exists():
