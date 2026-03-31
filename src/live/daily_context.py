@@ -32,6 +32,103 @@ def _run_cmd(cmd: list[str], repo_root: Path, *, raise_on_error: bool = True) ->
     return True
 
 
+def _lineup_output_stats(projected_lineups_path: Path) -> tuple[bool, int, int]:
+    if not projected_lineups_path.exists():
+        return False, 0, 0
+    try:
+        lu = pd.read_parquet(projected_lineups_path)
+    except Exception:
+        logging.exception("Failed reading projected lineup parquet: %s", projected_lineups_path)
+        return False, 0, 0
+    rows = int(len(lu))
+    if rows == 0:
+        return False, 0, 0
+    team_col = _pick(list(lu.columns), ["batter_team", "team", "team_abbrev", "batting_team"])
+    if team_col is None:
+        return True, rows, 0
+    teams = lu[team_col].dropna().astype(str).str.upper().str.strip()
+    return True, rows, int(teams.nunique())
+
+
+def _run_lineup_build_with_fallback(
+    *,
+    repo_root: Path,
+    config_path: Path,
+    season: int,
+    date_str: str,
+    projected_lineups_path: Path,
+    permissive_live_context: bool,
+) -> dict[str, object]:
+    attempts = [
+        ("scripts/live/build_live_lineups.py", "primary"),
+        ("scripts/live/build_projected_lineups_rotogrinders.py", "fallback"),
+    ]
+    errors: list[str] = []
+    last_rows = 0
+    last_teams = 0
+
+    for idx, (script_path, stage) in enumerate(attempts):
+        cmd = [
+            sys.executable,
+            script_path,
+            "--season",
+            str(season),
+            "--date",
+            date_str,
+            "--config",
+            str(config_path),
+        ]
+        if stage == "primary":
+            logging.info("projected lineup build: starting primary builder=%s", script_path)
+        else:
+            logging.info("projected lineup build: starting fallback builder=%s", script_path)
+
+        try:
+            _run_cmd(cmd, repo_root, raise_on_error=True)
+            exists, rows, teams = _lineup_output_stats(projected_lineups_path)
+            last_rows, last_teams = rows, teams
+            if exists:
+                logging.info(
+                    "projected lineup build: %s builder succeeded script=%s rows=%s unique_teams=%s",
+                    stage,
+                    script_path,
+                    rows,
+                    teams,
+                )
+                return {
+                    "lineup_builder_used": script_path,
+                    "lineup_rows": rows,
+                    "lineup_unique_teams": teams,
+                    "lineup_build_succeeded": True,
+                }
+            raise RuntimeError(
+                f"Projected lineup parquet missing or empty after {script_path}: {projected_lineups_path}"
+            )
+        except Exception as exc:
+            msg = f"{script_path} failed: {exc}"
+            errors.append(msg)
+            if idx + 1 < len(attempts):
+                logging.warning("projected lineup build: %s; trying fallback builder next", msg)
+            else:
+                logging.error("projected lineup build: fallback failed: %s", msg)
+
+    logging.error(
+        "projected lineup build failed for all builders permissive_live_context=%s path=%s errors=%s",
+        permissive_live_context,
+        projected_lineups_path,
+        errors,
+    )
+    if not permissive_live_context:
+        raise RuntimeError("Projected lineup build failed for all builders: " + " | ".join(errors))
+    logging.warning("permissive_live_context=True so continuing after projected lineup build failure")
+    return {
+        "lineup_builder_used": None,
+        "lineup_rows": last_rows,
+        "lineup_unique_teams": last_teams,
+        "lineup_build_succeeded": False,
+    }
+
+
 def resolve_live_paths(*, config: dict, season: int, date_str: str) -> dict[str, Path]:
     dirs = resolve_data_dirs(config=config, prefer_drive=True)
     return {
@@ -96,19 +193,21 @@ def run_live_preflight(
         _run_cmd(spine_cmd, repo_root)
 
         if build_lineups:
-            _run_cmd(
-                [
-                    sys.executable,
-                    "scripts/live/build_live_lineups.py",
-                    "--season",
-                    str(season),
-                    "--date",
-                    date_str,
-                    "--config",
-                    str(config_path),
-                ],
-                repo_root,
-                raise_on_error=not permissive_live_context,
+            lineup_meta = _run_lineup_build_with_fallback(
+                repo_root=repo_root,
+                config_path=config_path,
+                season=season,
+                date_str=date_str,
+                projected_lineups_path=paths["projected_lineups_path"],
+                permissive_live_context=permissive_live_context,
+            )
+            logging.info(
+                "projected lineup parquet final path=%s rows=%s unique_teams=%s builder=%s succeeded=%s",
+                paths["projected_lineups_path"],
+                lineup_meta.get("lineup_rows", 0),
+                lineup_meta.get("lineup_unique_teams", 0),
+                lineup_meta.get("lineup_builder_used"),
+                lineup_meta.get("lineup_build_succeeded", False),
             )
 
         if build_weather:
@@ -128,6 +227,8 @@ def run_live_preflight(
             )
 
     out = dict(paths)
+    if auto_build and build_lineups:
+        out.update(lineup_meta)
     for key, p in paths.items():
         out[f"{key}_exists"] = p.exists()
     return out
