@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -64,10 +64,12 @@ TEAM_ALIASES = {
 
 VALID_POSITIONS = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "DH", "OF"}
 
-SLOT_RE = re.compile(r"^\*?\s*(\d)\s*$")
-TIME_RE = re.compile(r"^\*?\s*\d{1,2}:\d{2}\s*[AP]M\s*ET\s*$", flags=re.IGNORECASE)
 BATS_RE = re.compile(r"^\((L|R|S)\)$", flags=re.IGNORECASE)
-WEATHER_RE = re.compile(r"(mph|humidity|forecast|precipitation|°)", flags=re.IGNORECASE)
+SLOT_RE = re.compile(r"^\d$")
+SALARY_RE = re.compile(r"^\$\d")
+OWN_RE = re.compile(r"^\d+(\.\d+)?%$")
+PROJ_RE = re.compile(r"^\d+(\.\d+)?$")
+TIME_RE = re.compile(r"\d{1,2}:\d{2}\s*[AP]M\s*ET", flags=re.IGNORECASE)
 
 
 def parse_args() -> argparse.Namespace:
@@ -116,10 +118,6 @@ def _to_canonical_team(team_token: object) -> str | None:
     if low in TEAM_ALIASES:
         return TEAM_ALIASES[low]
     return None
-
-
-def _looks_like_team(line: str) -> bool:
-    return _to_canonical_team(line) is not None
 
 
 def _build_team_game_map(spine: pd.DataFrame) -> pd.DataFrame:
@@ -217,130 +215,136 @@ def _load_html(url: str, html_path: Path | None) -> str:
 def _extract_visible_lines(html: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     lines: list[str] = []
-
     for s in soup.stripped_strings:
         t = _normalize_text(s)
-        if not t:
-            continue
-        lines.append(t)
-
+        if t:
+            lines.append(t)
     return lines
 
 
-def _find_nearest_teams(lines: list[str], idx: int) -> tuple[str | None, str | None]:
-    """
-    Search around a game block timestamp to find the two nearest team names.
-    """
-    window_start = max(0, idx - 120)
-    window_end = min(len(lines), idx + 120)
+def _find_game_blocks(lines: list[str]) -> list[tuple[int, int]]:
+    idxs = [i for i, t in enumerate(lines) if TIME_RE.search(t)]
+    blocks: list[tuple[int, int]] = []
+    for n, start in enumerate(idxs):
+        end = idxs[n + 1] if n + 1 < len(idxs) else len(lines)
+        blocks.append((start, end))
+    return blocks
 
-    found: list[str] = []
-    for j in range(window_start, window_end):
-        team = _to_canonical_team(lines[j])
-        if team is not None and team not in found:
-            found.append(team)
-        if len(found) == 2:
-            return found[0], found[1]
 
-    return None, None
+def _find_teams_in_block(block: list[str]) -> list[str]:
+    teams: list[str] = []
+    for tok in block:
+        team = _to_canonical_team(tok)
+        if team and team not in teams:
+            teams.append(team)
+        if len(teams) == 2:
+            break
+    return teams
+
+
+def _parse_team_lineup(team: str, tokens: list[str], default_status: str) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    status = default_status
+    i = 0
+
+    while i < len(tokens):
+        tok = tokens[i]
+        low = tok.lower()
+
+        if "lineup not released" in low:
+            status = "projected"
+            i += 1
+            continue
+
+        if SLOT_RE.fullmatch(tok):
+            slot = int(tok)
+
+            if i + 3 < len(tokens):
+                name = _normalize_text(tokens[i + 1])
+                bats_tok = _normalize_text(tokens[i + 2])
+                pos_tok = _normalize_text(tokens[i + 3])
+
+                bats_m = BATS_RE.fullmatch(bats_tok)
+                pos = pos_tok.upper().split("/")[0]
+
+                if bats_m and pos in VALID_POSITIONS:
+                    rows.append(
+                        {
+                            "canonical_team": team,
+                            "player_name": name,
+                            "lineup_slot": slot,
+                            "position": pos,
+                            "bats": bats_m.group(1).upper(),
+                            "lineup_status": status,
+                            "source_text": f"{tok} {name} {bats_tok} {pos_tok}",
+                        }
+                    )
+                    i += 4
+                    continue
+        i += 1
+
+    return rows
+
+
+def _split_block_into_team_sections(block: list[str], teams: list[str]) -> dict[str, list[str]]:
+    if len(teams) != 2:
+        return {}
+
+    # find first occurrence of each team token in block
+    positions = []
+    for team in teams:
+        pos = None
+        for i, tok in enumerate(block):
+            if _to_canonical_team(tok) == team:
+                pos = i
+                break
+        positions.append(pos)
+
+    if positions[0] is None or positions[1] is None:
+        return {}
+
+    # order by appearance
+    ordered = sorted(zip(teams, positions), key=lambda x: x[1])
+    (team_a, pos_a), (team_b, pos_b) = ordered
+
+    return {
+        team_a: block[pos_a:pos_b],
+        team_b: block[pos_b:],
+    }
 
 
 def _parse_rotogrinders_lines(lines: list[str]) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     diagnostics: list[dict[str, object]] = []
 
-    i = 0
-    while i < len(lines):
-        if not TIME_RE.match(lines[i]):
-            i += 1
+    for start, end in _find_game_blocks(lines):
+        block = lines[start:end]
+        teams = _find_teams_in_block(block)
+        if len(teams) != 2:
+            diagnostics.append({"time": lines[start], "reason": "team_detect_failed", "teams": teams})
             continue
 
-        away_team, home_team = _find_nearest_teams(lines, i)
-        if away_team is None or home_team is None:
-            i += 1
+        sections = _split_block_into_team_sections(block, teams)
+        if len(sections) != 2:
+            diagnostics.append({"time": lines[start], "reason": "team_section_split_failed", "teams": teams})
             continue
 
         game_rows = 0
-        current_team = away_team
-        current_status = "confirmed"
-        seen_slots_by_team = {
-            away_team: set(),
-            home_team: set(),
-        }
-
-        k = i + 1
-        while k < len(lines):
-            token = lines[k]
-
-            if k > i + 1 and TIME_RE.match(token):
-                break
-
-            low = token.lower()
-
-            if "lineup not released" in low:
-                current_status = "projected"
-                k += 1
-                continue
-
-            if WEATHER_RE.search(token) or "o/u" in low or "view forecast" in low:
-                k += 1
-                continue
-
-            # Slot token
-            slot_match = SLOT_RE.match(token)
-            if slot_match:
-                slot = int(slot_match.group(1))
-
-                # Expected token sequence:
-                # slot / name / (L|R|S) / POS / ...
-                if k + 3 < len(lines):
-                    name = _normalize_text(lines[k + 1])
-                    bats_token = _normalize_text(lines[k + 2])
-                    pos_token = _normalize_text(lines[k + 3])
-
-                    bats_match = BATS_RE.fullmatch(bats_token)
-                    if bats_match:
-                        bats = bats_match.group(1).upper()
-                        pos = pos_token.upper().split("/")[0]
-
-                        if pos in VALID_POSITIONS:
-                            # Once away side already has this slot, switch to home side
-                            if slot in seen_slots_by_team[current_team]:
-                                if current_team == away_team:
-                                    current_team = home_team
-                                    current_status = "confirmed"
-
-                            rows.append(
-                                {
-                                    "canonical_team": current_team,
-                                    "player_name": name,
-                                    "lineup_slot": slot,
-                                    "position": pos,
-                                    "bats": bats,
-                                    "lineup_status": current_status,
-                                    "source_text": f"{name} {bats_token} {pos_token}",
-                                }
-                            )
-                            seen_slots_by_team[current_team].add(slot)
-                            game_rows += 1
-                            k += 4
-                            continue
-
-            k += 1
+        for team in teams:
+            team_rows = _parse_team_lineup(team, sections[team], default_status="confirmed")
+            rows.extend(team_rows)
+            game_rows += len(team_rows)
 
         diagnostics.append(
             {
-                "time": lines[i],
-                "away_team": away_team,
-                "home_team": home_team,
+                "time": lines[start],
+                "teams": teams,
                 "rows": game_rows,
-                "away_slots": sorted(seen_slots_by_team[away_team]),
-                "home_slots": sorted(seen_slots_by_team[home_team]),
+                "rows_by_team": {t: len([r for r in rows if r["canonical_team"] == t]) for t in teams},
             }
         )
-        i = k
 
-    logging.info("rotogrinders parse diagnostics=%s", diagnostics)
+    logging.info("rotogrinders parse diagnostics=%s", diagnostics[:20])
     return pd.DataFrame(rows)
 
 
