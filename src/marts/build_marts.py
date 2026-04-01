@@ -85,6 +85,49 @@ def _existing_rows(path: Path) -> int:
         return 0
 
 
+def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _derive_moneyline_targets_from_games(processed_dir: Path, season: int) -> pd.DataFrame:
+    games_path = processed_dir / "by_season" / f"games_{season}.parquet"
+    if not games_path.exists():
+        logging.warning("moneyline missing target file and missing games source for derivation path=%s", games_path)
+        return pd.DataFrame()
+
+    games = read_parquet(games_path)
+    if games.empty:
+        logging.warning("moneyline derivation skipped: games source empty path=%s", games_path)
+        return pd.DataFrame()
+
+    home_col = _pick_col(games, ["home_score", "home_final_score", "home_runs", "post_home_score", "final_home_score"])
+    away_col = _pick_col(games, ["away_score", "away_final_score", "away_runs", "post_away_score", "final_away_score"])
+    if home_col is None or away_col is None:
+        logging.warning("moneyline derivation skipped: score columns missing in games path=%s cols=%s", games_path, sorted(games.columns))
+        return pd.DataFrame()
+
+    out = games[[c for c in ["game_pk", "game_date", "home_team", "away_team"] if c in games.columns]].copy()
+    out["game_pk"] = pd.to_numeric(out.get("game_pk"), errors="coerce").astype("Int64")
+    hs = pd.to_numeric(games[home_col], errors="coerce")
+    aw = pd.to_numeric(games[away_col], errors="coerce")
+    out["target_home_win"] = pd.NA
+    out.loc[hs > aw, "target_home_win"] = 1
+    out.loc[hs < aw, "target_home_win"] = 0
+    out["target_home_win"] = pd.to_numeric(out["target_home_win"], errors="coerce").astype("Int64")
+    out = out.drop_duplicates(subset=["game_pk"], keep="last")
+    out = out.dropna(subset=["target_home_win"]).copy()
+    logging.info(
+        "moneyline missing target file -> deriving from game scores season=%s source_rows=%s derived_rows=%s",
+        season,
+        len(games),
+        len(out),
+    )
+    return out
+
+
 def _game_level_rollups(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     if df.empty or "game_pk" not in df.columns:
         return pd.DataFrame(columns=["game_pk"])
@@ -143,7 +186,10 @@ def _load_moneyline_targets(dirs: dict[str, Path], season: int | None) -> pd.Dat
 def _merge_moneyline_targets(mart_df: pd.DataFrame, processed_dir: Path, season: int | None) -> pd.DataFrame:
     out = mart_df.copy()
     targets = _load_moneyline_targets({"processed_dir": processed_dir}, season)
+    if (targets is None or targets.empty) and season is not None:
+        targets = _derive_moneyline_targets_from_games(processed_dir, season)
     if targets is None or targets.empty:
+        logging.warning("moneyline target source rows=0 season=%s", season)
         return out
 
     slim = targets[["game_pk", "target_home_win"]].copy()
@@ -151,6 +197,7 @@ def _merge_moneyline_targets(mart_df: pd.DataFrame, processed_dir: Path, season:
     slim["target_home_win"] = pd.to_numeric(slim["target_home_win"], errors="coerce").astype("Int64")
 
     out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
+    logging.info("moneyline source rows=%s unique_games=%s", len(out), int(out["game_pk"].nunique()) if "game_pk" in out.columns else 0)
     out = out.merge(slim.drop_duplicates(subset=["game_pk"], keep="last"), on="game_pk", how="left", suffixes=("", "_t"))
     if "target_home_win_t" in out.columns:
         out["target_home_win"] = pd.to_numeric(out.get("target_home_win"), errors="coerce").fillna(
@@ -317,6 +364,11 @@ def build_marts(
                         int(mart_df["game_pk"].nunique()) if "game_pk" in mart_df.columns else 0,
                         float(mart_df["target_home_win"].isna().mean()) if len(mart_df) else 0.0,
                     )
+                logging.info(
+                    "moneyline final feature rows=%s unique_games=%s",
+                    len(mart_df),
+                    int(mart_df["game_pk"].nunique()) if "game_pk" in mart_df.columns and len(mart_df) else 0,
+                )
             elif filename == "nrfi_features.parquet":
                 nrfi_blocks = build_nrfi_feature_blocks(dirs, spine, season)
                 if not nrfi_blocks.empty:
@@ -441,7 +493,16 @@ def build_marts(
             continue
 
     if season is not None:
-        outputs["hitter_batter_features.parquet"] = build_hitter_batter_features(dirs, season)
-        outputs["pitcher_game_features.parquet"] = build_pitcher_game_features(dirs, season)
+        hitter_src = _mart_out_path(dirs["marts_dir"], "hitter_props_features.parquet", season)
+        if hitter_src.exists() and _existing_rows(hitter_src) > 0:
+            outputs["hitter_batter_features.parquet"] = build_hitter_batter_features(dirs, season)
+        else:
+            logging.warning("skipping hitter_batter_features: missing or empty source mart path=%s", hitter_src)
+
+        pitcher_src = _mart_out_path(dirs["marts_dir"], "pitcher_props_features.parquet", season)
+        if pitcher_src.exists() and _existing_rows(pitcher_src) > 0:
+            outputs["pitcher_game_features.parquet"] = build_pitcher_game_features(dirs, season)
+        else:
+            logging.warning("skipping pitcher_game_features: missing or empty source mart path=%s", pitcher_src)
 
     return outputs
