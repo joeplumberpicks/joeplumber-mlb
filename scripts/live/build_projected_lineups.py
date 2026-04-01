@@ -1,25 +1,75 @@
-import ipywidgets as widgets
-from IPython.display import display
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
 from pathlib import Path
 
-text_area = widgets.Textarea(
-    value="",
-    placeholder="Paste the full FanGraphs lineup text here...",
-    description="Paste:",
-    layout=widgets.Layout(width="100%", height="400px"),
-)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-button = widgets.Button(description="Save pasted text")
-output = widgets.Output()
+from src.utils.config import get_repo_root, load_config
+from src.utils.drive import resolve_data_dirs
 
-SAVE_PATH = Path("/content/fangraphs_pasted_lineups.txt")
 
-def on_click(_):
-    SAVE_PATH.write_text(text_area.value, encoding="utf-8")
-    with output:
-        output.clear_output()
-        print(f"Saved pasted text to: {SAVE_PATH}")
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Build canonical projected lineups artifact for same-day slate.")
+    p.add_argument("--season", type=int, required=True)
+    p.add_argument("--date", required=True, help="YYYY-MM-DD")
+    p.add_argument("--config", type=Path, default=Path("configs/project.yaml"))
+    p.add_argument("--source", choices=["rotogrinders", "fangraphs"], default="rotogrinders")
+    p.add_argument("--html-path", type=Path, default=None, help="Optional local HTML snapshot.")
+    p.add_argument("--url", default=None, help="Optional override URL for rotogrinders source.")
+    return p.parse_args()
 
-button.on_click(on_click)
 
-display(text_area, button, output)
+def main() -> None:
+    args = parse_args()
+    repo_root = get_repo_root()
+    config_path = (repo_root / args.config).resolve() if not args.config.is_absolute() else args.config.resolve()
+    config = load_config(config_path)
+    dirs = resolve_data_dirs(config=config, prefer_drive=True)
+
+    if args.source == "rotogrinders":
+        cmd = [
+            sys.executable,
+            "scripts/live/build_projected_lineups_rotogrinders.py",
+            "--season",
+            str(args.season),
+            "--date",
+            args.date,
+            "--config",
+            str(config_path),
+        ]
+        if args.html_path is not None:
+            cmd.extend(["--html-path", str(args.html_path)])
+        if args.url is not None:
+            cmd.extend(["--url", str(args.url)])
+    else:
+        if args.html_path is None:
+            raise ValueError("--html-path is required when --source=fangraphs")
+        cmd = [
+            sys.executable,
+            "scripts/live/build_projected_lineups_fangraphs.py",
+            "--season",
+            str(args.season),
+            "--date",
+            args.date,
+            "--config",
+            str(config_path),
+            "--html-path",
+            str(args.html_path),
+        ]
+
+    print(f"Running: {' '.join(cmd)}")
+    proc = subprocess.run(cmd, cwd=str(repo_root), check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Projected lineup build failed (exit={proc.returncode}): {' '.join(cmd)}")
+
+    out_path = dirs["processed_dir"] / "live" / f"projected_lineups_{args.season}_{args.date}.parquet"
+    print(f"canonical_projected_lineups_out={out_path}")
+
+
+if __name__ == "__main__":
+    main()

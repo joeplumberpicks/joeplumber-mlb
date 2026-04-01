@@ -445,7 +445,7 @@ def main() -> None:
         int(out["game_pk"].nunique()),
         out_path,
     )
-    print(f"projected_lineups_out={out_path}")
+    print(f"canonical_projected_lineups_out={out_path}")
 
 
 if __name__ == "__main__":

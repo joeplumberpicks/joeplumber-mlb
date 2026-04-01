@@ -35,6 +35,31 @@ def _to_nullable_int(series: pd.Series) -> pd.Series:
     except (TypeError, ValueError):
         return s
 
+
+def _load_weather_coverage(weather_path: Path) -> pd.DataFrame:
+    if not weather_path.exists():
+        return pd.DataFrame(columns=["game_pk", "has_weather"])
+    wx = read_parquet(weather_path).copy()
+    if wx.empty or "game_pk" not in wx.columns:
+        return pd.DataFrame(columns=["game_pk", "has_weather"])
+    wx["game_pk"] = _to_nullable_int(wx["game_pk"])
+    wx = wx.dropna(subset=["game_pk"]).drop_duplicates(subset=["game_pk"], keep="last")
+    wx["has_weather"] = True
+    return wx[["game_pk", "has_weather"]]
+
+
+def _load_lineup_coverage(lineup_path: Path) -> pd.DataFrame:
+    if not lineup_path.exists():
+        return pd.DataFrame(columns=["game_pk", "has_projected_lineups"])
+    lu = read_parquet(lineup_path).copy()
+    if lu.empty or "game_pk" not in lu.columns:
+        return pd.DataFrame(columns=["game_pk", "has_projected_lineups"])
+    lu["game_pk"] = _to_nullable_int(lu["game_pk"])
+    lu = lu.dropna(subset=["game_pk"]).copy()
+    lineup_cnt = lu.groupby("game_pk", as_index=False).size().rename(columns={"size": "projected_lineup_rows"})
+    lineup_cnt["has_projected_lineups"] = lineup_cnt["projected_lineup_rows"] >= 7
+    return lineup_cnt[["game_pk", "has_projected_lineups", "projected_lineup_rows"]]
+
 def main() -> None:
     args = parse_args()
     repo_root = get_repo_root()
@@ -49,6 +74,8 @@ def main() -> None:
     date_scoped_in_path = dirs["raw_dir"] / "live" / f"games_schedule_{args.season}_{args.date}.parquet"
     cumulative_in_path = dirs["raw_dir"] / "live" / f"games_schedule_{args.season}.parquet"
     out_path = dirs["processed_dir"] / "live" / f"model_spine_game_{args.season}_{args.date}.parquet"
+    weather_path = dirs["processed_dir"] / "live" / f"weather_game_{args.season}_{args.date}.parquet"
+    projected_lineups_path = dirs["processed_dir"] / "live" / f"projected_lineups_{args.season}_{args.date}.parquet"
 
     if out_path.exists() and not args.force:
         raise FileExistsError(f"Output already exists (use --force): {out_path}")
@@ -101,19 +128,29 @@ def main() -> None:
     out["season"] = out["season"].astype("int64")
     out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce")
 
+    weather_cov = _load_weather_coverage(weather_path)
+    lineup_cov = _load_lineup_coverage(projected_lineups_path)
+    out = out.merge(weather_cov, on="game_pk", how="left")
+    out = out.merge(lineup_cov, on="game_pk", how="left")
+    out["has_weather"] = out.get("has_weather", False).fillna(False).astype(bool)
+    out["has_projected_lineups"] = out.get("has_projected_lineups", False).fillna(False).astype(bool)
+    out["projected_lineup_rows"] = pd.to_numeric(out.get("projected_lineup_rows"), errors="coerce").fillna(0).astype(int)
+
     write_parquet(out, out_path)
     home_present = int(out["home_sp_id"].notna().sum()) if len(out) else 0
     away_present = int(out["away_sp_id"].notna().sum()) if len(out) else 0
     home_pct = (home_present / len(out) * 100.0) if len(out) else 0.0
     away_pct = (away_present / len(out) * 100.0) if len(out) else 0.0
     logging.info(
-        "live schedule spine rows=%s out=%s home_sp_id_present=%s (%.2f%%) away_sp_id_present=%s (%.2f%%)",
+        "live schedule spine rows=%s out=%s home_sp_id_present=%s (%.2f%%) away_sp_id_present=%s (%.2f%%) weather_games=%s lineup_games=%s",
         len(out),
         out_path,
         home_present,
         home_pct,
         away_present,
         away_pct,
+        int(out["has_weather"].sum()),
+        int(out["has_projected_lineups"].sum()),
     )
     print(f"Row count [model_spine_game_{args.season}_{args.date}]: {len(out):,}")
     print(f"Writing to: {out_path.resolve()}")

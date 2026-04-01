@@ -22,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.utils.config import get_repo_root, load_config
 from src.utils.drive import resolve_data_dirs
+from src.live.daily_context import load_live_lineups, load_live_spine, load_live_weather, resolve_live_paths, run_live_preflight
 from src.utils.logging import configure_logging, log_header
 
 DRIVE_ROOT = Path("/content/drive/MyDrive/joeplumber-mlb")
@@ -44,10 +45,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run daily NRFI/YRFI v1.0 predictions and public picks.")
     parser.add_argument("--date", required=True, help="Scoring date in YYYY-MM-DD")
     parser.add_argument("--season", type=int, default=None)
-    parser.add_argument("--auto-build", action="store_true")
+    parser.add_argument("--auto-build", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--min-grade", default="A-")
     parser.add_argument("--config", type=Path, default=Path("configs/project.yaml"))
+    parser.add_argument("--skip-lineups", action="store_true")
+    parser.add_argument("--skip-weather", action="store_true")
+    parser.add_argument("--permissive-live-context", action="store_true")
+    parser.add_argument("--board-top", type=int, default=15)
     return parser.parse_args()
 
 
@@ -132,6 +137,24 @@ def main() -> None:
     dirs = resolve_data_dirs(config=config, prefer_drive=True)
     configure_logging(dirs["logs_dir"] / "run_daily_nrfi_v1.log")
     log_header("scripts/live/run_daily_nrfi_v1.py", repo_root, config_path, dirs)
+    preflight = run_live_preflight(
+        repo_root=repo_root,
+        config_path=config_path,
+        season=season,
+        date_str=args.date,
+        auto_build=bool(args.auto_build),
+        force_spine=True,
+        build_lineups=not args.skip_lineups,
+        build_weather=not args.skip_weather,
+        permissive_live_context=bool(args.permissive_live_context),
+    )
+    live_paths = resolve_live_paths(config=config, season=season, date_str=args.date)
+    live_spine = load_live_spine(live_paths["live_spine_path"])
+    live_game_pks = set(pd.to_numeric(live_spine["game_pk"], errors="coerce").dropna().astype(int).tolist())
+    if not args.skip_weather:
+        _ = load_live_weather(config=config, season=season, date_str=args.date)
+    if not args.skip_lineups:
+        _ = load_live_lineups(config=config, season=season, date_str=args.date)
 
     release_dir = DRIVE_ROOT / "data/models/nrfi_xgb/releases/v1.0"
     nrfi_model_path = release_dir / "nrfi_model.json"
@@ -173,6 +196,9 @@ def main() -> None:
     df = df.copy()
     df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
     daily = df[df["game_date"].dt.date == run_date.date()].copy()
+    if live_game_pks:
+        daily["game_pk"] = pd.to_numeric(daily.get("game_pk"), errors="coerce").astype("Int64")
+        daily = daily[daily["game_pk"].isin(list(live_game_pks))].copy()
 
     if daily.empty:
         logging.error("No games found for date=%s in mart=%s", args.date, mart_path)
@@ -257,15 +283,17 @@ def main() -> None:
     ledger.to_csv(ledger_path, index=False)
 
     logging.info(
-        "NRFI v1.0 daily run complete | date=%s season=%s rows=%s daily_csv=%s public_csv=%s a_tier_csv=%s ledger=%s a_tier_count=%s",
+        "NRFI v1.0 daily run complete | date=%s season=%s rows=%s slate_games=%s daily_csv=%s public_csv=%s a_tier_csv=%s ledger=%s a_tier_count=%s preflight_spine_rows=%s",
         args.date,
         season,
         len(daily_out_df),
+        len(live_game_pks),
         daily_out,
         public_out,
         a_tier_out,
         ledger_path,
         len(a_tier_df),
+        preflight.get("final_game_spine_row_count"),
     )
 
     print(f"date={args.date}")

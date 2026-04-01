@@ -18,7 +18,7 @@ from src.utils.logging import configure_logging, log_header
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Build date-scoped live weather for hit props.")
+    p = argparse.ArgumentParser(description="Build canonical date-scoped live weather artifact for game-level daily engines.")
     p.add_argument("--season", type=int, required=True)
     p.add_argument("--date", required=True, help="YYYY-MM-DD")
     p.add_argument("--config", type=Path, default=Path("configs/project.yaml"))
@@ -41,8 +41,8 @@ def main() -> None:
     norm_df = normalize_weather_frame(raw_df, fallback_season=args.season)
     processed_live_out = dirs["processed_dir"] / "live" / f"weather_game_{args.season}_{args.date}.parquet"
     write_parquet(norm_df, processed_live_out)
-    print(f"Row count [weather_game_{args.season}_{args.date}_processed]: {len(norm_df):,}")
-    print(f"Writing to: {processed_live_out.resolve()}")
+    print(f"Row count [weather_game_{args.season}_{args.date}_processed_live]: {len(norm_df):,}")
+    print(f"canonical_weather_out={processed_live_out.resolve()}")
 
     if not args.skip_master:
         master_path, _ = build_weather_game_table(

@@ -60,7 +60,7 @@ def _run_lineup_build_with_fallback(
     permissive_live_context: bool,
 ) -> dict[str, object]:
     attempts = [
-        ("scripts/live/build_live_lineups.py", "primary"),
+        ("scripts/live/build_projected_lineups.py", "primary"),
         ("scripts/live/build_projected_lineups_rotogrinders.py", "fallback"),
     ]
     errors: list[str] = []
@@ -137,11 +137,44 @@ def resolve_live_paths(*, config: dict, season: int, date_str: str) -> dict[str,
         "confirmed_lineups_path": dirs["processed_dir"] / "live" / f"confirmed_lineups_{season}_{date_str}.parquet",
         "live_lineups_path": dirs["processed_dir"] / "live" / f"lineups_{season}_{date_str}.parquet",
         "live_weather_path": dirs["processed_dir"] / "live" / f"weather_game_{season}_{date_str}.parquet",
-        "raw_live_weather_path": dirs["raw_dir"] / "live" / f"weather_game_{season}_{date_str}.parquet",
-        "processed_weather_fallback_path": dirs["processed_dir"] / "weather_game.parquet",
         "live_schedule_path": dirs["raw_dir"] / "live" / f"games_schedule_{season}_{date_str}.parquet",
         "live_schedule_cumulative_path": dirs["raw_dir"] / "live" / f"games_schedule_{season}.parquet",
     }
+
+
+def _coverage_pct(numer: int, denom: int) -> float:
+    if denom <= 0:
+        return 0.0
+    return float(numer / denom * 100.0)
+
+
+def validate_live_context(*, live_spine_path: Path) -> dict[str, float | int]:
+    spine = load_live_spine(live_spine_path)
+    n = int(len(spine))
+    if n == 0:
+        return {
+            "slate_game_count": 0,
+            "home_starter_coverage_pct": 0.0,
+            "away_starter_coverage_pct": 0.0,
+            "projected_lineup_coverage_pct": 0.0,
+            "weather_coverage_pct": 0.0,
+            "final_game_spine_row_count": 0,
+        }
+
+    home_sp = pd.to_numeric(spine.get("home_sp_id"), errors="coerce")
+    away_sp = pd.to_numeric(spine.get("away_sp_id"), errors="coerce")
+    has_lineups = _to_series(spine.get("has_projected_lineups", False), spine.index).fillna(False).astype(bool)
+    has_weather = _to_series(spine.get("has_weather", False), spine.index).fillna(False).astype(bool)
+
+    summary = {
+        "slate_game_count": n,
+        "home_starter_coverage_pct": _coverage_pct(int(home_sp.notna().sum()), n),
+        "away_starter_coverage_pct": _coverage_pct(int(away_sp.notna().sum()), n),
+        "projected_lineup_coverage_pct": _coverage_pct(int(has_lineups.sum()), n),
+        "weather_coverage_pct": _coverage_pct(int(has_weather.sum()), n),
+        "final_game_spine_row_count": n,
+    }
+    return summary
 
 
 def run_live_preflight(
@@ -161,7 +194,7 @@ def run_live_preflight(
     config = load_config(config_path)
     paths = resolve_live_paths(config=config, season=season, date_str=date_str)
 
-    if auto_build:
+    if auto_build and not paths["live_schedule_path"].exists():
         _run_cmd(
             [
                 sys.executable,
@@ -178,6 +211,38 @@ def run_live_preflight(
             repo_root,
         )
 
+    lineup_meta = {
+        "lineup_builder_used": None,
+        "lineup_rows": 0,
+        "lineup_unique_teams": 0,
+        "lineup_build_succeeded": paths["projected_lineups_path"].exists(),
+    }
+    if auto_build and build_lineups and not paths["projected_lineups_path"].exists():
+        lineup_meta = _run_lineup_build_with_fallback(
+            repo_root=repo_root,
+            config_path=config_path,
+            season=season,
+            date_str=date_str,
+            projected_lineups_path=paths["projected_lineups_path"],
+            permissive_live_context=permissive_live_context,
+        )
+    if auto_build and build_weather and not paths["live_weather_path"].exists():
+        _run_cmd(
+            [
+                sys.executable,
+                "scripts/live/build_live_weather.py",
+                "--season",
+                str(season),
+                "--date",
+                date_str,
+                "--config",
+                str(config_path),
+            ],
+            repo_root,
+            raise_on_error=not permissive_live_context,
+        )
+
+    if auto_build and (force_spine or not paths["live_spine_path"].exists()):
         spine_cmd = [
             sys.executable,
             "scripts/live/build_spine_from_schedule.py",
@@ -192,45 +257,31 @@ def run_live_preflight(
             spine_cmd.append("--force")
         _run_cmd(spine_cmd, repo_root)
 
-        if build_lineups:
-            lineup_meta = _run_lineup_build_with_fallback(
-                repo_root=repo_root,
-                config_path=config_path,
-                season=season,
-                date_str=date_str,
-                projected_lineups_path=paths["projected_lineups_path"],
-                permissive_live_context=permissive_live_context,
-            )
-            logging.info(
-                "projected lineup parquet final path=%s rows=%s unique_teams=%s builder=%s succeeded=%s",
-                paths["projected_lineups_path"],
-                lineup_meta.get("lineup_rows", 0),
-                lineup_meta.get("lineup_unique_teams", 0),
-                lineup_meta.get("lineup_builder_used"),
-                lineup_meta.get("lineup_build_succeeded", False),
-            )
-
-        if build_weather:
-            _run_cmd(
-                [
-                    sys.executable,
-                    "scripts/live/build_live_weather.py",
-                    "--season",
-                    str(season),
-                    "--date",
-                    date_str,
-                    "--config",
-                    str(config_path),
-                ],
-                repo_root,
-                raise_on_error=not permissive_live_context,
-            )
-
     out = dict(paths)
-    if auto_build and build_lineups:
-        out.update(lineup_meta)
+    out.update(lineup_meta)
     for key, p in paths.items():
         out[f"{key}_exists"] = p.exists()
+    if paths["live_spine_path"].exists():
+        validation = validate_live_context(live_spine_path=paths["live_spine_path"])
+        out.update(validation)
+        logging.info(
+            "Live context validation summary | slate_game_count=%s home_starter_coverage_pct=%.2f away_starter_coverage_pct=%.2f projected_lineup_coverage_pct=%.2f weather_coverage_pct=%.2f final_game_spine_row_count=%s",
+            validation["slate_game_count"],
+            validation["home_starter_coverage_pct"],
+            validation["away_starter_coverage_pct"],
+            validation["projected_lineup_coverage_pct"],
+            validation["weather_coverage_pct"],
+            validation["final_game_spine_row_count"],
+        )
+        print(
+            "live_preflight_validation "
+            f"slate_games={validation['slate_game_count']} "
+            f"home_starter_coverage_pct={validation['home_starter_coverage_pct']:.2f} "
+            f"away_starter_coverage_pct={validation['away_starter_coverage_pct']:.2f} "
+            f"projected_lineup_coverage_pct={validation['projected_lineup_coverage_pct']:.2f} "
+            f"weather_coverage_pct={validation['weather_coverage_pct']:.2f} "
+            f"final_spine_rows={validation['final_game_spine_row_count']}"
+        )
     return out
 
 
@@ -271,13 +322,7 @@ def load_live_weather(
     candidates: list[Path] = []
     if config is not None and season is not None and date_str is not None:
         paths = resolve_live_paths(config=config, season=season, date_str=date_str)
-        candidates.extend(
-            [
-                paths["live_weather_path"],
-                paths["raw_live_weather_path"],
-                paths["processed_weather_fallback_path"],
-            ]
-        )
+        candidates.append(paths["live_weather_path"])
     elif live_weather_path is not None:
         candidates.append(live_weather_path)
 
