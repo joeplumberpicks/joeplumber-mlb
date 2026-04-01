@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import logging
 import pandas as pd
 
 from src.utils.checks import print_rowcount
@@ -98,14 +99,31 @@ def ingest_statcast_pa(
     fetched_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=REQUIRED_COLUMNS)
     fetched_df = _normalize_columns(fetched_df)
 
-    if output_path.exists() and not force:
+    existing_df = pd.DataFrame(columns=REQUIRED_COLUMNS)
+    if output_path.exists():
         existing_df = _normalize_columns(read_parquet(output_path))
+
+    if fetched_df.empty and not existing_df.empty:
+        combined = existing_df.copy()
+        logging.info(
+            "season_ingest zero-row fetch; preserving existing season file path=%s existing_rows=%s",
+            output_path,
+            len(existing_df),
+        )
+    elif not existing_df.empty:
         combined = pd.concat([existing_df, fetched_df], ignore_index=True)
     else:
-        combined = fetched_df
+        combined = fetched_df.copy()
 
     combined = _dedupe_pa(combined)
     combined = combined[REQUIRED_COLUMNS + [c for c in combined.columns if c not in REQUIRED_COLUMNS]]
+    logging.info(
+        "season_ingest existing_rows=%s new_rows=%s final_rows=%s file=%s",
+        len(existing_df),
+        len(fetched_df),
+        len(combined),
+        output_path,
+    )
 
     print_rowcount(f"pa_{season}", combined)
     print(f"Writing to: {output_path.resolve()}")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -38,7 +39,10 @@ def main() -> None:
 
     build_marts(dirs, season=args.season, start=args.start, end=args.end)
     if args.season is not None:
-        build_hr_batter_features(dirs=dirs, season=args.season, start=args.start, end=args.end)
+        try:
+            build_hr_batter_features(dirs=dirs, season=args.season, start=args.start, end=args.end)
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("build_hr_batter_features failed; continuing season=%s reason=%s", args.season, exc)
 
 
 if __name__ == "__main__":

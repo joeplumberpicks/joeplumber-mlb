@@ -3,6 +3,7 @@ from __future__ import annotations
 """Run raw ingest flow for one season."""
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -45,11 +46,23 @@ def main() -> None:
         f"chunk_days={args.chunk_days}, force={args.force}"
     )
 
+    ingest_start = args.start
+    ingest_end = args.end
+    if ingest_start and ingest_end and ingest_start == ingest_end:
+        season_floor = f"{args.season}-03-01"
+        if ingest_start >= season_floor:
+            logging.info(
+                "season_ingest received narrow same-day window start=end=%s; widening start to %s for completed-game backfill",
+                ingest_start,
+                season_floor,
+            )
+            ingest_start = season_floor
+
     ingest_statcast_pa(
         dirs=dirs,
         season=args.season,
-        start=args.start,
-        end=args.end,
+        start=ingest_start,
+        end=ingest_end,
         chunk_days=args.chunk_days,
         force=args.force,
     )
