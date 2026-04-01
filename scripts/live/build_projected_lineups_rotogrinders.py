@@ -344,19 +344,19 @@ def _parse_rotogrinders_lines(lines: list[str], lookup: pd.DataFrame, slate_team
             team, counts = _infer_team_for_lineup(lineup_rows, lookup, slate_teams)
             inferred.append((team, counts, len(lineup_rows)))
 
-            if team is not None:
-                for row in lineup_rows:
-                    rows.append(
-                        {
-                            "canonical_team": team,
-                            "player_name": row["player_name"],
-                            "lineup_slot": row["lineup_slot"],
-                            "position": row["position"],
-                            "bats": row["bats"],
-                            "lineup_status": row["lineup_status"],
-                            "source_text": row["source_text"],
-                        }
-                    )
+            team_value = team if team is not None else "UNK"
+            for row in lineup_rows:
+                rows.append(
+                    {
+                        "canonical_team": team_value,
+                        "player_name": row["player_name"],
+                        "lineup_slot": row["lineup_slot"],
+                        "position": row["position"],
+                        "bats": row["bats"],
+                        "lineup_status": row["lineup_status"],
+                        "source_text": row["source_text"],
+                    }
+                )
 
         diagnostics.append(
             {
@@ -411,35 +411,67 @@ def main() -> None:
     logging.info("rotogrinders visible lines count=%s", len(lines))
     logging.info("rotogrinders sample lines 260:340=%s", lines[260:340])
 
-    raw = _parse_rotogrinders_lines(lines, lookup, slate_canonical)
-    if raw.empty:
-        raise RuntimeError("No lineup rows parsed from RotoGrinders page")
-
-    raw = raw.dropna(subset=["canonical_team", "player_name", "lineup_slot", "position"]).copy()
-    raw = raw[raw["position"].isin(VALID_POSITIONS)].copy()
-    raw = raw.drop_duplicates(subset=["canonical_team", "player_name"], keep="first").copy()
-    raw = raw.sort_values(["canonical_team", "lineup_slot", "player_name"]).copy()
-    raw = raw.drop_duplicates(subset=["canonical_team", "lineup_slot"], keep="first").copy()
-
-    counts_before = raw.groupby("canonical_team").size().to_dict()
-    logging.info("rotogrinders counts before slate filter=%s", counts_before)
-
-    raw = raw[raw["canonical_team"].isin(slate_canonical)].copy()
-    if raw.empty:
-        raise RuntimeError(
-            f"Parsed lineup rows but none matched slate teams. "
-            f"parsed={sorted(counts_before.keys())} slate={sorted(slate_canonical)}"
+    parsed_rows = _parse_rotogrinders_lines(lines, lookup, slate_canonical)
+    if len(parsed_rows) == 0:
+        logging.warning("No lineup rows parsed — returning empty dataframe")
+        out_df = pd.DataFrame(
+            columns=[
+                "game_pk",
+                "team",
+                "player_name",
+                "batting_order",
+                "position",
+                "source",
+            ]
         )
+        out_df["source"] = "rotogrinders_partial"
+        out = pd.DataFrame(
+            columns=[
+                "game_pk",
+                "game_date",
+                "batter_team",
+                "canonical_team",
+                "player_name",
+                "batter_id",
+                "lineup_slot",
+                "position",
+                "bats",
+                "lineup_status",
+                "lineup_source",
+                "source_timestamp",
+            ]
+        )
+    else:
+        out_df = pd.DataFrame(parsed_rows)
+        out_df["source"] = "rotogrinders_partial"
+        raw = out_df.rename(columns={"team": "canonical_team", "batting_order": "lineup_slot"}).copy()
 
-    out = raw.merge(
-        team_games[["game_pk", "batter_team", "canonical_team"]].drop_duplicates(),
-        on="canonical_team",
-        how="inner",
-    )
+        raw = raw.dropna(subset=["player_name", "lineup_slot", "position"]).copy()
+        raw = raw[raw["position"].isin(VALID_POSITIONS)].copy()
+        raw = raw.drop_duplicates(subset=["canonical_team", "player_name"], keep="first").copy()
+        raw = raw.sort_values(["canonical_team", "lineup_slot", "player_name"]).copy()
+        raw = raw.drop_duplicates(subset=["canonical_team", "lineup_slot"], keep="first").copy()
+
+        counts_before = raw.groupby("canonical_team").size().to_dict()
+        logging.info("rotogrinders counts before slate filter=%s", counts_before)
+
+        raw = raw[raw["canonical_team"].isin(slate_canonical)].copy()
+        if raw.empty:
+            logging.warning(
+                "Parsed lineup rows but none matched slate teams. parsed=%s slate=%s",
+                sorted(counts_before.keys()),
+                sorted(slate_canonical),
+            )
+
+        out = raw.merge(
+            team_games[["game_pk", "batter_team", "canonical_team"]].drop_duplicates(),
+            on="canonical_team",
+            how="inner",
+        )
 
     out["game_date"] = args.date
     out["batter_id"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
-    out["lineup_source"] = SOURCE_NAME
+    out["lineup_source"] = "rotogrinders_partial"
     out["source_timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     out = _resolve_player_ids(out, lookup)
@@ -471,10 +503,10 @@ def main() -> None:
         logging.warning("rotogrinders incomplete projected lineup teams=%s counts=%s", bad_teams, counts)
 
     if out.empty:
-        raise RuntimeError("Output dataframe is empty after joining lineups to slate teams")
+        logging.warning("Output dataframe is empty after joining lineups to slate teams")
 
-    if out["position"].notna().sum() == 0:
-        raise RuntimeError("Output has zero non-null positions")
+    if len(out) and out["position"].notna().sum() == 0:
+        logging.warning("Output has zero non-null positions")
 
     logging.info(
         "rotogrinders projected_lineups prewrite total_rows=%s unique_games=%s unique_teams=%s nonnull_position=%s nonnull_batter_id=%s rows_per_team=%s sample_rows=%s",

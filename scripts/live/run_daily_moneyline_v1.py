@@ -200,24 +200,30 @@ def _resolve_moneyline_mart_path(
     *,
     marts_by_season_dir: Path,
     requested_season: int,
-    run_date: pd.Timestamp,
+    expected_feature_columns: list[str],
     preferred_fallback_season: int = 2025,
 ) -> tuple[Path, int]:
-    def _date_rows(path: Path) -> int:
+    def _mart_usable(path: Path) -> tuple[bool, str]:
         if not path.exists():
-            return 0
+            return False, "missing"
         try:
-            df = pd.read_parquet(path, columns=["game_date"])
-        except Exception:
             df = pd.read_parquet(path)
-        if "game_date" not in df.columns or df.empty:
-            return 0
-        d = pd.to_datetime(df["game_date"], errors="coerce")
-        return int((d.dt.date == run_date.date()).sum())
+        except Exception:
+            return False, "unreadable"
+        if df.empty:
+            return False, "empty"
+        required_cols = {"game_date", "home_team", "away_team"}
+        missing_required = sorted(c for c in required_cols if c not in df.columns)
+        if missing_required:
+            return False, f"missing_required_columns({','.join(missing_required)})"
+        missing_expected = [c for c in expected_feature_columns if c not in df.columns]
+        if missing_expected:
+            return False, f"missing_expected_columns({len(missing_expected)})"
+        return True, "ok"
 
     requested_path = marts_by_season_dir / f"moneyline_features_{requested_season}.parquet"
-    requested_rows = _date_rows(requested_path)
-    if requested_rows > 0:
+    requested_ok, requested_reason = _mart_usable(requested_path)
+    if requested_ok:
         return requested_path, requested_season
 
     candidate_seasons: list[int] = []
@@ -230,17 +236,17 @@ def _resolve_moneyline_mart_path(
             continue
         seen.add(season)
         path = marts_by_season_dir / f"moneyline_features_{season}.parquet"
-        if _date_rows(path) > 0:
+        is_usable, _ = _mart_usable(path)
+        if is_usable:
             logging.info(
-                "live scoring mart fallback: requested season=%s using mart season=%s because %s mart missing/empty for date=%s",
+                "live scoring mart fallback: market=moneyline requested_season=%s using_mart_season=%s reason=requested season mart %s",
                 requested_season,
                 season,
-                requested_season,
-                run_date.strftime("%Y-%m-%d"),
+                requested_reason,
             )
             return path, season
     raise FileNotFoundError(
-        f"No usable moneyline mart found for date={run_date.strftime('%Y-%m-%d')} requested_season={requested_season}"
+        f"No usable moneyline mart found for requested_season={requested_season}; requested_reason={requested_reason}"
     )
 
 
@@ -270,15 +276,20 @@ def main() -> None:
     )
     live_paths = resolve_live_paths(config=config, season=args.season, date_str=args.date)
     spine_path = live_paths["live_spine_path"]
-    fallback_mart_path, mart_season = _resolve_moneyline_mart_path(
-        marts_by_season_dir=dirs["marts_dir"] / "by_season",
-        requested_season=args.season,
-        run_date=date_ts,
-        preferred_fallback_season=args.fallback_season,
-    )
     batter_roll_path = dirs["processed_dir"] / "batter_game_rolling.parquet"
     pitcher_roll_path = dirs["processed_dir"] / "pitcher_game_rolling.parquet"
     model_dir = dirs["models_dir"] / "moneyline_sim"
+    model_path = _latest_model(model_dir)
+    model = joblib.load(model_path)
+    expected_features = list(getattr(model, "feature_names_in_", []))
+    if not expected_features:
+        raise ValueError(f"Model missing feature_names_in_: {model_path}")
+    fallback_mart_path, mart_season = _resolve_moneyline_mart_path(
+        marts_by_season_dir=dirs["marts_dir"] / "by_season",
+        requested_season=args.season,
+        expected_feature_columns=expected_features,
+        preferred_fallback_season=args.fallback_season,
+    )
 
     if not spine_path.exists():
         raise FileNotFoundError(f"Live spine not found: {spine_path}")
@@ -367,13 +378,8 @@ def main() -> None:
 
     merged = live_df.copy()
 
-    model_path = _latest_model(model_dir)
-    model = joblib.load(model_path)
-
     X = merged.select_dtypes(include=[np.number]).copy()
-    expected = list(getattr(model, "feature_names_in_", []))
-    if not expected:
-        raise ValueError(f"Model missing feature_names_in_: {model_path}")
+    expected = expected_features
 
     X = pd.DataFrame(index=merged.index, columns=expected, dtype="float64")
 
