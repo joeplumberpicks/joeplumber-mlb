@@ -92,6 +92,18 @@ def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 
+def _load_nrfi_expected_features(dirs: dict[str, Path]) -> list[str]:
+    features_path = dirs["models_dir"] / "nrfi_xgb" / "releases" / "v1.0" / "features_240.txt"
+    if not features_path.exists():
+        logging.warning("NRFI feature list not found for schema alignment: %s", features_path)
+        return []
+    features = [line.strip() for line in features_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not features:
+        logging.warning("NRFI feature list is empty: %s", features_path)
+        return []
+    return features
+
+
 def _derive_moneyline_targets_from_games(processed_dir: Path, season: int) -> pd.DataFrame:
     processed_games_path = processed_dir / "by_season" / f"games_{season}.parquet"
     raw_games_path = processed_dir.parent / "raw" / "by_season" / f"games_{season}.parquet"
@@ -355,6 +367,7 @@ def build_marts(
 
     batter_game_rollup = _game_level_rollups(batter_roll, "bat")
     pitcher_game_rollup = _game_level_rollups(pitcher_roll, "pit")
+    nrfi_expected_features = _load_nrfi_expected_features(dirs)
 
     outputs: dict[str, Path] = {}
     for filename, schema in MART_SCHEMAS.items():
@@ -396,6 +409,18 @@ def build_marts(
                         if tc in mart_df.columns:
                             mart_df[c] = pd.to_numeric(mart_df.get(c), errors="coerce").fillna(pd.to_numeric(mart_df[tc], errors="coerce")).astype("Int64")
                             mart_df = mart_df.drop(columns=[tc])
+                if nrfi_expected_features:
+                    actual_feature_count = len([c for c in mart_df.columns if c in nrfi_expected_features])
+                    missing_features = [c for c in nrfi_expected_features if c not in mart_df.columns]
+                    for col in missing_features:
+                        mart_df[col] = 0.0
+                    logging.info(
+                        "nrfi schema alignment expected_feature_count=%s actual_feature_count=%s missing_feature_count=%s added_default_columns=%s",
+                        len(nrfi_expected_features),
+                        actual_feature_count,
+                        len(missing_features),
+                        missing_features[:20],
+                    )
             elif filename == "hitter_props_features.parquet":
                 if "game_pk" not in mart_df.columns:
                     raise ValueError("hitter_props_features missing game_pk")
