@@ -131,24 +131,28 @@ def _resolve_live_mart_path(
     *,
     marts_by_season_dir: Path,
     requested_season: int,
-    run_date: pd.Timestamp,
+    expected_feature_columns: list[str],
     preferred_fallback_season: int = 2025,
 ) -> tuple[Path, int]:
-    def _date_rows(path: Path) -> int:
+    def _mart_usable(path: Path) -> tuple[bool, str]:
         if not path.exists():
-            return 0
+            return False, "missing"
         try:
-            df = pd.read_parquet(path, columns=["game_date"])
-        except Exception:
             df = pd.read_parquet(path)
-        if "game_date" not in df.columns or df.empty:
-            return 0
-        d = pd.to_datetime(df["game_date"], errors="coerce")
-        return int((d.dt.date == run_date.date()).sum())
+        except Exception:
+            return False, "unreadable"
+        if df.empty:
+            return False, "empty"
+        missing_expected = [c for c in expected_feature_columns if c not in df.columns]
+        if missing_expected:
+            return False, f"missing_expected_columns({len(missing_expected)})"
+        if "game_date" not in df.columns:
+            return False, "missing_game_date"
+        return True, "ok"
 
     requested_path = marts_by_season_dir / f"nrfi_features_{requested_season}.parquet"
-    requested_rows = _date_rows(requested_path)
-    if requested_rows > 0:
+    requested_ok, requested_reason = _mart_usable(requested_path)
+    if requested_ok:
         return requested_path, requested_season
 
     candidate_seasons: list[int] = []
@@ -161,17 +165,17 @@ def _resolve_live_mart_path(
             continue
         seen.add(season)
         path = marts_by_season_dir / f"nrfi_features_{season}.parquet"
-        if _date_rows(path) > 0:
+        is_usable, _ = _mart_usable(path)
+        if is_usable:
             logging.info(
-                "live scoring mart fallback: requested season=%s using mart season=%s because %s mart missing/empty for date=%s",
+                "live scoring mart fallback: market=nrfi requested_season=%s using_mart_season=%s reason=requested season mart %s",
                 requested_season,
                 season,
-                requested_season,
-                run_date.strftime("%Y-%m-%d"),
+                requested_reason,
             )
             return path, season
     raise FileNotFoundError(
-        f"No usable NRFI mart found for date={run_date.strftime('%Y-%m-%d')} requested_season={requested_season}"
+        f"No usable NRFI mart found for requested_season={requested_season}; requested_reason={requested_reason}"
     )
 
 
@@ -210,12 +214,13 @@ def main() -> None:
     nrfi_model_path = release_dir / "nrfi_model.json"
     yrfi_model_path = release_dir / "yrfi_model.json"
     features_path = release_dir / "features_240.txt"
+    features = _load_features(features_path)
 
     marts_by_season_dir = DRIVE_ROOT / "data/marts/by_season"
     mart_path, mart_season = _resolve_live_mart_path(
         marts_by_season_dir=marts_by_season_dir,
         requested_season=season,
-        run_date=run_date,
+        expected_feature_columns=features,
     )
 
     out_dir = DRIVE_ROOT / "data/outputs/nrfi_xgb/v1.0/daily"
@@ -253,7 +258,6 @@ def main() -> None:
         logging.error("No games found for date=%s in mart=%s", args.date, mart_path)
         raise SystemExit(1)
 
-    features = _load_features(features_path)
     X = daily.reindex(columns=features).copy()
     X = X.apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
