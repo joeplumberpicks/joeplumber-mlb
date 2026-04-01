@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-weather", action="store_true")
     parser.add_argument("--permissive-live-context", action="store_true")
     parser.add_argument("--board-top", type=int, default=15)
+    parser.add_argument("--suppress-preflight-summary", action="store_true")
     return parser.parse_args()
 
 
@@ -126,6 +127,54 @@ def _auto_build(repo_root: Path, season: int, date_str: str) -> None:
         _run_cmd(cmd, cwd=repo_root)
 
 
+def _resolve_live_mart_path(
+    *,
+    marts_by_season_dir: Path,
+    requested_season: int,
+    run_date: pd.Timestamp,
+    preferred_fallback_season: int = 2025,
+) -> tuple[Path, int]:
+    def _date_rows(path: Path) -> int:
+        if not path.exists():
+            return 0
+        try:
+            df = pd.read_parquet(path, columns=["game_date"])
+        except Exception:
+            df = pd.read_parquet(path)
+        if "game_date" not in df.columns or df.empty:
+            return 0
+        d = pd.to_datetime(df["game_date"], errors="coerce")
+        return int((d.dt.date == run_date.date()).sum())
+
+    requested_path = marts_by_season_dir / f"nrfi_features_{requested_season}.parquet"
+    requested_rows = _date_rows(requested_path)
+    if requested_rows > 0:
+        return requested_path, requested_season
+
+    candidate_seasons: list[int] = []
+    if preferred_fallback_season != requested_season:
+        candidate_seasons.append(preferred_fallback_season)
+    candidate_seasons.extend(range(requested_season - 1, 2014, -1))
+    seen: set[int] = set()
+    for season in candidate_seasons:
+        if season in seen:
+            continue
+        seen.add(season)
+        path = marts_by_season_dir / f"nrfi_features_{season}.parquet"
+        if _date_rows(path) > 0:
+            logging.info(
+                "live scoring mart fallback: requested season=%s using mart season=%s because %s mart missing/empty for date=%s",
+                requested_season,
+                season,
+                requested_season,
+                run_date.strftime("%Y-%m-%d"),
+            )
+            return path, season
+    raise FileNotFoundError(
+        f"No usable NRFI mart found for date={run_date.strftime('%Y-%m-%d')} requested_season={requested_season}"
+    )
+
+
 def main() -> None:
     args = parse_args()
     run_date = _validate_date(args.date)
@@ -147,6 +196,7 @@ def main() -> None:
         build_lineups=not args.skip_lineups,
         build_weather=not args.skip_weather,
         permissive_live_context=bool(args.permissive_live_context),
+        emit_summary_line=not args.suppress_preflight_summary,
     )
     live_paths = resolve_live_paths(config=config, season=season, date_str=args.date)
     live_spine = load_live_spine(live_paths["live_spine_path"])
@@ -161,7 +211,12 @@ def main() -> None:
     yrfi_model_path = release_dir / "yrfi_model.json"
     features_path = release_dir / "features_240.txt"
 
-    mart_path = DRIVE_ROOT / f"data/marts/by_season/nrfi_features_{season}.parquet"
+    marts_by_season_dir = DRIVE_ROOT / "data/marts/by_season"
+    mart_path, mart_season = _resolve_live_mart_path(
+        marts_by_season_dir=marts_by_season_dir,
+        requested_season=season,
+        run_date=run_date,
+    )
 
     out_dir = DRIVE_ROOT / "data/outputs/nrfi_xgb/v1.0/daily"
     pub_dir = DRIVE_ROOT / "data/outputs/nrfi_xgb/v1.0/public"
@@ -182,12 +237,6 @@ def main() -> None:
 
     if args.auto_build:
         _auto_build(repo_root, season, args.date)
-
-    if not mart_path.exists():
-        raise FileNotFoundError(
-            f"Mart not found for season={season}: {mart_path}. "
-            "Run with --auto-build or build marts upstream first."
-        )
 
     df = pd.read_parquet(mart_path)
     if "game_date" not in df.columns:
@@ -283,9 +332,10 @@ def main() -> None:
     ledger.to_csv(ledger_path, index=False)
 
     logging.info(
-        "NRFI v1.0 daily run complete | date=%s season=%s rows=%s slate_games=%s daily_csv=%s public_csv=%s a_tier_csv=%s ledger=%s a_tier_count=%s preflight_spine_rows=%s",
+        "NRFI v1.0 daily run complete | date=%s season=%s mart_season=%s rows=%s slate_games=%s daily_csv=%s public_csv=%s a_tier_csv=%s ledger=%s a_tier_count=%s preflight_spine_rows=%s",
         args.date,
         season,
+        mart_season,
         len(daily_out_df),
         len(live_game_pks),
         daily_out,
@@ -298,6 +348,7 @@ def main() -> None:
 
     print(f"date={args.date}")
     print(f"season={season}")
+    print(f"mart_season={mart_season}")
     print(f"rows={len(daily_out_df)}")
     print(f"daily_csv={daily_out}")
     print(f"public_csv={public_out}")

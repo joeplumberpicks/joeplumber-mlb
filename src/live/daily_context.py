@@ -188,6 +188,7 @@ def run_live_preflight(
     build_lineups: bool = True,
     build_weather: bool = True,
     permissive_live_context: bool = False,
+    emit_summary_line: bool = True,
 ) -> dict:
     from src.utils.config import load_config
 
@@ -273,15 +274,16 @@ def run_live_preflight(
             validation["weather_coverage_pct"],
             validation["final_game_spine_row_count"],
         )
-        print(
-            "live_preflight_validation "
-            f"slate_games={validation['slate_game_count']} "
-            f"home_starter_coverage_pct={validation['home_starter_coverage_pct']:.2f} "
-            f"away_starter_coverage_pct={validation['away_starter_coverage_pct']:.2f} "
-            f"projected_lineup_coverage_pct={validation['projected_lineup_coverage_pct']:.2f} "
-            f"weather_coverage_pct={validation['weather_coverage_pct']:.2f} "
-            f"final_spine_rows={validation['final_game_spine_row_count']}"
-        )
+        if emit_summary_line:
+            print(
+                "live_preflight_validation "
+                f"slate_games={validation['slate_game_count']} "
+                f"home_starter_coverage_pct={validation['home_starter_coverage_pct']:.2f} "
+                f"away_starter_coverage_pct={validation['away_starter_coverage_pct']:.2f} "
+                f"projected_lineup_coverage_pct={validation['projected_lineup_coverage_pct']:.2f} "
+                f"weather_coverage_pct={validation['weather_coverage_pct']:.2f} "
+                f"final_spine_rows={validation['final_game_spine_row_count']}"
+            )
     return out
 
 
@@ -301,7 +303,16 @@ def load_live_spine(live_spine_path: Path) -> pd.DataFrame:
 
     keep = required + [
         c
-        for c in ["away_sp_id", "home_sp_id", "away_sp_name", "home_sp_name", "venue_id"]
+        for c in [
+            "away_sp_id",
+            "home_sp_id",
+            "away_sp_name",
+            "home_sp_name",
+            "venue_id",
+            "has_projected_lineups",
+            "has_weather",
+            "projected_lineup_rows",
+        ]
         if c in df.columns
     ]
     for c in keep:
