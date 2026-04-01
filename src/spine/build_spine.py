@@ -172,6 +172,16 @@ def _normalize_parks_df(df: pd.DataFrame, season: int) -> pd.DataFrame:
     return out
 
 
+def _normalize_weather_df(df: pd.DataFrame, season: int) -> pd.DataFrame:
+    out = df.copy()
+    if "season" not in out.columns:
+        out["season"] = season
+    for col in WEATHER_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.NA
+    return out
+
+
 
 
 def _normalize_games_df(df: pd.DataFrame, season: int) -> pd.DataFrame:
@@ -212,6 +222,11 @@ def load_or_placeholder(raw_path: Path, columns: list[str], label: str, season: 
         if label == "parks":
             df = _normalize_parks_df(df, season)
             print_rowcount("parks_normalized", df)
+        if label == "weather":
+            df = _normalize_weather_df(df, season)
+            if df.empty:
+                logging.info("weather_by_season empty source normalized with required schema path=%s", raw_path)
+            print_rowcount("weather_normalized", df)
         require_columns(df, columns, label)
         print_rowcount(label, df)
         return df
