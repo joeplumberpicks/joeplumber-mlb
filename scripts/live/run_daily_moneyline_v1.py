@@ -207,7 +207,7 @@ def main() -> None:
     configure_logging(dirs["logs_dir"] / "run_daily_moneyline_v1.log")
     log_header("scripts/live/run_daily_moneyline_v1.py", repo_root, config_path, dirs)
 
-    run_live_preflight(
+    preflight = run_live_preflight(
         repo_root=repo_root,
         config_path=config_path,
         season=args.season,
@@ -253,6 +253,13 @@ def main() -> None:
         f"pct_with_lineups={smoke['pct_with_lineups']:.2f} "
         f"away_lineup_found={smoke['away_lineup_found']} "
         f"home_lineup_found={smoke['home_lineup_found']}"
+    )
+    logging.info(
+        "moneyline preflight summary slate_games=%s final_spine_rows=%s lineup_coverage_pct=%.2f weather_coverage_pct=%.2f",
+        preflight.get("slate_game_count", 0),
+        preflight.get("final_game_spine_row_count", 0),
+        float(preflight.get("projected_lineup_coverage_pct", 0.0)),
+        float(preflight.get("weather_coverage_pct", 0.0)),
     )
 
     live_df = live_context.copy()

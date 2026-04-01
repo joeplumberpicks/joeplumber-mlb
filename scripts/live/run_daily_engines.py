@@ -14,11 +14,11 @@ from src.utils.config import get_repo_root, load_config
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run daily engine suite (no_hr, nrfi, moneyline).")
+    p = argparse.ArgumentParser(description="Run official daily game-level engine suite (NRFI + Moneyline).")
     p.add_argument("--date", required=True)
     p.add_argument("--season", type=int, required=True)
     p.add_argument("--config", type=Path, default=Path("configs/project.yaml"))
-    p.add_argument("--engines", default="no_hr,nrfi,moneyline")
+    p.add_argument("--engines", default="nrfi,moneyline")
     p.add_argument("--auto-build", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--skip-lineups", action="store_true")
     p.add_argument("--skip-weather", action="store_true")
@@ -41,7 +41,7 @@ def main() -> None:
     config_path = (repo_root / args.config).resolve() if not args.config.is_absolute() else args.config.resolve()
     _ = load_config(config_path)
 
-    run_live_preflight(
+    preflight = run_live_preflight(
         repo_root=repo_root,
         config_path=config_path,
         season=args.season,
@@ -52,6 +52,11 @@ def main() -> None:
         build_weather=not args.skip_weather,
         permissive_live_context=bool(args.permissive_live_context),
     )
+    print(
+        "preflight_complete "
+        f"slate_games={preflight.get('slate_game_count', 0)} "
+        f"final_spine_rows={preflight.get('final_game_spine_row_count', 0)}"
+    )
 
     selected = [x.strip() for x in args.engines.split(",") if x.strip()]
     produced: list[str] = []
@@ -61,7 +66,7 @@ def main() -> None:
         if engine == "nrfi":
             cmd = [
                 sys.executable,
-                "scripts/run_daily_nrfi_v1.py",
+                "scripts/live/run_daily_nrfi_v1.py",
                 "--date",
                 args.date,
                 "--season",
@@ -102,28 +107,6 @@ def main() -> None:
                 cmd.append("--permissive-live-context")
             _run(cmd, repo_root)
             produced.append(f"moneyline_board_{args.season}_{args.date}")
-        elif engine == "no_hr":
-            cmd = [
-                sys.executable,
-                "scripts/live/run_daily_no_hr_v1.py",
-                "--date",
-                args.date,
-                "--season",
-                str(args.season),
-                "--config",
-                str(args.config),
-                "--board-top",
-                str(args.board_top),
-                "--no-auto-build",
-            ]
-            if args.skip_lineups:
-                cmd.append("--skip-lineups")
-            if args.skip_weather:
-                cmd.append("--skip-weather")
-            if args.permissive_live_context:
-                cmd.append("--permissive-live-context")
-            _run(cmd, repo_root)
-            produced.append(f"no_hr_board_{args.season}_{args.date}")
         else:
             raise ValueError(f"Unknown engine: {engine}")
 
