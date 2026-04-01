@@ -118,9 +118,7 @@ def _run_lineup_build_with_fallback(
         projected_lineups_path,
         errors,
     )
-    if not permissive_live_context:
-        raise RuntimeError("Projected lineup build failed for all builders: " + " | ".join(errors))
-    logging.warning("permissive_live_context=True so continuing after projected lineup build failure")
+    logging.error("Projected lineup build failed for all builders; continuing without projected lineups")
     return {
         "lineup_builder_used": None,
         "lineup_rows": last_rows,
