@@ -20,6 +20,23 @@ from src.utils.io import read_parquet, write_parquet
 from src.utils.logging import configure_logging, log_header
 
 GAME_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
+WEATHER_COLUMNS = [
+    "game_pk",
+    "game_date",
+    "season",
+    "home_team",
+    "away_team",
+    "venue_id",
+    "temperature",
+    "wind_speed",
+    "wind_direction",
+    "temperature_f",
+    "wind_mph",
+    "wind_dir",
+    "weather_wind_out",
+    "weather_wind_in",
+    "weather_crosswind",
+]
 
 
 def _to_int(value: object) -> int | None:
@@ -186,6 +203,21 @@ def fetch_weather_for_games(games_df: pd.DataFrame, timeout: int = 30) -> pd.Dat
     return out
 
 
+def _normalize_weather_schema(df: pd.DataFrame, season: int) -> pd.DataFrame:
+    out = df.copy()
+    for col in WEATHER_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.NA
+    out["season"] = pd.to_numeric(out.get("season"), errors="coerce").fillna(season).astype("Int64")
+    out["game_pk"] = pd.to_numeric(out.get("game_pk"), errors="coerce").astype("Int64")
+    out["venue_id"] = pd.to_numeric(out.get("venue_id"), errors="coerce").astype("Int64")
+    out["game_date"] = pd.to_datetime(out.get("game_date"), errors="coerce")
+    out["temperature_f"] = pd.to_numeric(out.get("temperature_f"), errors="coerce")
+    out["wind_mph"] = pd.to_numeric(out.get("wind_mph"), errors="coerce")
+    out["wind_dir"] = out.get("wind_dir").astype("string")
+    return out[WEATHER_COLUMNS + [c for c in out.columns if c not in WEATHER_COLUMNS]]
+
+
 def _read_historical_games(dirs: dict[str, Path], season: int) -> pd.DataFrame:
     games_path = dirs["raw_dir"] / "by_season" / f"games_{season}.parquet"
     require_files([games_path], f"weather_games_{season}")
@@ -205,12 +237,40 @@ def _read_live_games(dirs: dict[str, Path], season: int, date: str) -> pd.DataFr
 
 def write_weather_for_season(dirs: dict[str, Path], season: int) -> Path:
     games_df = _read_historical_games(dirs, season)
-    weather_df = fetch_weather_for_games(games_df)
+    weather_df = _normalize_weather_schema(fetch_weather_for_games(games_df), season)
     out_path = dirs["raw_dir"] / "by_season" / f"weather_game_{season}.parquet"
-    print_rowcount(f"weather_game_{season}", weather_df)
+    existing_df = pd.DataFrame(columns=WEATHER_COLUMNS)
+    if out_path.exists():
+        existing_df = _normalize_weather_schema(read_parquet(out_path), season)
+
+    if weather_df.empty and not existing_df.empty:
+        final_df = existing_df.copy()
+        logging.info(
+            "season_ingest zero-row fetch; preserving existing season file path=%s existing_rows=%s",
+            out_path,
+            len(existing_df),
+        )
+    elif weather_df.empty and existing_df.empty:
+        final_df = _normalize_weather_schema(pd.DataFrame(columns=WEATHER_COLUMNS), season)
+        logging.info("weather_by_season empty source normalized with required schema path=%s", out_path)
+    elif not existing_df.empty:
+        final_df = pd.concat([existing_df, weather_df], ignore_index=True)
+        final_df = final_df.sort_values(["game_date"], kind="mergesort")
+        final_df = final_df.drop_duplicates(subset=["game_pk"], keep="last")
+    else:
+        final_df = weather_df.copy()
+
+    logging.info(
+        "season_ingest existing_rows=%s new_rows=%s final_rows=%s file=%s",
+        len(existing_df),
+        len(weather_df),
+        len(final_df),
+        out_path,
+    )
+    print_rowcount(f"weather_game_{season}", final_df)
     print(f"Writing to: {out_path.resolve()}")
-    write_parquet(weather_df, out_path)
-    logging.info("weather ingest season=%s rows=%s out=%s", season, len(weather_df), out_path)
+    write_parquet(final_df, out_path)
+    logging.info("weather ingest season=%s rows=%s out=%s", season, len(final_df), out_path)
     return out_path
 
 
