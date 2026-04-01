@@ -146,8 +146,6 @@ def _resolve_live_mart_path(
         missing_expected = [c for c in expected_feature_columns if c not in df.columns]
         if missing_expected:
             return False, f"missing_expected_columns({len(missing_expected)})"
-        if "game_date" not in df.columns:
-            return False, "missing_game_date"
         return True, "ok"
 
     requested_path = marts_by_season_dir / f"nrfi_features_{requested_season}.parquet"
@@ -177,6 +175,49 @@ def _resolve_live_mart_path(
     raise FileNotFoundError(
         f"No usable NRFI mart found for requested_season={requested_season}; requested_reason={requested_reason}"
     )
+
+
+def _build_live_inference_frame(
+    *,
+    live_spine: pd.DataFrame,
+    mart_df: pd.DataFrame,
+    run_date: pd.Timestamp,
+    expected_features: list[str],
+) -> pd.DataFrame:
+    live = live_spine.copy()
+    if live.empty:
+        return live
+
+    live["game_date"] = pd.to_datetime(run_date).normalize()
+
+    feature_source = mart_df.copy()
+    if "game_date" in feature_source.columns:
+        feature_source["game_date"] = pd.to_datetime(feature_source["game_date"], errors="coerce")
+
+    merge_keys: list[str] = []
+    if {"home_team", "away_team"}.issubset(live.columns) and {"home_team", "away_team"}.issubset(feature_source.columns):
+        merge_keys = ["home_team", "away_team"]
+    elif "game_pk" in live.columns and "game_pk" in feature_source.columns:
+        feature_source["game_pk"] = pd.to_numeric(feature_source["game_pk"], errors="coerce").astype("Int64")
+        live["game_pk"] = pd.to_numeric(live["game_pk"], errors="coerce").astype("Int64")
+        merge_keys = ["game_pk"]
+
+    if merge_keys == ["home_team", "away_team"]:
+        for col in merge_keys:
+            live[col] = live[col].astype(str)
+            feature_source[col] = feature_source[col].astype(str)
+
+    if merge_keys:
+        sort_cols = ["game_date"] if "game_date" in feature_source.columns else merge_keys
+        hist_latest = feature_source.sort_values(sort_cols).drop_duplicates(subset=merge_keys, keep="last")
+        keep_cols = merge_keys + [c for c in expected_features if c in hist_latest.columns]
+        live = live.merge(hist_latest[keep_cols], on=merge_keys, how="left")
+
+    for col in expected_features:
+        if col not in live.columns:
+            live[col] = 0.0
+
+    return live
 
 
 def main() -> None:
@@ -243,19 +284,21 @@ def main() -> None:
     if args.auto_build:
         _auto_build(repo_root, season, args.date)
 
-    df = pd.read_parquet(mart_path)
-    if "game_date" not in df.columns:
-        raise ValueError(f"Expected game_date column in mart: {mart_path}")
+    backbone_df = pd.read_parquet(mart_path).copy()
 
-    df = df.copy()
-    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
-    daily = df[df["game_date"].dt.date == run_date.date()].copy()
+    daily = _build_live_inference_frame(
+        live_spine=live_spine,
+        mart_df=backbone_df,
+        run_date=run_date,
+        expected_features=features,
+    )
     if live_game_pks:
         daily["game_pk"] = pd.to_numeric(daily.get("game_pk"), errors="coerce").astype("Int64")
         daily = daily[daily["game_pk"].isin(list(live_game_pks))].copy()
 
+    logging.info("live inference frame rows=%s date=%s", len(daily), args.date)
     if daily.empty:
-        logging.error("No games found for date=%s in mart=%s", args.date, mart_path)
+        logging.error("No live games available in inference frame for date=%s", args.date)
         raise SystemExit(1)
 
     X = daily.reindex(columns=features).copy()
