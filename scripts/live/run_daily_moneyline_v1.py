@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-weather", action="store_true")
     p.add_argument("--permissive-live-context", action="store_true")
     p.add_argument("--outdir-name", default="moneyline")
+    p.add_argument("--suppress-preflight-summary", action="store_true")
     return p.parse_args()
 
 
@@ -195,6 +196,54 @@ def _pick_metric_name(source_cols: set[str], expected_col: str, prefix: str) -> 
     return None
 
 
+def _resolve_moneyline_mart_path(
+    *,
+    marts_by_season_dir: Path,
+    requested_season: int,
+    run_date: pd.Timestamp,
+    preferred_fallback_season: int = 2025,
+) -> tuple[Path, int]:
+    def _date_rows(path: Path) -> int:
+        if not path.exists():
+            return 0
+        try:
+            df = pd.read_parquet(path, columns=["game_date"])
+        except Exception:
+            df = pd.read_parquet(path)
+        if "game_date" not in df.columns or df.empty:
+            return 0
+        d = pd.to_datetime(df["game_date"], errors="coerce")
+        return int((d.dt.date == run_date.date()).sum())
+
+    requested_path = marts_by_season_dir / f"moneyline_features_{requested_season}.parquet"
+    requested_rows = _date_rows(requested_path)
+    if requested_rows > 0:
+        return requested_path, requested_season
+
+    candidate_seasons: list[int] = []
+    if preferred_fallback_season != requested_season:
+        candidate_seasons.append(preferred_fallback_season)
+    candidate_seasons.extend(range(requested_season - 1, 2014, -1))
+    seen: set[int] = set()
+    for season in candidate_seasons:
+        if season in seen:
+            continue
+        seen.add(season)
+        path = marts_by_season_dir / f"moneyline_features_{season}.parquet"
+        if _date_rows(path) > 0:
+            logging.info(
+                "live scoring mart fallback: requested season=%s using mart season=%s because %s mart missing/empty for date=%s",
+                requested_season,
+                season,
+                requested_season,
+                run_date.strftime("%Y-%m-%d"),
+            )
+            return path, season
+    raise FileNotFoundError(
+        f"No usable moneyline mart found for date={run_date.strftime('%Y-%m-%d')} requested_season={requested_season}"
+    )
+
+
 def main() -> None:
     args = parse_args()
     date_ts = pd.to_datetime(args.date, format="%Y-%m-%d", errors="raise")
@@ -217,19 +266,22 @@ def main() -> None:
         build_lineups=not args.skip_lineups,
         build_weather=not args.skip_weather,
         permissive_live_context=bool(args.permissive_live_context),
+        emit_summary_line=not args.suppress_preflight_summary,
     )
     live_paths = resolve_live_paths(config=config, season=args.season, date_str=args.date)
     spine_path = live_paths["live_spine_path"]
-    fallback_mart_path = dirs["marts_dir"] / "by_season" / f"moneyline_features_{args.fallback_season}.parquet"
+    fallback_mart_path, mart_season = _resolve_moneyline_mart_path(
+        marts_by_season_dir=dirs["marts_dir"] / "by_season",
+        requested_season=args.season,
+        run_date=date_ts,
+        preferred_fallback_season=args.fallback_season,
+    )
     batter_roll_path = dirs["processed_dir"] / "batter_game_rolling.parquet"
     pitcher_roll_path = dirs["processed_dir"] / "pitcher_game_rolling.parquet"
     model_dir = dirs["models_dir"] / "moneyline_sim"
 
     if not spine_path.exists():
         raise FileNotFoundError(f"Live spine not found: {spine_path}")
-    if not fallback_mart_path.exists():
-        raise FileNotFoundError(f"Fallback moneyline mart not found: {fallback_mart_path}")
-
     live_df = load_live_spine(spine_path).copy()
     live_weather = (
         load_live_weather(config=config, season=args.season, date_str=args.date)
@@ -520,12 +572,13 @@ def main() -> None:
         "moneyline daily run complete date=%s season=%s fallback=%s rows=%s model=%s daily=%s public=%s",
         args.date,
         args.season,
-        args.fallback_season,
+        mart_season,
         len(out),
         model_path,
         daily_path,
         public_path,
     )
+    print(f"mart_season={mart_season}")
     print(f"daily_out={daily_path}")
     print(f"daily_out_parquet={daily_parquet_path}")
     print(f"public_out={public_path}")

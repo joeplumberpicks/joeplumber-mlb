@@ -51,6 +51,7 @@ def main() -> None:
         build_lineups=not args.skip_lineups,
         build_weather=not args.skip_weather,
         permissive_live_context=bool(args.permissive_live_context),
+        emit_summary_line=True,
     )
     print(
         "preflight_complete "
@@ -75,14 +76,15 @@ def main() -> None:
                 str(args.config),
                 "--board-top",
                 str(args.board_top),
-                "--no-auto-build",
             ]
+            cmd.append("--auto-build" if args.auto_build else "--no-auto-build")
             if args.skip_lineups:
                 cmd.append("--skip-lineups")
             if args.skip_weather:
                 cmd.append("--skip-weather")
             if args.permissive_live_context:
                 cmd.append("--permissive-live-context")
+            cmd.append("--suppress-preflight-summary")
             _run(cmd, repo_root)
             produced.append(f"nrfi_board_{args.season}_{args.date}")
         elif engine == "moneyline":
@@ -97,14 +99,15 @@ def main() -> None:
                 str(args.config),
                 "--fallback-season",
                 str(args.fallback_season),
-                "--no-auto-build",
             ]
+            cmd.append("--auto-build" if args.auto_build else "--no-auto-build")
             if args.skip_lineups:
                 cmd.append("--skip-lineups")
             if args.skip_weather:
                 cmd.append("--skip-weather")
             if args.permissive_live_context:
                 cmd.append("--permissive-live-context")
+            cmd.append("--suppress-preflight-summary")
             _run(cmd, repo_root)
             produced.append(f"moneyline_board_{args.season}_{args.date}")
         else:
