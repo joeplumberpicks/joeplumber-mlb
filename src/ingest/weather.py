@@ -1,34 +1,67 @@
 """
-Weather ingestion for Joe Plumber MLB Engine.
+Weather ingestion for Joe Plumber MLB Engine using NOAA/AWC METAR data.
 
 Purpose
 -------
-Pull game-level weather from MLB schedule/game metadata and normalize it into a
-clean one-row-per-game weather table.
+Pull game-level weather from the official Aviation Weather Center METAR API
+and normalize it into a clean one-row-per-game weather table.
 
 This module is Layer 1 only:
 - raw truth only
 - no modeling logic
-- no feature engineering
+- no feature engineering for scoring
 - no target creation
 
-Primary public function
------------------------
-build_weather_games(...)
+Notes
+-----
+- Requires a mapping from MLB venue/team to nearby METAR station.
+- Designed for current / recent slates. METAR API history is limited.
 """
 
 from __future__ import annotations
 
-import re
 from datetime import date, datetime
 from typing import Any, Iterable
 
 import pandas as pd
 import requests
 
-MLB_SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
-DEFAULT_GAME_TYPES = ("R", "S")
+METAR_API_URL = "https://aviationweather.gov/api/data/metar"
 REQUEST_TIMEOUT = 30
+
+# You can refine these over time, but this is a strong starting map.
+TEAM_TO_METAR_STATION: dict[str, str] = {
+    "ARI": "KPHX",
+    "ATL": "KATL",
+    "BAL": "KBWI",
+    "BOS": "KBOS",
+    "CHC": "KORD",
+    "CHA": "KMDW",
+    "CIN": "KLUK",
+    "CLE": "KCLE",
+    "COL": "KDEN",
+    "DET": "KDTW",
+    "HOU": "KIAH",
+    "KCA": "KMCI",
+    "LAA": "KSNA",
+    "LAN": "KLAX",
+    "MIA": "KMIA",
+    "MIL": "KMKE",
+    "MIN": "KMSP",
+    "NYA": "KLGA",
+    "NYN": "KLGA",
+    "OAK": "KOAK",
+    "PHI": "KPHL",
+    "PIT": "KPIT",
+    "SDN": "KSAN",
+    "SEA": "KSEA",
+    "SFN": "KSFO",
+    "SLN": "KSTL",
+    "TBA": "KTPA",
+    "TEX": "KDFW",
+    "TOR": "CYYZ",
+    "WAS": "KDCA",
+}
 
 
 def _coerce_iso_date(value: str | date | datetime | None) -> str | None:
@@ -40,14 +73,6 @@ def _coerce_iso_date(value: str | date | datetime | None) -> str | None:
     if isinstance(value, date):
         return value.isoformat()
     return str(value)
-
-
-def _coerce_game_type_param(game_types: Iterable[str] | None) -> str:
-    """Convert iterable of game type codes into MLB API query format."""
-    values = tuple(gt.strip().upper() for gt in (game_types or DEFAULT_GAME_TYPES) if str(gt).strip())
-    if not values:
-        values = DEFAULT_GAME_TYPES
-    return ",".join(values)
 
 
 def _safe_get(dct: dict[str, Any] | None, *keys: str, default: Any = None) -> Any:
@@ -62,219 +87,230 @@ def _safe_get(dct: dict[str, Any] | None, *keys: str, default: Any = None) -> An
     return cur
 
 
-def _extract_temperature_f(weather_raw: str | None) -> float | None:
-    """
-    Extract temperature in Fahrenheit from free-text weather string.
-
-    Example inputs:
-    - "72 degrees, Sunny"
-    - "68 degrees, Partly Cloudy"
-    """
-    if not weather_raw:
+def _to_float(value: Any) -> float | None:
+    """Coerce value to float if possible."""
+    if value is None or value == "":
         return None
-    match = re.search(r"(-?\d+)\s*degrees", str(weather_raw), flags=re.IGNORECASE)
-    return float(match.group(1)) if match else None
-
-
-def _extract_weather_condition(weather_raw: str | None) -> str | None:
-    """
-    Extract a normalized weather condition string from free-text weather.
-
-    Example:
-    - "72 degrees, Sunny" -> "Sunny"
-    """
-    if not weather_raw:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
         return None
-    parts = [p.strip() for p in str(weather_raw).split(",") if p.strip()]
-    if len(parts) >= 2:
-        return ", ".join(parts[1:]).strip() or None
-    return None
 
 
-def _extract_wind_mph(wind_raw: str | None) -> float | None:
-    """
-    Extract numeric wind speed from free-text wind string.
-
-    Example inputs:
-    - "10 mph, Out To LF"
-    - "7 mph, In From CF"
-    - "0 mph, None"
-    """
-    if not wind_raw:
+def _to_int(value: Any) -> int | None:
+    """Coerce value to int if possible."""
+    if value is None or value == "":
         return None
-    match = re.search(r"(-?\d+)\s*mph", str(wind_raw), flags=re.IGNORECASE)
-    return float(match.group(1)) if match else None
-
-
-def _extract_wind_direction_text(wind_raw: str | None) -> str | None:
-    """
-    Extract raw wind direction descriptor from free-text wind string.
-
-    Example:
-    - "10 mph, Out To LF" -> "Out To LF"
-    """
-    if not wind_raw:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
         return None
-    parts = [p.strip() for p in str(wind_raw).split(",") if p.strip()]
-    if len(parts) >= 2:
-        return ", ".join(parts[1:]).strip() or None
-    return None
 
 
-def _normalize_wind_flags(wind_direction_text: str | None) -> tuple[float, float, float]:
+def _normalize_wind_flags(wind_dir_degrees: float | None) -> tuple[float, float, float]:
     """
-    Convert wind direction text into simple directional flags.
+    Convert wind direction degrees into coarse field-direction flags.
+
+    This is intentionally simple and ingest-safe.
+    Assumes:
+    - out = blowing toward outfield roughly 315°..45°
+    - in = blowing in from center roughly 135°..225°
+    - cross = everything else
+    """
+    if wind_dir_degrees is None:
+        return 0.0, 0.0, 0.0
+
+    deg = wind_dir_degrees % 360
+
+    # Rough generic baseball orientation proxy.
+    if deg >= 315 or deg <= 45:
+        return 1.0, 0.0, 0.0
+    if 135 <= deg <= 225:
+        return 0.0, 1.0, 0.0
+    return 0.0, 0.0, 1.0
+
+
+def _infer_roof_status(home_team: str | None) -> str | None:
+    """
+    Best-effort roof status from team / park type.
+
+    This remains ingest metadata only.
+    """
+    retractable_or_dome = {
+        "ARI",
+        "HOU",
+        "MIA",
+        "MIL",
+        "SEA",
+        "TBA",
+        "TOR",
+        "TEX",
+    }
+    if home_team in retractable_or_dome:
+        return "unknown_retractable"
+    return "open_air"
+
+
+def fetch_metar_json(
+    station_ids: Iterable[str],
+    hours: float = 3.0,
+    request_timeout: int = REQUEST_TIMEOUT,
+) -> list[dict[str, Any]]:
+    """
+    Fetch METAR observations for one or more stations.
+
+    Parameters
+    ----------
+    station_ids:
+        ICAO station ids, e.g. ["KATL", "KBOS"].
+    hours:
+        Lookback window in hours.
+    request_timeout:
+        Timeout in seconds.
 
     Returns
     -------
-    tuple
-        (weather_wind_out, weather_wind_in, weather_crosswind)
+    list[dict[str, Any]]
+        Raw METAR records from the API.
     """
-    if not wind_direction_text:
-        return 0.0, 0.0, 0.0
+    ids = sorted({str(x).strip().upper() for x in station_ids if str(x).strip()})
+    if not ids:
+        return []
 
-    value = str(wind_direction_text).strip().lower()
-
-    if value in {"none", "calm"}:
-        return 0.0, 0.0, 0.0
-
-    is_out = any(token in value for token in ["out to", "out toward", "blowing out"])
-    is_in = any(token in value for token in ["in from", "blowing in"])
-    is_cross = any(
-        token in value
-        for token in ["left to right", "right to left", "from lf", "from rf", "toward lf", "toward rf"]
-    )
-
-    if is_out:
-        return 1.0, 0.0, 0.0
-    if is_in:
-        return 0.0, 1.0, 0.0
-    if is_cross:
-        return 0.0, 0.0, 1.0
-
-    return 0.0, 0.0, 0.0
-
-
-def _infer_roof_status(weather_raw: str | None, wind_raw: str | None) -> str | None:
-    """
-    Infer a simple roof status from available weather text.
-
-    This is best-effort ingest metadata only, not a modeling feature.
-    """
-    combined = " ".join([str(x) for x in [weather_raw, wind_raw] if x]).lower()
-    if not combined:
-        return None
-
-    if "roof closed" in combined or "closed roof" in combined:
-        return "closed"
-    if "roof open" in combined or "open roof" in combined:
-        return "open"
-    if "dome" in combined:
-        return "closed"
-
-    return None
-
-
-def fetch_weather_json(
-    season: int,
-    start_date: str | date | datetime | None = None,
-    end_date: str | date | datetime | None = None,
-    game_types: Iterable[str] = DEFAULT_GAME_TYPES,
-    sport_id: int = 1,
-    hydrate: str = "weather,venue,linescore,team",
-    request_timeout: int = REQUEST_TIMEOUT,
-) -> dict[str, Any]:
-    """
-    Fetch raw MLB schedule JSON including weather-related fields.
-    """
-    params: dict[str, Any] = {
-        "sportId": sport_id,
-        "season": season,
-        "gameTypes": _coerce_game_type_param(game_types),
-        "hydrate": hydrate,
+    params = {
+        "ids": ",".join(ids),
+        "format": "json",
+        "hours": str(hours),
     }
 
-    start_date_iso = _coerce_iso_date(start_date)
-    end_date_iso = _coerce_iso_date(end_date)
-
-    if start_date_iso:
-        params["startDate"] = start_date_iso
-    if end_date_iso:
-        params["endDate"] = end_date_iso
-
-    response = requests.get(MLB_SCHEDULE_URL, params=params, timeout=request_timeout)
+    response = requests.get(METAR_API_URL, params=params, timeout=request_timeout)
     response.raise_for_status()
-    return response.json()
+
+    payload = response.json()
+    if isinstance(payload, list):
+        return payload
+    return []
 
 
-def normalize_weather_json(payload: dict[str, Any], season: int) -> pd.DataFrame:
+def normalize_metar_records(records: list[dict[str, Any]]) -> pd.DataFrame:
     """
-    Normalize raw MLB schedule JSON into a one-row-per-game weather DataFrame.
+    Normalize raw METAR records into station-level weather observations.
     """
     rows: list[dict[str, Any]] = []
 
-    for date_block in payload.get("dates", []):
-        fallback_game_date = date_block.get("date")
+    for rec in records:
+        station_id = (
+            rec.get("icaoId")
+            or rec.get("station_id")
+            or rec.get("station")
+            or rec.get("id")
+        )
 
-        for game in date_block.get("games", []):
-            weather_raw = game.get("weather")
-            wind_raw = game.get("wind")
+        observed_at = (
+            rec.get("obsTime")
+            or rec.get("observationTime")
+            or rec.get("observation_time")
+        )
 
-            wind_direction_text = _extract_wind_direction_text(wind_raw)
-            weather_wind_out, weather_wind_in, weather_crosswind = _normalize_wind_flags(wind_direction_text)
+        temp_c = _to_float(
+            rec.get("temp")
+            if rec.get("temp") is not None
+            else rec.get("tempC")
+        )
+        dewpoint_c = _to_float(
+            rec.get("dewp")
+            if rec.get("dewp") is not None
+            else rec.get("dewpoint")
+        )
 
-            row = {
-                "game_pk": game.get("gamePk"),
-                "game_date": game.get("officialDate") or fallback_game_date,
-                "season": season,
-                "home_team": _safe_get(game, "teams", "home", "team", "abbreviation"),
-                "away_team": _safe_get(game, "teams", "away", "team", "abbreviation"),
-                "venue_id": _safe_get(game, "venue", "id"),
-                "venue_name": _safe_get(game, "venue", "name"),
-                "temperature": _extract_temperature_f(weather_raw),
-                "temperature_f": _extract_temperature_f(weather_raw),
-                "wind_speed": _extract_wind_mph(wind_raw),
-                "wind_mph": _extract_wind_mph(wind_raw),
-                "wind_direction": wind_raw,
-                "wind_dir": wind_direction_text,
-                "weather_condition": _extract_weather_condition(weather_raw),
-                "weather_raw": weather_raw,
-                "wind_raw": wind_raw,
-                "roof_status": _infer_roof_status(weather_raw, wind_raw),
-                "humidity": None,
-                "precipitation_risk": None,
-                "weather_wind_out": weather_wind_out,
-                "weather_wind_in": weather_wind_in,
-                "weather_crosswind": weather_crosswind,
-                "weather_source": "mlb_statsapi_schedule",
-                "weather_pull_ts": pd.Timestamp.utcnow().isoformat(),
-            }
-            rows.append(row)
+        wind_dir_deg = _to_float(
+            rec.get("wdir")
+            if rec.get("wdir") is not None
+            else rec.get("windDir")
+        )
+        wind_speed_kt = _to_float(
+            rec.get("wspd")
+            if rec.get("wspd") is not None
+            else rec.get("windSpeed")
+        )
+        wind_gust_kt = _to_float(
+            rec.get("wgst")
+            if rec.get("wgst") is not None
+            else rec.get("windGust")
+        )
+
+        pressure_hpa = _to_float(
+            rec.get("altim")
+            if rec.get("altim") is not None
+            else rec.get("seaLevelPressure")
+        )
+
+        visibility_mi = _to_float(
+            rec.get("visib")
+            if rec.get("visib") is not None
+            else rec.get("visibility")
+        )
+
+        # Unit conversions
+        temperature_f = (temp_c * 9.0 / 5.0 + 32.0) if temp_c is not None else None
+        dewpoint_f = (dewpoint_c * 9.0 / 5.0 + 32.0) if dewpoint_c is not None else None
+        wind_mph = (wind_speed_kt * 1.15078) if wind_speed_kt is not None else None
+        wind_gust_mph = (wind_gust_kt * 1.15078) if wind_gust_kt is not None else None
+
+        weather_wind_out, weather_wind_in, weather_crosswind = _normalize_wind_flags(wind_dir_deg)
+
+        row = {
+            "station_id": station_id,
+            "observed_at_utc": pd.to_datetime(observed_at, utc=True, errors="coerce"),
+            "raw_metar": rec.get("rawOb") or rec.get("raw_text") or rec.get("rawText"),
+            "flight_category": rec.get("flight_category"),
+            "weather_condition": rec.get("wxString") or rec.get("wx"),
+            "temperature_c": temp_c,
+            "temperature_f": temperature_f,
+            "dewpoint_c": dewpoint_c,
+            "dewpoint_f": dewpoint_f,
+            "wind_dir_degrees": wind_dir_deg,
+            "wind_speed_kt": wind_speed_kt,
+            "wind_speed_mph": wind_mph,
+            "wind_gust_kt": wind_gust_kt,
+            "wind_gust_mph": wind_gust_mph,
+            "pressure_hpa": pressure_hpa,
+            "visibility_miles": visibility_mi,
+            "ceiling_ft": _to_int(rec.get("ceil")),
+            "humidity": None,  # can be derived later if desired
+            "precipitation_mm": None,  # usually not directly populated in METAR JSON
+            "weather_wind_out": weather_wind_out,
+            "weather_wind_in": weather_wind_in,
+            "weather_crosswind": weather_crosswind,
+            "weather_source": "awc_metar",
+            "weather_pull_ts": pd.Timestamp.utcnow(),
+        }
+        rows.append(row)
 
     df = pd.DataFrame(rows)
 
     if df.empty:
         return pd.DataFrame(
             columns=[
-                "game_pk",
-                "game_date",
-                "season",
-                "home_team",
-                "away_team",
-                "venue_id",
-                "venue_name",
-                "temperature",
-                "temperature_f",
-                "wind_speed",
-                "wind_mph",
-                "wind_direction",
-                "wind_dir",
+                "station_id",
+                "observed_at_utc",
+                "raw_metar",
+                "flight_category",
                 "weather_condition",
-                "weather_raw",
-                "wind_raw",
-                "roof_status",
+                "temperature_c",
+                "temperature_f",
+                "dewpoint_c",
+                "dewpoint_f",
+                "wind_dir_degrees",
+                "wind_speed_kt",
+                "wind_speed_mph",
+                "wind_gust_kt",
+                "wind_gust_mph",
+                "pressure_hpa",
+                "visibility_miles",
+                "ceiling_ft",
                 "humidity",
-                "precipitation_risk",
+                "precipitation_mm",
                 "weather_wind_out",
                 "weather_wind_in",
                 "weather_crosswind",
@@ -283,40 +319,146 @@ def normalize_weather_json(payload: dict[str, Any], season: int) -> pd.DataFrame
             ]
         )
 
-    df["game_pk"] = pd.to_numeric(df["game_pk"], errors="coerce").astype("Int64")
-    df["season"] = pd.to_numeric(df["season"], errors="coerce").astype("Int64")
-    df["venue_id"] = pd.to_numeric(df["venue_id"], errors="coerce").astype("Int64")
-    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce").dt.date.astype("string")
-
-    float_cols = [
-        "temperature",
-        "temperature_f",
-        "wind_speed",
-        "wind_mph",
-        "humidity",
-        "precipitation_risk",
-        "weather_wind_out",
-        "weather_wind_in",
-        "weather_crosswind",
-    ]
-    for col in float_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    sort_cols = ["game_date", "game_pk"]
-    df = df.sort_values(sort_cols, kind="stable").reset_index(drop=True)
-
+    df = df.sort_values(["station_id", "observed_at_utc"], kind="stable").reset_index(drop=True)
     return df
+
+
+def build_weather_games(
+    schedule_df: pd.DataFrame,
+    station_map: dict[str, str] | None = None,
+    hours: float = 3.0,
+    request_timeout: int = REQUEST_TIMEOUT,
+    validate: bool = True,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Build one-row-per-game weather table by joining games to nearby METAR stations.
+
+    Parameters
+    ----------
+    schedule_df:
+        Normalized schedule DataFrame. Must include:
+        - game_pk
+        - game_date
+        - season
+        - home_team
+        - away_team
+        - venue_id
+        - venue_name
+    station_map:
+        Optional override mapping of team abbreviation -> METAR station.
+    hours:
+        Lookback window for most recent METAR.
+    request_timeout:
+        Timeout in seconds.
+    validate:
+        Whether to validate output.
+    verbose:
+        Whether to print summary.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per game with normalized weather fields.
+    """
+    required_cols = {
+        "game_pk",
+        "game_date",
+        "season",
+        "home_team",
+        "away_team",
+        "venue_id",
+        "venue_name",
+    }
+    missing = sorted(required_cols.difference(schedule_df.columns))
+    if missing:
+        raise ValueError(f"build_weather_games requires schedule columns: missing={missing}")
+
+    station_lookup = dict(TEAM_TO_METAR_STATION)
+    if station_map:
+        station_lookup.update({str(k): str(v).upper() for k, v in station_map.items()})
+
+    work = schedule_df.copy()
+    work["station_id"] = work["home_team"].map(station_lookup)
+
+    station_ids = [x for x in work["station_id"].dropna().astype(str).unique().tolist() if x]
+    metar_records = fetch_metar_json(
+        station_ids=station_ids,
+        hours=hours,
+        request_timeout=request_timeout,
+    )
+    station_weather = normalize_metar_records(metar_records)
+
+    if not station_weather.empty:
+        station_weather = (
+            station_weather.sort_values(["station_id", "observed_at_utc"], kind="stable")
+            .drop_duplicates(subset=["station_id"], keep="last")
+            .reset_index(drop=True)
+        )
+
+    df = work.merge(
+        station_weather,
+        on="station_id",
+        how="left",
+        validate="m:1",
+    )
+
+    df["roof_status"] = df["home_team"].map(_infer_roof_status)
+
+    out = pd.DataFrame(
+        {
+            "game_pk": pd.to_numeric(df["game_pk"], errors="coerce").astype("Int64"),
+            "game_date": pd.to_datetime(df["game_date"], errors="coerce").dt.date.astype("string"),
+            "season": pd.to_numeric(df["season"], errors="coerce").astype("Int64"),
+            "home_team": df["home_team"].astype("string"),
+            "away_team": df["away_team"].astype("string"),
+            "venue_id": pd.to_numeric(df["venue_id"], errors="coerce").astype("Int64"),
+            "venue_name": df["venue_name"].astype("string"),
+            "station_id": df["station_id"].astype("string"),
+            "observed_at_utc": pd.to_datetime(df["observed_at_utc"], utc=True, errors="coerce"),
+            "temperature_f": pd.to_numeric(df["temperature_f"], errors="coerce"),
+            "temperature_c": pd.to_numeric(df["temperature_c"], errors="coerce"),
+            "dewpoint_f": pd.to_numeric(df["dewpoint_f"], errors="coerce"),
+            "dewpoint_c": pd.to_numeric(df["dewpoint_c"], errors="coerce"),
+            "wind_mph": pd.to_numeric(df["wind_speed_mph"], errors="coerce"),
+            "wind_kt": pd.to_numeric(df["wind_speed_kt"], errors="coerce"),
+            "wind_gust_mph": pd.to_numeric(df["wind_gust_mph"], errors="coerce"),
+            "wind_gust_kt": pd.to_numeric(df["wind_gust_kt"], errors="coerce"),
+            "wind_direction_deg": pd.to_numeric(df["wind_dir_degrees"], errors="coerce"),
+            "wind_dir_text": df["wind_dir_degrees"].apply(
+                lambda x: None if pd.isna(x) else f"{int(float(x))}°"
+            ).astype("string"),
+            "pressure_hpa": pd.to_numeric(df["pressure_hpa"], errors="coerce"),
+            "visibility_miles": pd.to_numeric(df["visibility_miles"], errors="coerce"),
+            "ceiling_ft": pd.to_numeric(df["ceiling_ft"], errors="coerce").astype("Int64"),
+            "weather_condition": df["weather_condition"].astype("string"),
+            "flight_category": df["flight_category"].astype("string"),
+            "humidity": pd.to_numeric(df["humidity"], errors="coerce"),
+            "precipitation_mm": pd.to_numeric(df["precipitation_mm"], errors="coerce"),
+            "roof_status": df["roof_status"].astype("string"),
+            "weather_wind_out": pd.to_numeric(df["weather_wind_out"], errors="coerce"),
+            "weather_wind_in": pd.to_numeric(df["weather_wind_in"], errors="coerce"),
+            "weather_crosswind": pd.to_numeric(df["weather_crosswind"], errors="coerce"),
+            "raw_metar": df["raw_metar"].astype("string"),
+            "weather_source": df["weather_source"].fillna("awc_metar").astype("string"),
+            "weather_pull_ts": pd.to_datetime(df["weather_pull_ts"], utc=True, errors="coerce"),
+        }
+    )
+
+    out = out.sort_values(["game_date", "game_pk"], kind="stable").reset_index(drop=True)
+
+    if validate:
+        validate_weather_games(out)
+
+    if verbose:
+        summarize_weather_games(out)
+
+    return out
 
 
 def validate_weather_games(df: pd.DataFrame) -> None:
     """
     Validate normalized weather output.
-
-    Raises
-    ------
-    ValueError
-        If required columns are missing or key constraints fail.
     """
     required_columns = {
         "game_pk",
@@ -325,6 +467,7 @@ def validate_weather_games(df: pd.DataFrame) -> None:
         "home_team",
         "away_team",
         "venue_id",
+        "station_id",
     }
     missing = sorted(required_columns.difference(df.columns))
     if missing:
@@ -340,7 +483,9 @@ def validate_weather_games(df: pd.DataFrame) -> None:
 
 
 def summarize_weather_games(df: pd.DataFrame, label: str = "weather_game") -> None:
-    """Print a compact ingest summary."""
+    """
+    Print compact ingest summary.
+    """
     row_count = len(df)
     distinct_games = df["game_pk"].nunique(dropna=True) if "game_pk" in df.columns else 0
     min_date = df["game_date"].min() if "game_date" in df.columns and row_count else None
@@ -351,53 +496,9 @@ def summarize_weather_games(df: pd.DataFrame, label: str = "weather_game") -> No
     print(f"Min game_date: {min_date}")
     print(f"Max game_date: {max_date}")
 
-    for col in ["game_pk", "game_date", "temperature_f", "wind_mph", "wind_dir"]:
+    for col in ["game_pk", "station_id", "temperature_f", "wind_mph", "wind_direction_deg"]:
         if col in df.columns:
             print(f"Nulls [{col}]: {int(df[col].isna().sum()):,}")
 
     if "game_pk" in df.columns:
         print(f"Duplicates on [game_pk]: {int(df.duplicated(subset=['game_pk']).sum()):,}")
-
-
-def build_weather_games(
-    season: int,
-    start_date: str | date | datetime | None = None,
-    end_date: str | date | datetime | None = None,
-    game_types: Iterable[str] = DEFAULT_GAME_TYPES,
-    sport_id: int = 1,
-    hydrate: str = "weather,venue,linescore,team",
-    request_timeout: int = REQUEST_TIMEOUT,
-    validate: bool = True,
-    verbose: bool = True,
-) -> pd.DataFrame:
-    """
-    Fetch, normalize, and validate MLB weather data.
-
-    Returns
-    -------
-    pandas.DataFrame
-        Clean normalized weather table.
-    """
-    payload = fetch_weather_json(
-        season=season,
-        start_date=start_date,
-        end_date=end_date,
-        game_types=game_types,
-        sport_id=sport_id,
-        hydrate=hydrate,
-        request_timeout=request_timeout,
-    )
-    df = normalize_weather_json(payload=payload, season=season)
-
-    if validate:
-        validate_weather_games(df)
-
-    if verbose:
-        label_parts = [str(season)]
-        if start_date:
-            label_parts.append(_coerce_iso_date(start_date) or "")
-        if end_date and end_date != start_date:
-            label_parts.append(_coerce_iso_date(end_date) or "")
-        summarize_weather_games(df, label=f"weather_game_{'_'.join([p for p in label_parts if p])}")
-
-    return df
