@@ -1,1 +1,0 @@
-"""Shared live daily utilities."""
