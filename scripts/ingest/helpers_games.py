@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import logging
 import pandas as pd
 
 from src.utils.checks import print_rowcount, require_files
@@ -33,6 +34,15 @@ def build_games_from_pa(dirs: dict[str, Path], season: int) -> Path:
         if col not in pa_df.columns:
             pa_df[col] = pd.NA
 
+    existing_df = pd.DataFrame(columns=REQUIRED_GAME_COLUMNS)
+    out_path = raw_by_season / f"games_{season}.parquet"
+    if out_path.exists():
+        existing_df = read_parquet(out_path)
+        for col in REQUIRED_GAME_COLUMNS:
+            if col not in existing_df.columns:
+                existing_df[col] = pd.NA
+        existing_df = existing_df[REQUIRED_GAME_COLUMNS]
+
     games_df = (
         pa_df[["game_pk", "game_date", "home_team", "away_team"]]
         .dropna(subset=["game_pk"])
@@ -51,8 +61,28 @@ def build_games_from_pa(dirs: dict[str, Path], season: int) -> Path:
 
     games_df = games_df[REQUIRED_GAME_COLUMNS]
 
-    out_path = raw_by_season / f"games_{season}.parquet"
-    print_rowcount(f"games_{season}", games_df)
+    if games_df.empty and not existing_df.empty:
+        final_df = existing_df.copy()
+        logging.info(
+            "season_ingest zero-row fetch; preserving existing season file path=%s existing_rows=%s",
+            out_path,
+            len(existing_df),
+        )
+    elif not existing_df.empty:
+        final_df = pd.concat([existing_df, games_df], ignore_index=True)
+        final_df = final_df.drop_duplicates(subset=["game_pk"], keep="last")
+    else:
+        final_df = games_df.copy()
+
+    logging.info(
+        "season_ingest existing_rows=%s new_rows=%s final_rows=%s file=%s",
+        len(existing_df),
+        len(games_df),
+        len(final_df),
+        out_path,
+    )
+
+    print_rowcount(f"games_{season}", final_df)
     print(f"Writing to: {out_path.resolve()}")
-    write_parquet(games_df, out_path)
+    write_parquet(final_df, out_path)
     return out_path

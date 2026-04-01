@@ -75,6 +75,73 @@ def _log_mart_stats(name: str, df: pd.DataFrame) -> None:
     logging.info(msg)
 
 
+def _existing_rows(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        return int(len(read_parquet(path)))
+    except Exception:
+        logging.exception("Failed reading existing mart for row count path=%s", path)
+        return 0
+
+
+def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _derive_moneyline_targets_from_games(processed_dir: Path, season: int) -> pd.DataFrame:
+    processed_games_path = processed_dir / "by_season" / f"games_{season}.parquet"
+    raw_games_path = processed_dir.parent / "raw" / "by_season" / f"games_{season}.parquet"
+
+    if not processed_games_path.exists() and not raw_games_path.exists():
+        logging.warning("[MONEYLINE] missing target file and no games source available processed=%s raw=%s", processed_games_path, raw_games_path)
+        return pd.DataFrame()
+
+    games_path = processed_games_path if processed_games_path.exists() else raw_games_path
+    games = read_parquet(games_path)
+    if games.empty:
+        logging.warning("[MONEYLINE] games source empty path=%s", games_path)
+        return pd.DataFrame()
+
+    home_col = _pick_col(games, ["home_score", "home_final_score", "home_runs", "post_home_score", "final_home_score"])
+    away_col = _pick_col(games, ["away_score", "away_final_score", "away_runs", "post_away_score", "final_away_score"])
+    if (home_col is None or away_col is None) and games_path == processed_games_path and raw_games_path.exists():
+        logging.info("[MONEYLINE] processed games missing scores; falling back to raw games path=%s", raw_games_path)
+        games_path = raw_games_path
+        games = read_parquet(games_path)
+        home_col = _pick_col(games, ["home_score", "home_final_score", "home_runs", "post_home_score", "final_home_score"])
+        away_col = _pick_col(games, ["away_score", "away_final_score", "away_runs", "post_away_score", "final_away_score"])
+
+    if home_col is None or away_col is None:
+        logging.warning("[MONEYLINE] score columns still missing path=%s cols=%s", games_path, sorted(games.columns))
+        return pd.DataFrame()
+    logging.info("[MONEYLINE] raw_games_rows=%s source_path=%s", len(games), games_path)
+
+    out = games[[c for c in ["game_pk", "game_date", "home_team", "away_team"] if c in games.columns]].copy()
+    out["game_pk"] = pd.to_numeric(out.get("game_pk"), errors="coerce").astype("Int64")
+    hs = pd.to_numeric(games[home_col], errors="coerce")
+    aw = pd.to_numeric(games[away_col], errors="coerce")
+    out["target_home_win"] = pd.NA
+    out.loc[hs > aw, "target_home_win"] = 1
+    out.loc[hs < aw, "target_home_win"] = 0
+    out["target_home_win"] = pd.to_numeric(out["target_home_win"], errors="coerce").astype("Int64")
+    out = out.drop_duplicates(subset=["game_pk"], keep="last")
+    rows_with_scores = int((hs.notna() & aw.notna()).sum())
+    logging.info("[MONEYLINE] rows_with_scores=%s", rows_with_scores)
+    out = out.dropna(subset=["target_home_win"]).copy()
+    logging.info("[MONEYLINE] labeled_rows=%s", len(out))
+    logging.info(
+        "moneyline missing target file -> deriving from game scores season=%s source_rows=%s derived_rows=%s",
+        season,
+        len(games),
+        len(out),
+    )
+    return out
+
+
 def _game_level_rollups(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     if df.empty or "game_pk" not in df.columns:
         return pd.DataFrame(columns=["game_pk"])
@@ -133,7 +200,10 @@ def _load_moneyline_targets(dirs: dict[str, Path], season: int | None) -> pd.Dat
 def _merge_moneyline_targets(mart_df: pd.DataFrame, processed_dir: Path, season: int | None) -> pd.DataFrame:
     out = mart_df.copy()
     targets = _load_moneyline_targets({"processed_dir": processed_dir}, season)
+    if (targets is None or targets.empty) and season is not None:
+        targets = _derive_moneyline_targets_from_games(processed_dir, season)
     if targets is None or targets.empty:
+        logging.warning("moneyline target source rows=0 season=%s", season)
         return out
 
     slim = targets[["game_pk", "target_home_win"]].copy()
@@ -141,6 +211,7 @@ def _merge_moneyline_targets(mart_df: pd.DataFrame, processed_dir: Path, season:
     slim["target_home_win"] = pd.to_numeric(slim["target_home_win"], errors="coerce").astype("Int64")
 
     out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
+    logging.info("moneyline source rows=%s unique_games=%s", len(out), int(out["game_pk"].nunique()) if "game_pk" in out.columns else 0)
     out = out.merge(slim.drop_duplicates(subset=["game_pk"], keep="last"), on="game_pk", how="left", suffixes=("", "_t"))
     if "target_home_win_t" in out.columns:
         out["target_home_win"] = pd.to_numeric(out.get("target_home_win"), errors="coerce").fillna(
@@ -287,96 +358,79 @@ def build_marts(
 
     outputs: dict[str, Path] = {}
     for filename, schema in MART_SCHEMAS.items():
-        mart_df = _base_mart(spine, schema)
-        if not batter_game_rollup.empty:
-            mart_df = mart_df.merge(batter_game_rollup, on="game_pk", how="left")
-        if not pitcher_game_rollup.empty:
-            mart_df = mart_df.merge(pitcher_game_rollup, on="game_pk", how="left")
+        out_path = _mart_out_path(dirs["marts_dir"], filename, season)
+        market_name = filename.replace("_features.parquet", "").replace(".parquet", "")
+        try:
+            mart_df = _base_mart(spine, schema)
+            if not batter_game_rollup.empty:
+                mart_df = mart_df.merge(batter_game_rollup, on="game_pk", how="left")
+            if not pitcher_game_rollup.empty:
+                mart_df = mart_df.merge(pitcher_game_rollup, on="game_pk", how="left")
 
-        if filename == "moneyline_features.parquet":
-            mart_df = _moneyline_side_offense_features(batter_roll, mart_df)
-            mart_df = _merge_moneyline_targets(mart_df, dirs["processed_dir"], season)
-            if "target_home_win" in mart_df.columns:
-                mart_df = mart_df[mart_df["target_home_win"].notna()].copy()
-                logging.info(
-                    "moneyline labeled rows=%s unique_games=%s null_rate=%.4f",
-                    len(mart_df),
-                    int(mart_df["game_pk"].nunique()) if "game_pk" in mart_df.columns else 0,
-                    float(mart_df["target_home_win"].isna().mean()) if len(mart_df) else 0.0,
-                )
-        elif filename == "nrfi_features.parquet":
-            nrfi_blocks = build_nrfi_feature_blocks(dirs, spine, season)
-            if not nrfi_blocks.empty:
-                mart_df = mart_df.merge(nrfi_blocks, on="game_pk", how="left")
-            nrfi_t = _read_target_file(dirs["processed_dir"], "nrfi", season, ["game_pk", "target_nrfi", "target_yrfi"])
-            if not nrfi_t.empty:
-                mart_df = mart_df.merge(nrfi_t[["game_pk", "target_nrfi", "target_yrfi"]].drop_duplicates(subset=["game_pk"]), on="game_pk", how="left", suffixes=("", "_t"))
-                for c in ["target_nrfi", "target_yrfi"]:
-                    tc = f"{c}_t"
-                    if tc in mart_df.columns:
-                        mart_df[c] = pd.to_numeric(mart_df.get(c), errors="coerce").fillna(pd.to_numeric(mart_df[tc], errors="coerce")).astype("Int64")
-                        mart_df = mart_df.drop(columns=[tc])
-        elif filename == "hitter_props_features.parquet":
-            if "game_pk" not in mart_df.columns:
-                raise ValueError("hitter_props_features missing game_pk")
-
-            mart_df["game_pk"] = pd.to_numeric(mart_df["game_pk"], errors="coerce").astype("Int64")
-
-            # Hitter props mart MUST be batter-game grain.
-            # Use targets as the authoritative key set (game_pk, batter_id).
-            targets = _load_hitter_targets(dirs["processed_dir"], season)
-            if targets.empty:
-                if season is None:
-                    logging.warning(
-                        "hitter_props targets empty for multi-season build; skipping hitter_props_features mart"
+            if filename == "moneyline_features.parquet":
+                mart_df = _moneyline_side_offense_features(batter_roll, mart_df)
+                mart_df = _merge_moneyline_targets(mart_df, dirs["processed_dir"], season)
+                if "target_home_win" in mart_df.columns:
+                    mart_df = mart_df[mart_df["target_home_win"].notna()].copy()
+                    logging.info(
+                        "moneyline labeled rows=%s unique_games=%s null_rate=%.4f",
+                        len(mart_df),
+                        int(mart_df["game_pk"].nunique()) if "game_pk" in mart_df.columns else 0,
+                        float(mart_df["target_home_win"].isna().mean()) if len(mart_df) else 0.0,
                     )
+                logging.info(
+                    "moneyline final feature rows=%s unique_games=%s",
+                    len(mart_df),
+                    int(mart_df["game_pk"].nunique()) if "game_pk" in mart_df.columns and len(mart_df) else 0,
+                )
+                logging.info("[MONEYLINE] final_rows=%s", len(mart_df))
+            elif filename == "nrfi_features.parquet":
+                nrfi_blocks = build_nrfi_feature_blocks(dirs, spine, season)
+                if not nrfi_blocks.empty:
+                    mart_df = mart_df.merge(nrfi_blocks, on="game_pk", how="left")
+                nrfi_t = _read_target_file(dirs["processed_dir"], "nrfi", season, ["game_pk", "target_nrfi", "target_yrfi"])
+                if not nrfi_t.empty:
+                    mart_df = mart_df.merge(nrfi_t[["game_pk", "target_nrfi", "target_yrfi"]].drop_duplicates(subset=["game_pk"]), on="game_pk", how="left", suffixes=("", "_t"))
+                    for c in ["target_nrfi", "target_yrfi"]:
+                        tc = f"{c}_t"
+                        if tc in mart_df.columns:
+                            mart_df[c] = pd.to_numeric(mart_df.get(c), errors="coerce").fillna(pd.to_numeric(mart_df[tc], errors="coerce")).astype("Int64")
+                            mart_df = mart_df.drop(columns=[tc])
+            elif filename == "hitter_props_features.parquet":
+                if "game_pk" not in mart_df.columns:
+                    raise ValueError("hitter_props_features missing game_pk")
+
+                mart_df["game_pk"] = pd.to_numeric(mart_df["game_pk"], errors="coerce").astype("Int64")
+                targets = _load_hitter_targets(dirs["processed_dir"], season)
+                if targets.empty:
+                    logging.warning("hitter_props targets empty for season=%s; skipping market", season)
                     continue
-                raise ValueError(f"hitter_props targets empty for season={season}")
 
-            targets = targets.copy()
-            targets["game_pk"] = pd.to_numeric(targets["game_pk"], errors="coerce").astype("Int64")
-            targets["batter_id"] = pd.to_numeric(targets["batter_id"], errors="coerce").astype("Int64")
-            targets_keys = targets[["game_pk", "batter_id"]].drop_duplicates()
-
-            # Prevent any feature-side batter_id column from overwriting the target key.
-            if "batter_id" in mart_df.columns:
-                mart_df = mart_df.drop(columns=["batter_id"])
-
-            # If the feature frame is only game-grain, broadcast onto all batters in that game.
-            # If it already has batter_id elsewhere, you can later tighten this to a 2-key merge.
-            mart_df = targets_keys.merge(mart_df, on=["game_pk"], how="left")
-            source_col, source_non_null = "targets:batter_id", 1.0
-
-            logging.info(
-                "hitter_props mart keys before target merge: game_pk dtype=%s batter dtype=%s batter_id dtype=%s mlbam_batter_id dtype=%s",
-                mart_df["game_pk"].dtype if "game_pk" in mart_df.columns else "missing",
-                mart_df["batter"].dtype if "batter" in mart_df.columns else "missing",
-                mart_df["batter_id"].dtype if "batter_id" in mart_df.columns else "missing",
-                mart_df["mlbam_batter_id"].dtype if "mlbam_batter_id" in mart_df.columns else "missing",
-            )
-
-            targets = _load_hitter_targets(dirs["processed_dir"], season)
-            if not targets.empty and {"game_pk", "batter_id"}.issubset(mart_df.columns):
                 targets = targets.copy()
                 targets["game_pk"] = pd.to_numeric(targets["game_pk"], errors="coerce").astype("Int64")
                 targets["batter_id"] = pd.to_numeric(targets["batter_id"], errors="coerce").astype("Int64")
+                targets_keys = targets[["game_pk", "batter_id"]].drop_duplicates()
+
+                if "batter_id" in mart_df.columns:
+                    mart_df = mart_df.drop(columns=["batter_id"])
+                mart_df = targets_keys.merge(mart_df, on=["game_pk"], how="left")
+                source_col, source_non_null = "targets:batter_id", 1.0
 
                 required_target_cols = {"game_pk", "batter_id", "target_hit1p", "target_tb2p", "target_rbi1p", "target_bb1p"}
                 missing_target_cols = required_target_cols.difference(targets.columns)
                 if missing_target_cols:
-                    raise ValueError(f"hitter_props target file missing required columns: {sorted(missing_target_cols)}")
+                    logging.warning("hitter_props target file missing required columns=%s; skipping market", sorted(missing_target_cols))
+                    continue
 
                 hitter_keys = mart_df[["game_pk", "batter_id"]].drop_duplicates()
                 target_keys = targets[["game_pk", "batter_id"]].drop_duplicates()
                 overlap_n = int(hitter_keys.merge(target_keys, on=["game_pk", "batter_id"], how="inner").shape[0])
-
                 mart_df = mart_df.merge(
                     targets[["game_pk", "batter_id", "target_hit1p", "target_tb2p", "target_rbi1p", "target_bb1p"]],
                     on=["game_pk", "batter_id"],
                     how="left",
                     suffixes=("", "_t"),
                 )
-
                 for c in ["target_hit1p", "target_tb2p", "target_rbi1p", "target_bb1p"]:
                     tc = f"{c}_t"
                     if tc in mart_df.columns:
@@ -390,83 +444,80 @@ def build_marts(
                     "target_bb1p": float(mart_df["target_bb1p"].isna().mean()) if "target_bb1p" in mart_df.columns and len(mart_df) else 1.0,
                 }
                 match_rate = 1.0 - null_rates["target_hit1p"]
-                logging.info(
-                    "hitter_props target merge match_rate=%.4f hitter_keys=%s target_keys=%s overlap_keys=%s null_hit=%.4f null_tb=%.4f null_rbi=%.4f null_bb=%.4f",
-                    match_rate,
-                    int(hitter_keys.shape[0]),
-                    int(target_keys.shape[0]),
-                    overlap_n,
-                    null_rates["target_hit1p"],
-                    null_rates["target_tb2p"],
-                    null_rates["target_rbi1p"],
-                    null_rates["target_bb1p"],
+                if match_rate < 0.90 or overlap_n == 0:
+                    logging.warning(
+                        "hitter_props target merge weak alignment match_rate=%.4f overlap=%s chosen_source_col=%s source_non_null_pct=%.4f",
+                        match_rate,
+                        overlap_n,
+                        source_col,
+                        source_non_null,
+                    )
+                    continue
+            elif filename == "pitcher_props_features.parquet":
+                pt = _read_target_file(
+                    dirs["processed_dir"],
+                    "pitcher_props",
+                    season,
+                    ["game_pk", "pitcher_id", "target_k", "target_outs", "target_er", "target_bb"],
                 )
+                if pt.empty:
+                    logging.warning("pitcher_props targets empty for season=%s; skipping market", season)
+                    continue
 
-                if match_rate < 0.90:
-                    raise ValueError(
-                        "hitter_props target merge low match rate. "
-                        f"chosen_source_col={source_col} source_non_null_pct={source_non_null:.4f} "
-                        f"hitter_game_pk_dtype={mart_df['game_pk'].dtype if 'game_pk' in mart_df.columns else 'missing'} "
-                        f"hitter_batter_key=batter_id dtype={mart_df['batter_id'].dtype if 'batter_id' in mart_df.columns else 'missing'} "
-                        f"target_game_pk_dtype={targets['game_pk'].dtype if 'game_pk' in targets.columns else 'missing'} "
-                        f"target_batter_key=batter_id dtype={targets['batter_id'].dtype if 'batter_id' in targets.columns else 'missing'} "
-                        f"hitter_key_head={hitter_keys.head(5).to_dict('records')} "
-                        f"target_key_head={target_keys.head(5).to_dict('records')}"
-                    )
-                if overlap_n == 0:
-                    raise ValueError(
-                        "hitter_props target merge has zero overlapping keys. "
-                        f"chosen_source_col={source_col} source_non_null_pct={source_non_null:.4f} "
-                        f"hitter_key_head={hitter_keys.head(5).to_dict('records')} "
-                        f"target_key_head={target_keys.head(5).to_dict('records')}"
-                    )
-        elif filename == "pitcher_props_features.parquet":
-            # Pitcher props mart MUST be pitcher-game grain.
-            # Use targets as the authoritative key set (game_pk, pitcher_id).
-            pt = _read_target_file(
-                dirs["processed_dir"],
-                "pitcher_props",
-                season,
-                ["game_pk", "pitcher_id", "target_k", "target_outs", "target_er", "target_bb"],
+                pt = pt.copy()
+                pt["game_pk"] = pd.to_numeric(pt["game_pk"], errors="coerce").astype("Int64")
+                pt["pitcher_id"] = pd.to_numeric(pt["pitcher_id"], errors="coerce").astype("Int64")
+                pt_keys = pt[["game_pk", "pitcher_id"]].drop_duplicates()
+                if "pitcher_id" in mart_df.columns:
+                    mart_df = mart_df.drop(columns=["pitcher_id"])
+                mart_df = pt_keys.merge(mart_df, on=["game_pk"], how="left")
+                mart_df = mart_df.merge(
+                    pt[["game_pk", "pitcher_id", "target_k", "target_outs", "target_er", "target_bb"]],
+                    on=["game_pk", "pitcher_id"],
+                    how="left",
+                )
+                for c in ["target_k", "target_outs", "target_er", "target_bb"]:
+                    if c in mart_df.columns:
+                        mart_df[c] = pd.to_numeric(mart_df[c], errors="coerce").astype("Int64")
+
+            mart_df = _filter_to_season(mart_df, season)
+            mart_df = _apply_date_range(mart_df, start, end)
+
+            existing_rows = _existing_rows(out_path)
+            new_rows = int(len(mart_df))
+            if new_rows == 0 and existing_rows > 0:
+                logging.warning("mart_refresh skipped overwrite because rebuild result empty path=%s", out_path)
+                outputs[filename] = out_path
+                continue
+
+            print_rowcount(filename.replace(".parquet", ""), mart_df)
+            _log_mart_stats(filename.replace(".parquet", ""), mart_df)
+            print(f"Writing to: {out_path.resolve()}")
+            write_parquet(mart_df, out_path)
+            outputs[filename] = out_path
+            logging.info(
+                "mart_refresh market=%s existing_rows=%s new_rows=%s final_rows=%s path=%s",
+                market_name,
+                existing_rows,
+                new_rows,
+                new_rows,
+                out_path,
             )
-            if pt.empty:
-                raise ValueError(f"pitcher_props targets empty for season={season}")
-
-            pt = pt.copy()
-            pt["game_pk"] = pd.to_numeric(pt["game_pk"], errors="coerce").astype("Int64")
-            pt["pitcher_id"] = pd.to_numeric(pt["pitcher_id"], errors="coerce").astype("Int64")
-            pt_keys = pt[["game_pk", "pitcher_id"]].drop_duplicates()
-
-            # Prevent any feature-side pitcher_id from overwriting the target key.
-            if "pitcher_id" in mart_df.columns:
-                mart_df = mart_df.drop(columns=["pitcher_id"])
-
-            # Broadcast game-level pitcher features onto all pitchers for that game,
-            # then attach pitcher-game targets.
-            mart_df = pt_keys.merge(mart_df, on=["game_pk"], how="left")
-            mart_df = mart_df.merge(
-                pt[["game_pk", "pitcher_id", "target_k", "target_outs", "target_er", "target_bb"]],
-                on=["game_pk", "pitcher_id"],
-                how="left",
-            )
-
-            # Ensure consistent dtypes (validator expects these columns to exist)
-            for c in ["target_k", "target_outs", "target_er", "target_bb"]:
-                if c in mart_df.columns:
-                    mart_df[c] = pd.to_numeric(mart_df[c], errors="coerce").astype("Int64")
-
-        mart_df = _filter_to_season(mart_df, season)
-        mart_df = _apply_date_range(mart_df, start, end)
-
-        print_rowcount(filename.replace(".parquet", ""), mart_df)
-        _log_mart_stats(filename.replace(".parquet", ""), mart_df)
-        out_path = _mart_out_path(dirs["marts_dir"], filename, season)
-        print(f"Writing to: {out_path.resolve()}")
-        write_parquet(mart_df, out_path)
-        outputs[filename] = out_path
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("mart_refresh market=%s failed; continuing reason=%s", market_name, exc)
+            continue
 
     if season is not None:
-        outputs["hitter_batter_features.parquet"] = build_hitter_batter_features(dirs, season)
-        outputs["pitcher_game_features.parquet"] = build_pitcher_game_features(dirs, season)
+        hitter_src = _mart_out_path(dirs["marts_dir"], "hitter_props_features.parquet", season)
+        if hitter_src.exists() and _existing_rows(hitter_src) > 0:
+            outputs["hitter_batter_features.parquet"] = build_hitter_batter_features(dirs, season)
+        else:
+            logging.warning("skipping hitter_batter_features: missing or empty source mart path=%s", hitter_src)
+
+        pitcher_src = _mart_out_path(dirs["marts_dir"], "pitcher_props_features.parquet", season)
+        if pitcher_src.exists() and _existing_rows(pitcher_src) > 0:
+            outputs["pitcher_game_features.parquet"] = build_pitcher_game_features(dirs, season)
+        else:
+            logging.warning("skipping pitcher_game_features: missing or empty source mart path=%s", pitcher_src)
 
     return outputs
