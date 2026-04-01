@@ -132,9 +132,24 @@ def main() -> None:
     lineup_cov = _load_lineup_coverage(projected_lineups_path)
     out = out.merge(weather_cov, on="game_pk", how="left")
     out = out.merge(lineup_cov, on="game_pk", how="left")
-    out["has_weather"] = out.get("has_weather", False).fillna(False).astype(bool)
-    out["has_projected_lineups"] = out.get("has_projected_lineups", False).fillna(False).astype(bool)
-    out["projected_lineup_rows"] = pd.to_numeric(out.get("projected_lineup_rows"), errors="coerce").fillna(0).astype(int)
+    if "has_weather" not in out.columns:
+        out["has_weather"] = False
+    else:
+        out["has_weather"] = out["has_weather"].fillna(False).astype(bool)
+
+    if "has_projected_lineups" not in out.columns:
+        out["has_projected_lineups"] = False
+    else:
+        out["has_projected_lineups"] = out["has_projected_lineups"].fillna(False).astype(bool)
+
+    if "projected_lineup_rows" not in out.columns:
+        out["projected_lineup_rows"] = 0
+    else:
+        out["projected_lineup_rows"] = (
+            pd.to_numeric(out["projected_lineup_rows"], errors="coerce")
+            .fillna(0)
+            .astype(int)
+        )
 
     write_parquet(out, out_path)
     home_present = int(out["home_sp_id"].notna().sum()) if len(out) else 0
