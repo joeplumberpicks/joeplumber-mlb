@@ -93,21 +93,32 @@ def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
 
 
 def _derive_moneyline_targets_from_games(processed_dir: Path, season: int) -> pd.DataFrame:
-    games_path = processed_dir / "by_season" / f"games_{season}.parquet"
-    if not games_path.exists():
-        logging.warning("moneyline missing target file and missing games source for derivation path=%s", games_path)
+    processed_games_path = processed_dir / "by_season" / f"games_{season}.parquet"
+    raw_games_path = processed_dir.parent / "raw" / "by_season" / f"games_{season}.parquet"
+
+    if not processed_games_path.exists() and not raw_games_path.exists():
+        logging.warning("[MONEYLINE] missing target file and no games source available processed=%s raw=%s", processed_games_path, raw_games_path)
         return pd.DataFrame()
 
+    games_path = processed_games_path if processed_games_path.exists() else raw_games_path
     games = read_parquet(games_path)
     if games.empty:
-        logging.warning("moneyline derivation skipped: games source empty path=%s", games_path)
+        logging.warning("[MONEYLINE] games source empty path=%s", games_path)
         return pd.DataFrame()
 
     home_col = _pick_col(games, ["home_score", "home_final_score", "home_runs", "post_home_score", "final_home_score"])
     away_col = _pick_col(games, ["away_score", "away_final_score", "away_runs", "post_away_score", "final_away_score"])
+    if (home_col is None or away_col is None) and games_path == processed_games_path and raw_games_path.exists():
+        logging.info("[MONEYLINE] processed games missing scores; falling back to raw games path=%s", raw_games_path)
+        games_path = raw_games_path
+        games = read_parquet(games_path)
+        home_col = _pick_col(games, ["home_score", "home_final_score", "home_runs", "post_home_score", "final_home_score"])
+        away_col = _pick_col(games, ["away_score", "away_final_score", "away_runs", "post_away_score", "final_away_score"])
+
     if home_col is None or away_col is None:
-        logging.warning("moneyline derivation skipped: score columns missing in games path=%s cols=%s", games_path, sorted(games.columns))
+        logging.warning("[MONEYLINE] score columns still missing path=%s cols=%s", games_path, sorted(games.columns))
         return pd.DataFrame()
+    logging.info("[MONEYLINE] raw_games_rows=%s source_path=%s", len(games), games_path)
 
     out = games[[c for c in ["game_pk", "game_date", "home_team", "away_team"] if c in games.columns]].copy()
     out["game_pk"] = pd.to_numeric(out.get("game_pk"), errors="coerce").astype("Int64")
@@ -118,7 +129,10 @@ def _derive_moneyline_targets_from_games(processed_dir: Path, season: int) -> pd
     out.loc[hs < aw, "target_home_win"] = 0
     out["target_home_win"] = pd.to_numeric(out["target_home_win"], errors="coerce").astype("Int64")
     out = out.drop_duplicates(subset=["game_pk"], keep="last")
+    rows_with_scores = int((hs.notna() & aw.notna()).sum())
+    logging.info("[MONEYLINE] rows_with_scores=%s", rows_with_scores)
     out = out.dropna(subset=["target_home_win"]).copy()
+    logging.info("[MONEYLINE] labeled_rows=%s", len(out))
     logging.info(
         "moneyline missing target file -> deriving from game scores season=%s source_rows=%s derived_rows=%s",
         season,
@@ -369,6 +383,7 @@ def build_marts(
                     len(mart_df),
                     int(mart_df["game_pk"].nunique()) if "game_pk" in mart_df.columns and len(mart_df) else 0,
                 )
+                logging.info("[MONEYLINE] final_rows=%s", len(mart_df))
             elif filename == "nrfi_features.parquet":
                 nrfi_blocks = build_nrfi_feature_blocks(dirs, spine, season)
                 if not nrfi_blocks.empty:
