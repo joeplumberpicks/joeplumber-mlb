@@ -195,6 +195,36 @@ def run_live_preflight(
     config = load_config(config_path)
     paths = resolve_live_paths(config=config, season=season, date_str=date_str)
 
+    def _ensure_spine_exists_before_lineups() -> None:
+        logging.info("live preflight: ensuring game spine exists before lineup build")
+        if paths["live_spine_path"].exists() and not force_spine:
+            logging.info("live preflight: spine confirmed path=%s", paths["live_spine_path"])
+            return
+        if not auto_build:
+            raise FileNotFoundError(
+                "Live spine required before lineup build but auto_build=False and spine is missing: "
+                f"{paths['live_spine_path']}"
+            )
+        spine_cmd = [
+            sys.executable,
+            "scripts/live/build_spine_from_schedule.py",
+            "--season",
+            str(season),
+            "--date",
+            date_str,
+            "--config",
+            str(config_path),
+        ]
+        if force_spine:
+            spine_cmd.append("--force")
+        _run_cmd(spine_cmd, repo_root)
+        if not paths["live_spine_path"].exists():
+            raise FileNotFoundError(
+                "Live spine still missing after build_spine_from_schedule.py ran: "
+                f"{paths['live_spine_path']}"
+            )
+        logging.info("live preflight: spine confirmed path=%s", paths["live_spine_path"])
+
     if auto_build and not paths["live_schedule_path"].exists():
         _run_cmd(
             [
@@ -212,6 +242,11 @@ def run_live_preflight(
             repo_root,
         )
 
+    spine_ensured_before_lineups = False
+    if build_lineups:
+        _ensure_spine_exists_before_lineups()
+        spine_ensured_before_lineups = True
+
     lineup_meta = {
         "lineup_builder_used": None,
         "lineup_rows": 0,
@@ -219,6 +254,13 @@ def run_live_preflight(
         "lineup_build_succeeded": paths["projected_lineups_path"].exists(),
     }
     if auto_build and build_lineups and not paths["projected_lineups_path"].exists():
+        if not paths["live_spine_path"].exists():
+            _ensure_spine_exists_before_lineups()
+            if not paths["live_spine_path"].exists():
+                raise FileNotFoundError(
+                    "Live spine is required before projected lineup build and is still missing: "
+                    f"{paths['live_spine_path']}"
+                )
         lineup_meta = _run_lineup_build_with_fallback(
             repo_root=repo_root,
             config_path=config_path,
@@ -243,7 +285,7 @@ def run_live_preflight(
             raise_on_error=not permissive_live_context,
         )
 
-    if auto_build and (force_spine or not paths["live_spine_path"].exists()):
+    if auto_build and (force_spine or not paths["live_spine_path"].exists()) and not spine_ensured_before_lineups:
         spine_cmd = [
             sys.executable,
             "scripts/live/build_spine_from_schedule.py",
@@ -257,6 +299,8 @@ def run_live_preflight(
         if force_spine:
             spine_cmd.append("--force")
         _run_cmd(spine_cmd, repo_root)
+        if paths["live_spine_path"].exists():
+            logging.info("live preflight: spine confirmed path=%s", paths["live_spine_path"])
 
     out = dict(paths)
     out.update(lineup_meta)
