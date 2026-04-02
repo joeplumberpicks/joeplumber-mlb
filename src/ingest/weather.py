@@ -29,38 +29,55 @@ import requests
 METAR_API_URL = "https://aviationweather.gov/api/data/metar"
 REQUEST_TIMEOUT = 30
 
-# You can refine these over time, but this is a strong starting map.
+# Supports both canonical Joe Plumber abbreviations and common live-feed abbreviations.
 TEAM_TO_METAR_STATION: dict[str, str] = {
     "ARI": "KPHX",
+    "AZ": "KPHX",
     "ATL": "KATL",
     "BAL": "KBWI",
     "BOS": "KBOS",
     "CHC": "KORD",
     "CHA": "KMDW",
+    "CHW": "KMDW",
+    "CWS": "KMDW",
     "CIN": "KLUK",
     "CLE": "KCLE",
     "COL": "KDEN",
     "DET": "KDTW",
     "HOU": "KIAH",
     "KCA": "KMCI",
+    "KC": "KMCI",
+    "KCR": "KMCI",
     "LAA": "KSNA",
+    "LAD": "KLAX",
     "LAN": "KLAX",
     "MIA": "KMIA",
     "MIL": "KMKE",
     "MIN": "KMSP",
     "NYA": "KLGA",
+    "NYY": "KLGA",
     "NYN": "KLGA",
+    "NYM": "KLGA",
     "OAK": "KOAK",
+    "ATH": "KOAK",
     "PHI": "KPHL",
     "PIT": "KPIT",
+    "SD": "KSAN",
     "SDN": "KSAN",
+    "SDP": "KSAN",
     "SEA": "KSEA",
+    "SF": "KSFO",
     "SFN": "KSFO",
+    "SFG": "KSFO",
     "SLN": "KSTL",
+    "STL": "KSTL",
     "TBA": "KTPA",
+    "TB": "KTPA",
+    "TBR": "KTPA",
     "TEX": "KDFW",
     "TOR": "CYYZ",
     "WAS": "KDCA",
+    "WSH": "KDCA",
 }
 
 
@@ -122,7 +139,6 @@ def _normalize_wind_flags(wind_dir_degrees: float | None) -> tuple[float, float,
 
     deg = wind_dir_degrees % 360
 
-    # Rough generic baseball orientation proxy.
     if deg >= 315 or deg <= 45:
         return 1.0, 0.0, 0.0
     if 135 <= deg <= 225:
@@ -138,11 +154,13 @@ def _infer_roof_status(home_team: str | None) -> str | None:
     """
     retractable_or_dome = {
         "ARI",
+        "AZ",
         "HOU",
         "MIA",
         "MIL",
         "SEA",
         "TBA",
+        "TB",
         "TOR",
         "TEX",
     }
@@ -251,7 +269,6 @@ def normalize_metar_records(records: list[dict[str, Any]]) -> pd.DataFrame:
             else rec.get("visibility")
         )
 
-        # Unit conversions
         temperature_f = (temp_c * 9.0 / 5.0 + 32.0) if temp_c is not None else None
         dewpoint_f = (dewpoint_c * 9.0 / 5.0 + 32.0) if dewpoint_c is not None else None
         wind_mph = (wind_speed_kt * 1.15078) if wind_speed_kt is not None else None
@@ -277,8 +294,8 @@ def normalize_metar_records(records: list[dict[str, Any]]) -> pd.DataFrame:
             "pressure_hpa": pressure_hpa,
             "visibility_miles": visibility_mi,
             "ceiling_ft": _to_int(rec.get("ceil")),
-            "humidity": None,  # can be derived later if desired
-            "precipitation_mm": None,  # usually not directly populated in METAR JSON
+            "humidity": None,
+            "precipitation_mm": None,
             "weather_wind_out": weather_wind_out,
             "weather_wind_in": weather_wind_in,
             "weather_crosswind": weather_crosswind,
