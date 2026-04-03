@@ -10,22 +10,6 @@ This module is Layer 1 only:
 - no modeling logic
 - no feature engineering
 - no target creation
-
-Design
-------
-This file is provider-agnostic at the normalization layer.
-
-Public function
----------------
-- build_parks_reference(...)
-
-Input format
-------------
-The builder expects a list[dict] or DataFrame with park / venue records already
-pulled from a source such as MLB StatsAPI, manual reference files, or park
-factor datasets.
-
-The normalization layer tolerates multiple possible source column names.
 """
 
 from __future__ import annotations
@@ -46,10 +30,12 @@ def _as_dataframe(records: pd.DataFrame | list[dict[str, Any]] | None) -> pd.Dat
     raise TypeError(f"Unsupported records type: {type(records)!r}")
 
 
-def _coalesce_series(df: pd.DataFrame, candidates: list[str], default: Any = None) -> pd.Series:
-    """
-    Return the first available column from candidates, otherwise a default-valued series.
-    """
+def _coalesce_series(
+    df: pd.DataFrame,
+    candidates: list[str],
+    default: Any = None,
+) -> pd.Series:
+    """Return the first available column from candidates, else a default series."""
     for col in candidates:
         if col in df.columns:
             return df[col]
@@ -57,22 +43,18 @@ def _coalesce_series(df: pd.DataFrame, candidates: list[str], default: Any = Non
 
 
 def _to_nullable_int(series: pd.Series) -> pd.Series:
-    """Convert a series to pandas nullable Int64."""
     return pd.to_numeric(series, errors="coerce").astype("Int64")
 
 
 def _to_nullable_float(series: pd.Series) -> pd.Series:
-    """Convert a series to float."""
     return pd.to_numeric(series, errors="coerce")
 
 
 def _to_string(series: pd.Series) -> pd.Series:
-    """Convert a series to pandas string dtype."""
     return series.astype("string")
 
 
 def _to_boolean(series: pd.Series, default: bool | None = None) -> pd.Series:
-    """Convert a series to pandas nullable boolean."""
     s = series.copy()
     if default is not None:
         s = s.fillna(default)
@@ -93,7 +75,6 @@ def _to_boolean(series: pd.Series, default: bool | None = None) -> pd.Series:
 
 
 def _empty_parks_df() -> pd.DataFrame:
-    """Return an empty normalized parks DataFrame."""
     return pd.DataFrame(
         columns=[
             "venue_id",
@@ -131,7 +112,7 @@ def normalize_park_records(
     source: str | None = None,
 ) -> pd.DataFrame:
     """
-    Normalize raw park / venue records into a clean one-row-per-venue table.
+    Normalize raw park / venue records into a one-row-per-venue table.
     """
     df = _as_dataframe(records)
 
@@ -140,31 +121,65 @@ def normalize_park_records(
 
     out = pd.DataFrame(
         {
-            "venue_id": _to_nullable_int(_coalesce_series(df, ["venue_id", "park_id", "stadium_id", "id"])),
-            "venue_name": _to_string(_coalesce_series(df, ["venue_name", "park_name", "stadium_name", "name"])),
-            "team": _to_string(_coalesce_series(df, ["team", "team_abbr", "home_team"])),
-            "team_name": _to_string(_coalesce_series(df, ["team_name", "home_team_name"])),
+            "venue_id": _to_nullable_int(
+                _coalesce_series(df, ["venue_id", "park_id", "stadium_id", "id"])
+            ),
+            "venue_name": _to_string(
+                _coalesce_series(df, ["venue_name", "park_name", "stadium_name", "name"])
+            ),
+            "team": _to_string(
+                _coalesce_series(df, ["team", "team_abbr", "home_team"])
+            ),
+            "team_name": _to_string(
+                _coalesce_series(df, ["team_name", "home_team_name"])
+            ),
             "city": _to_string(_coalesce_series(df, ["city"])),
             "state": _to_string(_coalesce_series(df, ["state", "state_code", "province"])),
             "country": _to_string(_coalesce_series(df, ["country"], default="USA")),
-            "surface_type": _to_string(_coalesce_series(df, ["surface_type", "surface", "turf_type"])),
+            "surface_type": _to_string(
+                _coalesce_series(df, ["surface_type", "surface", "turf_type"])
+            ),
             "roof_type": _to_string(_coalesce_series(df, ["roof_type", "roof"])),
             "is_dome": _to_boolean(_coalesce_series(df, ["is_dome", "dome_flag"])),
-            "is_retractable": _to_boolean(_coalesce_series(df, ["is_retractable", "retractable_roof_flag"])),
-            "altitude_ft": _to_nullable_float(_coalesce_series(df, ["altitude_ft", "elevation_ft", "altitude"])),
+            "is_retractable": _to_boolean(
+                _coalesce_series(df, ["is_retractable", "retractable_roof_flag"])
+            ),
+            "altitude_ft": _to_nullable_float(
+                _coalesce_series(df, ["altitude_ft", "elevation_ft", "altitude"])
+            ),
             "latitude": _to_nullable_float(_coalesce_series(df, ["latitude", "lat"])),
             "longitude": _to_nullable_float(_coalesce_series(df, ["longitude", "lon", "lng"])),
             "time_zone": _to_string(_coalesce_series(df, ["time_zone", "timezone"])),
-            "weather_station_id": _to_string(_coalesce_series(df, ["weather_station_id", "metar_station_id", "station_id"])),
-            "park_factor_runs": _to_nullable_float(_coalesce_series(df, ["park_factor_runs", "pf_runs"])),
-            "park_factor_hr": _to_nullable_float(_coalesce_series(df, ["park_factor_hr", "pf_hr"])),
-            "park_factor_hits": _to_nullable_float(_coalesce_series(df, ["park_factor_hits", "pf_hits"])),
-            "park_factor_2b": _to_nullable_float(_coalesce_series(df, ["park_factor_2b", "pf_2b"])),
-            "park_factor_3b": _to_nullable_float(_coalesce_series(df, ["park_factor_3b", "pf_3b"])),
-            "park_factor_bb": _to_nullable_float(_coalesce_series(df, ["park_factor_bb", "pf_bb"])),
-            "park_source": _to_string(_coalesce_series(df, ["park_source"], default=source if source is not None else "unknown")),
-            "park_source_season": _to_nullable_int(_coalesce_series(df, ["park_source_season", "season"])),
-            "source": _to_string(_coalesce_series(df, ["source"], default=source if source is not None else "unknown")),
+            "weather_station_id": _to_string(
+                _coalesce_series(df, ["weather_station_id", "metar_station_id", "station_id"])
+            ),
+            "park_factor_runs": _to_nullable_float(
+                _coalesce_series(df, ["park_factor_runs", "pf_runs"])
+            ),
+            "park_factor_hr": _to_nullable_float(
+                _coalesce_series(df, ["park_factor_hr", "pf_hr"])
+            ),
+            "park_factor_hits": _to_nullable_float(
+                _coalesce_series(df, ["park_factor_hits", "pf_hits"])
+            ),
+            "park_factor_2b": _to_nullable_float(
+                _coalesce_series(df, ["park_factor_2b", "pf_2b"])
+            ),
+            "park_factor_3b": _to_nullable_float(
+                _coalesce_series(df, ["park_factor_3b", "pf_3b"])
+            ),
+            "park_factor_bb": _to_nullable_float(
+                _coalesce_series(df, ["park_factor_bb", "pf_bb"])
+            ),
+            "park_source": _to_string(
+                _coalesce_series(df, ["park_source"], default=source if source is not None else "unknown")
+            ),
+            "park_source_season": _to_nullable_int(
+                _coalesce_series(df, ["park_source_season", "season"])
+            ),
+            "source": _to_string(
+                _coalesce_series(df, ["source"], default=source if source is not None else "unknown")
+            ),
             "source_pull_ts": pd.to_datetime(
                 _coalesce_series(df, ["source_pull_ts"], default=pd.Timestamp.utcnow()),
                 utc=True,
@@ -173,7 +188,6 @@ def normalize_park_records(
         }
     )
 
-    # Fill in some inferred flags if missing
     roof_lower = out["roof_type"].str.lower()
 
     missing_is_dome = out["is_dome"].isna()
@@ -198,18 +212,7 @@ def normalize_park_records(
 
 
 def validate_parks_reference(df: pd.DataFrame) -> None:
-    """
-    Validate normalized parks output.
-
-    Raises
-    ------
-    ValueError
-        If required columns are missing or key constraints fail.
-    """
-    required_columns = {
-        "venue_id",
-        "venue_name",
-    }
+    required_columns = {"venue_id", "venue_name"}
     missing = sorted(required_columns.difference(df.columns))
     if missing:
         raise ValueError(f"parks validation failed; missing required columns: {missing}")
@@ -225,7 +228,6 @@ def validate_parks_reference(df: pd.DataFrame) -> None:
 
 
 def summarize_parks_reference(df: pd.DataFrame, label: str = "parks") -> None:
-    """Print a compact ingest summary."""
     row_count = len(df)
     distinct_venues = df["venue_id"].nunique(dropna=True) if "venue_id" in df.columns else 0
 
@@ -246,9 +248,6 @@ def build_parks_reference(
     validate: bool = True,
     verbose: bool = True,
 ) -> pd.DataFrame:
-    """
-    Build normalized parks reference table.
-    """
     df = normalize_park_records(records=records, source=source)
 
     if validate and not df.empty:
