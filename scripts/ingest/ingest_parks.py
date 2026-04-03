@@ -1,23 +1,6 @@
 #!/usr/bin/env python3
 """
 Ingest normalized MLB park reference data.
-
-Purpose
--------
-Read provider-level park / venue records and write normalized park reference
-data to the data lake.
-
-This script is Layer 1 only:
-- raw truth only
-- no modeling logic
-- no feature engineering
-- no target creation
-
-Notes
------
-This runner is intentionally input-driven. It expects provider-level records
-from a CSV or parquet file that were pulled separately from a source such as
-MLB StatsAPI, FanGraphs park factors, or a maintained reference file.
 """
 
 from __future__ import annotations
@@ -25,12 +8,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from src.ingest.io import (
-    log_kv,
-    log_section,
-    read_dataset,
-    write_parquet,
-)
+from src.ingest.io import log_kv, log_section, read_dataset, write_parquet
 from src.ingest.parks import build_parks_reference
 from src.utils.config import load_config
 from src.utils.drive import resolve_data_dirs
