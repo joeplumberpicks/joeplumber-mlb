@@ -1,24 +1,95 @@
-model_version: "v1.0"
-drive_data_root: "joeplumber-mlb/data"
-seasons_default:
-  - 2019
-  - 2020
-  - 2021
-  - 2022
-  - 2023
-  - 2024
-  - 2025
-  - 2026
+# =========================
+# PROJECT METADATA
+# =========================
+project_name: joeplumber-mlb
+model_version: v7.0
+
+# =========================
+# DATA ROOT (GOOGLE DRIVE)
+# =========================
+drive_data_root: joeplumber-mlb/data
+
+# =========================
+# DEFAULT SEASONS / WINDOWS
+# =========================
+seasons_default: [2019, 2020, 2021, 2022, 2023, 2024, 2025]
+
 rolling_windows: [3, 7, 15, 30]
 leakage_shift: 1
 allow_partial_default: false
 
+# =========================
+# INGEST SETTINGS
+# =========================
+ingest:
+  game_types: ["R", "S"]   # Regular + Spring if needed
+  request_timeout: 30
+  retry_attempts: 3
+
+# =========================
+# WEATHER SETTINGS
+# =========================
+weather:
+  provider: statcast
+  default_temp_f: 70
+  default_wind_mph: 0
+  use_wind_direction: true
+
+# =========================
+# LINEUP SOURCES
+# =========================
 fangraphs:
-  projected_lineups_url: ""
+  projected_lineups_url: "https://www.fangraphs.com/roster-resource/lineup-tracker"
   request_timeout: 30
 
 rotowire:
-  projected_lineups_url: ""
-  confirmed_lineups_url: ""
-  starting_pitchers_url: ""
+  confirmed_lineups_url: "https://www.rotowire.com/baseball/daily-lineups.php"
+  starting_pitchers_url: "https://www.rotowire.com/baseball/daily-lineups.php"
   request_timeout: 30
+
+# =========================
+# FEATURE FLAGS
+# =========================
+features:
+  use_statcast: true
+  use_rolling: true
+  use_weather: true
+  use_park_factors: true
+  include_pitch_mix: false   # can expand later
+  include_splits: false      # L/R splits optional later
+
+# =========================
+# MODEL SETTINGS
+# =========================
+models:
+
+  nrfi:
+    model_type: xgboost
+    threshold: 0.55
+
+  moneyline:
+    model_type: logistic
+    threshold: 0.52
+
+  hr:
+    model_type: xgboost
+    threshold: 0.50
+
+  rbi:
+    model_type: xgboost
+    threshold: 0.50
+
+# =========================
+# OUTPUT SETTINGS
+# =========================
+outputs:
+  save_csv: true
+  save_parquet: true
+  save_top_n: 25
+
+# =========================
+# LOGGING
+# =========================
+logging:
+  level: INFO
+  log_to_file: true
