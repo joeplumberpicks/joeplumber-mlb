@@ -13,6 +13,10 @@ rolling_windows: [3, 7, 15, 30]
 leakage_shift: 1
 allow_partial_default: false
 
+fangraphs:
+  projected_lineups_url: ""
+  request_timeout: 30
+
 rotowire:
   projected_lineups_url: ""
   confirmed_lineups_url: ""
