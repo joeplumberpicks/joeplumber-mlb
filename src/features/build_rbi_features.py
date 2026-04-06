@@ -44,6 +44,10 @@ def _normalize_is_home(series: pd.Series) -> pd.Series:
     )
 
 
+def _to_int64_nullable(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").astype("Int64")
+
+
 def _attach_opposing_pitcher(lineups: pd.DataFrame, spine: pd.DataFrame) -> pd.DataFrame:
     lu = _safe_copy(lineups)
     sp = _safe_copy(spine)
@@ -58,22 +62,12 @@ def _attach_opposing_pitcher(lineups: pd.DataFrame, spine: pd.DataFrame) -> pd.D
     sp_game_pk = _pick_col(sp, ["game_pk"], required=True)
     home_sp_col = _pick_col(
         sp,
-        [
-            "home_sp_id",
-            "home_starting_pitcher_id",
-            "home_pitcher_id",
-            "home_starter_pitcher_id",
-        ],
+        ["home_sp_id", "home_starting_pitcher_id", "home_pitcher_id", "home_starter_pitcher_id"],
         required=True,
     )
     away_sp_col = _pick_col(
         sp,
-        [
-            "away_sp_id",
-            "away_starting_pitcher_id",
-            "away_pitcher_id",
-            "away_starter_pitcher_id",
-        ],
+        ["away_sp_id", "away_starting_pitcher_id", "away_pitcher_id", "away_starter_pitcher_id"],
         required=True,
     )
     home_team_col = _pick_col(sp, ["home_team"], required=False)
@@ -89,11 +83,19 @@ def _attach_opposing_pitcher(lineups: pd.DataFrame, spine: pd.DataFrame) -> pd.D
     ].copy()
     sp_join = sp_join.rename(columns={sp_game_pk: game_pk_col})
 
+    sp_join[home_sp_col] = _to_int64_nullable(sp_join[home_sp_col])
+    sp_join[away_sp_col] = _to_int64_nullable(sp_join[away_sp_col])
+
     lu = lu.merge(sp_join, on=game_pk_col, how="left")
 
-    lu["opp_pitcher_id"] = pd.NA
-    lu.loc[lu[lu_is_home_col].eq(True), "opp_pitcher_id"] = lu.loc[lu[lu_is_home_col].eq(True), away_sp_col]
-    lu.loc[lu[lu_is_home_col].eq(False), "opp_pitcher_id"] = lu.loc[lu[lu_is_home_col].eq(False), home_sp_col]
+    lu["opp_pitcher_id"] = pd.Series(pd.NA, index=lu.index, dtype="Int64")
+    lu.loc[lu[lu_is_home_col].eq(True), "opp_pitcher_id"] = _to_int64_nullable(
+        lu.loc[lu[lu_is_home_col].eq(True), away_sp_col]
+    )
+    lu.loc[lu[lu_is_home_col].eq(False), "opp_pitcher_id"] = _to_int64_nullable(
+        lu.loc[lu[lu_is_home_col].eq(False), home_sp_col]
+    )
+    lu["opp_pitcher_id"] = _to_int64_nullable(lu["opp_pitcher_id"])
 
     opp_col = _pick_col(lu, ["opponent"], required=False)
     team_col = _pick_col(lu, ["team", "team_abbr", "batting_team"], required=False)
@@ -119,8 +121,11 @@ def _build_team_context(lineups: pd.DataFrame, batter_roll: pd.DataFrame) -> pd.
     game_date_col = _pick_col(lu, ["game_date"], required=True)
     slot_col = _pick_col(lu, ["batting_order", "lineup_slot", "order_spot", "slot"], required=False)
 
+    lu[batter_id_col] = _to_int64_nullable(lu[batter_id_col])
+
     br_batter_id = _pick_col(br, ["batter_id", "player_id"], required=True)
     br_game_date = _pick_col(br, ["game_date"], required=False)
+    br[br_batter_id] = _to_int64_nullable(br[br_batter_id])
 
     left_on = [batter_id_col]
     right_on = [br_batter_id]
@@ -173,9 +178,6 @@ def build_rbi_features(
     batter_roll: pd.DataFrame,
     pitcher_roll: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Build one-row-per-batter RBI feature table.
-    """
     sp = _safe_copy(spine)
     lu = _attach_opposing_pitcher(lineups, sp)
     br = _safe_copy(batter_roll)
@@ -186,8 +188,11 @@ def build_rbi_features(
     lu_team_col = _pick_col(lu, ["team", "team_abbr", "batting_team"], required=True)
     lu_game_pk = _pick_col(lu, ["game_pk"], required=True)
 
+    lu[lu_batter_id] = _to_int64_nullable(lu[lu_batter_id])
+
     br_batter_id = _pick_col(br, ["batter_id", "player_id"], required=True)
     br_game_date = _pick_col(br, ["game_date"], required=False)
+    br[br_batter_id] = _to_int64_nullable(br[br_batter_id])
 
     left_on = [lu_batter_id]
     right_on = [br_batter_id]
@@ -205,6 +210,7 @@ def build_rbi_features(
 
     pr_pitcher_id = _pick_col(pr, ["pitcher_id"], required=True)
     pr_game_date = _pick_col(pr, ["game_date"], required=False)
+    pr[pr_pitcher_id] = _to_int64_nullable(pr[pr_pitcher_id])
 
     left_on = ["opp_pitcher_id"]
     right_on = [pr_pitcher_id]
@@ -222,6 +228,9 @@ def build_rbi_features(
         elif c != pr_game_date:
             rename_map[c] = f"opp_{c}"
     pr_use = pr_use.rename(columns=rename_map)
+    pr_use["opp_pitcher_id"] = _to_int64_nullable(pr_use["opp_pitcher_id"])
+
+    df["opp_pitcher_id"] = _to_int64_nullable(df["opp_pitcher_id"])
 
     df = df.merge(
         pr_use,
@@ -249,9 +258,6 @@ def build_rbi_features(
         ("hardhit_rate_roll15", "opp_hardhit_rate_allowed_roll15", "rbi_contact_pressure_roll15"),
     ]:
         if bat_c in df.columns and pit_c in df.columns:
-            df[out_c] = (
-                pd.to_numeric(df[bat_c], errors="coerce")
-                + pd.to_numeric(df[pit_c], errors="coerce")
-            )
+            df[out_c] = pd.to_numeric(df[bat_c], errors="coerce") + pd.to_numeric(df[pit_c], errors="coerce")
 
     return df
