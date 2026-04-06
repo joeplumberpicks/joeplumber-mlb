@@ -31,7 +31,7 @@ def _run(cmd: list[str], repo_root: Path) -> None:
 def _pct(series) -> float:
     if len(series) == 0:
         return 0.0
-    return float(series.fillna(False).mean() * 100.0)
+    return float(series.fillna(False).astype("boolean").mean() * 100.0)
 
 
 def main() -> None:
@@ -77,19 +77,19 @@ def main() -> None:
     print(f"Distinct game_pk: {df['game_pk'].nunique(dropna=True):,}")
 
     if "starters_both_found" in df.columns:
-        print(f"Pct with both starters: {_pct(df['starters_both_found']):.2f}")
+        print(f"pct_with_starters={_pct(df['starters_both_found']):.2f}")
 
     if "lineups_projected_both_found" in df.columns:
-        print(f"Pct with both projected lineups: {_pct(df['lineups_projected_both_found']):.2f}")
+        print(f"pct_with_projected_lineups={_pct(df['lineups_projected_both_found']):.2f}")
 
     if "lineups_confirmed_both_found" in df.columns:
-        print(f"Pct with both confirmed lineups: {_pct(df['lineups_confirmed_both_found']):.2f}")
+        print(f"pct_with_confirmed_lineups={_pct(df['lineups_confirmed_both_found']):.2f}")
 
     for col in ["temperature_f", "wind_mph", "weather_wind_out", "weather_wind_in", "weather_crosswind"]:
         if col in df.columns:
             print(f"Nulls [{col}]: {int(df[col].isna().sum()):,}")
 
-    print(f"output_path={spine_path}")
+    print(f"daily_out={spine_path}")
 
 
 if __name__ == "__main__":
