@@ -2,125 +2,184 @@ from __future__ import annotations
 
 import pandas as pd
 
-from src.features.rolling import logistic_score, safe_numeric
+
+def _pick_col(df: pd.DataFrame, candidates: list[str], required: bool = False) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    if required:
+        raise KeyError(f"Missing required column. Tried: {candidates}")
+    return None
 
 
-def _team_lineup_summary(lineups_today: pd.DataFrame, batter_roll_latest: pd.DataFrame, team_key: str = "team", top_n: int = 9) -> pd.DataFrame:
-    lu = lineups_today.copy()
-    lu["batting_order"] = safe_numeric(lu.get("batting_order"))
-    lu = lu.sort_values([team_key, "batting_order"], kind="stable")
-    lu = lu.loc[lu["batting_order"].le(top_n) | lu["batting_order"].isna()].copy()
+def _safe_copy(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if "game_date" in out.columns:
+        out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce")
+    return out
 
-    keep = [c for c in batter_roll_latest.columns if c in {
-        "batter_id",
-        "hit_rate_roll15", "hit_rate_roll30",
-        "hr_rate_roll15", "hr_rate_roll30",
-        "rbi_pa_rate_roll15", "rbi_pa_rate_roll30",
-        "tb_pa_rate_roll15", "tb_pa_rate_roll30",
-        "barrel_rate_roll15", "barrel_rate_roll30",
-        "hard_hit_rate_roll15", "hard_hit_rate_roll30",
-        "bb_rate_roll15", "bb_rate_roll30",
-        "so_rate_roll15", "so_rate_roll30",
-        "contact_rate_roll15", "contact_rate_roll30",
-    }]
-    br = batter_roll_latest[keep].copy()
 
-    merged = lu.merge(br, left_on="player_id", right_on="batter_id", how="left")
-    agg_map = {c: "mean" for c in merged.columns if c.endswith(("roll15", "roll30"))}
-    out = merged.groupby(team_key, dropna=False).agg(agg_map).reset_index()
+def _build_team_lineup_features(lineups: pd.DataFrame, batter_roll: pd.DataFrame) -> pd.DataFrame:
+    lu = _safe_copy(lineups)
+    br = _safe_copy(batter_roll)
+
+    team_col = _pick_col(lu, ["team", "team_abbr", "batting_team"], required=True)
+    batter_id_col = _pick_col(lu, ["batter_id", "player_id"], required=True)
+    game_pk_col = _pick_col(lu, ["game_pk"], required=True)
+    game_date_col = _pick_col(lu, ["game_date"], required=True)
+
+    br_batter_id = _pick_col(br, ["batter_id", "player_id"], required=True)
+    br_game_date = _pick_col(br, ["game_date"], required=False)
+
+    left_on = [batter_id_col]
+    right_on = [br_batter_id]
+
+    if br_game_date is not None:
+        left_on.append(game_date_col)
+        right_on.append(br_game_date)
+
+    br_keep = [c for c in br.columns if c in set(right_on) or "roll" in c]
+    lu = lu.merge(
+        br[br_keep].copy(),
+        left_on=left_on,
+        right_on=right_on,
+        how="left",
+    )
+
+    agg_map = {}
+    for c in lu.columns:
+        if "roll" in c:
+            agg_map[c] = "mean"
+
+    if not agg_map:
+        out = (
+            lu.groupby([game_pk_col, game_date_col, team_col], dropna=False)
+            .size()
+            .reset_index(name="lineup_count")
+        )
+        return out
+
+    out = (
+        lu.groupby([game_pk_col, game_date_col, team_col], dropna=False)
+        .agg(agg_map)
+        .reset_index()
+    )
+    out["lineup_count"] = (
+        lu.groupby([game_pk_col, game_date_col, team_col], dropna=False)[batter_id_col]
+        .count()
+        .values
+    )
     return out
 
 
 def build_moneyline_features(
-    spine_today: pd.DataFrame,
-    lineups_today: pd.DataFrame,
-    batter_roll_latest: pd.DataFrame,
-    pitcher_roll_latest: pd.DataFrame,
+    spine: pd.DataFrame,
+    lineups: pd.DataFrame,
+    batter_roll: pd.DataFrame,
+    pitcher_roll: pd.DataFrame,
 ) -> pd.DataFrame:
-    df = spine_today.copy()
+    """
+    Build one-row-per-game Moneyline feature table.
+    """
+    sp = _safe_copy(spine)
+    lu = _safe_copy(lineups)
+    br = _safe_copy(batter_roll)
+    pr = _safe_copy(pitcher_roll)
 
-    away_sp = pitcher_roll_latest.add_prefix("away_sp_")
-    home_sp = pitcher_roll_latest.add_prefix("home_sp_")
-    df = df.merge(away_sp, left_on="away_starter_pitcher_id", right_on="away_sp_pitcher_id", how="left")
-    df = df.merge(home_sp, left_on="home_starter_pitcher_id", right_on="home_sp_pitcher_id", how="left")
+    game_pk_col = _pick_col(sp, ["game_pk"], required=True)
+    game_date_col = _pick_col(sp, ["game_date"], required=True)
+    home_team_col = _pick_col(sp, ["home_team"], required=True)
+    away_team_col = _pick_col(sp, ["away_team"], required=True)
 
-    away_off = _team_lineup_summary(lineups_today.rename(columns={"team": "away_team"}), batter_roll_latest, team_key="away_team")
-    home_off = _team_lineup_summary(lineups_today.rename(columns={"team": "home_team"}), batter_roll_latest, team_key="home_team")
-    away_off = away_off.add_prefix("away_off_").rename(columns={"away_off_away_team": "away_team"})
-    home_off = home_off.add_prefix("home_off_").rename(columns={"home_off_home_team": "home_team"})
-
-    if "away_off_away_team" in away_off.columns:
-        away_off = away_off.rename(columns={"away_off_away_team": "away_team"})
-    if "home_off_home_team" in home_off.columns:
-        home_off = home_off.rename(columns={"home_off_home_team": "home_team"})
-
-    df = df.merge(away_off, on="away_team", how="left")
-    df = df.merge(home_off, on="home_team", how="left")
-
-    df["away_offense_strength"] = (
-        1.3 * safe_numeric(df.get("away_off_tb_pa_rate_roll30"), 0)
-        + 1.1 * safe_numeric(df.get("away_off_hit_rate_roll30"), 0)
-        + 1.3 * safe_numeric(df.get("away_off_barrel_rate_roll30"), 0)
-        + 0.7 * safe_numeric(df.get("away_off_bb_rate_roll30"), 0)
-        - 0.5 * safe_numeric(df.get("away_off_so_rate_roll30"), 0)
+    home_sp_col = _pick_col(
+        sp,
+        ["home_sp_id", "home_starting_pitcher_id", "home_pitcher_id"],
+        required=True,
+    )
+    away_sp_col = _pick_col(
+        sp,
+        ["away_sp_id", "away_starting_pitcher_id", "away_pitcher_id"],
+        required=True,
     )
 
-    df["home_offense_strength"] = (
-        1.3 * safe_numeric(df.get("home_off_tb_pa_rate_roll30"), 0)
-        + 1.1 * safe_numeric(df.get("home_off_hit_rate_roll30"), 0)
-        + 1.3 * safe_numeric(df.get("home_off_barrel_rate_roll30"), 0)
-        + 0.7 * safe_numeric(df.get("home_off_bb_rate_roll30"), 0)
-        - 0.5 * safe_numeric(df.get("home_off_so_rate_roll30"), 0)
+    pr_pitcher_id = _pick_col(pr, ["pitcher_id"], required=True)
+
+    pr_keep = [c for c in pr.columns if c == pr_pitcher_id or "roll" in c]
+    pr_use = pr[pr_keep].copy()
+
+    # home SP rolling features
+    home_pr = pr_use.rename(
+        columns={
+            pr_pitcher_id: home_sp_col,
+            **{c: f"home_sp_{c}" for c in pr_use.columns if c != pr_pitcher_id},
+        }
+    )
+    sp = sp.merge(home_pr, on=home_sp_col, how="left")
+
+    # away SP rolling features
+    away_pr = pr_use.rename(
+        columns={
+            pr_pitcher_id: away_sp_col,
+            **{c: f"away_sp_{c}" for c in pr_use.columns if c != pr_pitcher_id},
+        }
+    )
+    sp = sp.merge(away_pr, on=away_sp_col, how="left")
+
+    # team offensive form from full projected/confirmed lineup
+    team_form = _build_team_lineup_features(lu, br)
+
+    team_form_team_col = _pick_col(team_form, ["team", "team_abbr", "batting_team"], required=True)
+
+    home_team_form = team_form.copy().add_prefix("home_team_").rename(
+        columns={
+            "home_team_game_pk": game_pk_col,
+            "home_team_game_date": game_date_col,
+            f"home_team_{team_form_team_col}": home_team_col,
+        }
     )
 
-    df["away_sp_strength"] = (
-        1.4 * safe_numeric(df.get("away_sp_k_rate_roll30"), 0)
-        - 1.0 * safe_numeric(df.get("away_sp_bb_rate_roll30"), 0)
-        - 1.6 * safe_numeric(df.get("away_sp_hr_rate_roll30"), 0)
-        - 1.3 * safe_numeric(df.get("away_sp_barrel_rate_allowed_roll30"), 0)
-        - 0.8 * safe_numeric(df.get("away_sp_hard_hit_rate_allowed_roll30"), 0)
+    away_team_form = team_form.copy().add_prefix("away_team_").rename(
+        columns={
+            "away_team_game_pk": game_pk_col,
+            "away_team_game_date": game_date_col,
+            f"away_team_{team_form_team_col}": away_team_col,
+        }
     )
 
-    df["home_sp_strength"] = (
-        1.4 * safe_numeric(df.get("home_sp_k_rate_roll30"), 0)
-        - 1.0 * safe_numeric(df.get("home_sp_bb_rate_roll30"), 0)
-        - 1.6 * safe_numeric(df.get("home_sp_hr_rate_roll30"), 0)
-        - 1.3 * safe_numeric(df.get("home_sp_barrel_rate_allowed_roll30"), 0)
-        - 0.8 * safe_numeric(df.get("home_sp_hard_hit_rate_allowed_roll30"), 0)
-    )
+    sp = sp.merge(home_team_form, on=[game_pk_col, game_date_col, home_team_col], how="left")
+    sp = sp.merge(away_team_form, on=[game_pk_col, game_date_col, away_team_col], how="left")
 
-    df["away_run_env"] = (
-        safe_numeric(df.get("park_factor_runs"), 1.0)
-        + 0.02 * safe_numeric(df.get("temperature_f"), 72)
-        + 0.06 * safe_numeric(df.get("weather_wind_out"), 0)
-        - 0.04 * safe_numeric(df.get("weather_wind_in"), 0)
-    )
-    df["home_run_env"] = df["away_run_env"]
+    # convenience deltas
+    for metric in [
+        "k_rate_roll7",
+        "bb_rate_roll7",
+        "hr_rate_roll7",
+        "runs_rate_roll7",
+        "barrel_rate_roll7",
+        "hardhit_rate_roll7",
+        "ev_mean_roll7",
+    ]:
+        home_c = f"home_sp_{metric}"
+        away_c = f"away_sp_{metric}"
+        if home_c in sp.columns and away_c in sp.columns:
+            sp[f"sp_diff_{metric}"] = pd.to_numeric(sp[home_c], errors="coerce") - pd.to_numeric(
+                sp[away_c], errors="coerce"
+            )
 
-    df["home_edge_raw"] = (
-        1.7 * (df["home_offense_strength"] - df["away_offense_strength"])
-        + 2.0 * (df["home_sp_strength"] - df["away_sp_strength"])
-        + 0.18  # mild home-field
-    )
+    for metric in [
+        "rbi_roll7",
+        "tb_roll7",
+        "barrel_rate_roll7",
+        "hardhit_rate_roll7",
+        "ev_mean_roll7",
+        "bb_rate_roll7",
+        "k_rate_roll7",
+    ]:
+        home_c = f"home_team_{metric}"
+        away_c = f"away_team_{metric}"
+        if home_c in sp.columns and away_c in sp.columns:
+            sp[f"off_diff_{metric}"] = pd.to_numeric(sp[home_c], errors="coerce") - pd.to_numeric(
+                sp[away_c], errors="coerce"
+            )
 
-    df["p_home_win"] = logistic_score(df["home_edge_raw"], center=0.0, scale=0.9).clip(0.05, 0.95)
-    df["p_away_win"] = (1.0 - df["p_home_win"]).clip(0.05, 0.95)
-
-    df["away_implied_runs"] = (
-        3.85
-        + 1.8 * df["away_offense_strength"].fillna(0)
-        - 1.2 * df["home_sp_strength"].fillna(0)
-        + 0.25 * df["away_run_env"].fillna(0)
-    ).clip(2.0, 8.5)
-
-    df["home_implied_runs"] = (
-        4.00
-        + 1.8 * df["home_offense_strength"].fillna(0)
-        - 1.2 * df["away_sp_strength"].fillna(0)
-        + 0.25 * df["home_run_env"].fillna(0)
-    ).clip(2.0, 8.5)
-
-    df["projected_total"] = (df["away_implied_runs"] + df["home_implied_runs"]).clip(5.5, 13.5)
-    df["projected_margin_home"] = df["home_implied_runs"] - df["away_implied_runs"]
-
-    return df.sort_values(["game_date", "scheduled_start_time_et", "game_pk"], kind="stable").reset_index(drop=True)
+    return sp
