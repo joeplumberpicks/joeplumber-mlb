@@ -7,8 +7,6 @@ from pathlib import Path
 import pandas as pd
 
 from src.ingest.io import log_kv, log_section, write_parquet
-from src.ingest.lineups import build_starting_pitchers
-from src.providers import rotowire
 from src.utils.config import load_config
 from src.utils.drive import resolve_data_dirs
 
@@ -17,6 +15,7 @@ from scripts.live._live_lineup_helpers import (
     load_schedule_for_date,
     print_quality,
 )
+from src.providers import rotowire
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +61,58 @@ def _pull_starters(config: dict) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True).drop_duplicates().reset_index(drop=True)
 
 
+def _coerce_final_schema(df: pd.DataFrame, season: int, slate_date: str) -> pd.DataFrame:
+    out = df.copy()
+
+    if out.empty:
+        return pd.DataFrame(
+            columns=[
+                "game_pk", "game_date", "season", "team", "opponent", "is_home",
+                "pitcher_id", "pitcher_name", "throws", "starter_status",
+                "source", "source_pull_ts", "rotowire_id",
+            ]
+        )
+
+    out["game_date"] = pd.to_datetime(out.get("game_date", slate_date), errors="coerce").dt.date.astype("string")
+    out["game_date"] = out["game_date"].fillna(slate_date)
+    out["season"] = season
+
+    if "pitcher_id" in out.columns:
+        out["pitcher_id"] = pd.to_numeric(out["pitcher_id"], errors="coerce").astype("Int64")
+    else:
+        out["pitcher_id"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+
+    if "pitcher_name" not in out.columns:
+        out["pitcher_name"] = pd.Series(pd.NA, index=out.index, dtype="string")
+    out["pitcher_name"] = out["pitcher_name"].astype("string").str.strip()
+
+    if "rotowire_id" in out.columns:
+        out["rotowire_id"] = pd.to_numeric(out["rotowire_id"], errors="coerce").astype("Int64")
+    else:
+        out["rotowire_id"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+
+    out["throws"] = pd.Series(pd.NA, index=out.index, dtype="string")
+    out["starter_status"] = out.get("starter_status", "probable")
+    out["source"] = out.get("source", "rotowire")
+    out["source_pull_ts"] = pd.Timestamp.utcnow().isoformat()
+
+    keep = [
+        "game_pk", "game_date", "season", "team", "opponent", "is_home",
+        "pitcher_id", "pitcher_name", "throws", "starter_status",
+        "source", "source_pull_ts", "rotowire_id",
+    ]
+
+    for c in keep:
+        if c not in out.columns:
+            out[c] = pd.NA
+
+    out = out[keep].copy()
+
+    # Keep rows even when pitcher_id is missing
+    out = out.dropna(subset=["team", "pitcher_name"], how="any").reset_index(drop=True)
+    return out
+
+
 def main() -> None:
     args = parse_args()
 
@@ -76,18 +127,19 @@ def main() -> None:
     dirs = resolve_data_dirs(config=config, prefer_drive=True)
 
     raw_live_dir = Path(dirs["raw_dir"]) / "live"
+    raw_live_dir.mkdir(parents=True, exist_ok=True)
+
     schedule_df = load_schedule_for_date(raw_live_dir, args.season, args.date)
 
     provider_df = _pull_starters(config)
-    provider_df = enrich_with_schedule(provider_df, schedule_df, args.date)
+    debug_raw = raw_live_dir / f"DEBUG_starting_pitchers_provider_{args.season}_{args.date}.parquet"
+    provider_df.to_parquet(debug_raw, index=False)
 
-    out_df = build_starting_pitchers(
-        records=provider_df,
-        starter_status="probable",
-        source="rotowire",
-        validate=True,
-        verbose=True,
-    )
+    enriched_df = enrich_with_schedule(provider_df, schedule_df, args.date)
+    debug_enriched = raw_live_dir / f"DEBUG_starting_pitchers_enriched_{args.season}_{args.date}.parquet"
+    enriched_df.to_parquet(debug_enriched, index=False)
+
+    out_df = _coerce_final_schema(enriched_df, args.season, args.date)
 
     print_quality(out_df, "starting_pitchers_out")
 
@@ -98,6 +150,8 @@ def main() -> None:
     write_parquet(out_df, dated_out)
 
     print(f"starting_pitchers_out={dated_out}")
+    print(f"debug_provider_out={debug_raw}")
+    print(f"debug_enriched_out={debug_enriched}")
 
 
 if __name__ == "__main__":
