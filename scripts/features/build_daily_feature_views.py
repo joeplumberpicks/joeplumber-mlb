@@ -1,189 +1,111 @@
+#!/usr/bin/env python3
 from __future__ import annotations
+
+import argparse
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-
-def _pick_col(df: pd.DataFrame, candidates: list[str], required: bool = False) -> str | None:
-    for c in candidates:
-        if c in df.columns:
-            return c
-    if required:
-        raise KeyError(f"Missing required column. Tried: {candidates}")
-    return None
+from src.features.build_hr_features import build_hr_features
+from src.features.build_moneyline_features import build_moneyline_features
+from src.features.build_nrfi_features import build_nrfi_features
+from src.features.build_rbi_features import build_rbi_features
+from src.utils.config import load_config
+from src.utils.drive import resolve_data_dirs
 
 
-def _safe_copy(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if "game_date" in out.columns:
-        out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce")
-    return out
+def get_today_date() -> str:
+    return datetime.now(ZoneInfo("America/New_York")).date().isoformat()
 
 
-def _build_top3_team_features(lineups: pd.DataFrame, batter_roll: pd.DataFrame) -> pd.DataFrame:
-    lu = _safe_copy(lineups)
-    br = _safe_copy(batter_roll)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build daily feature views for NRFI, Moneyline, HR, RBI.")
+    parser.add_argument("--date", type=str, default=None)
+    parser.add_argument("--season", type=str, default="2026")
+    parser.add_argument("--config", type=str, default="configs/project.yaml")
+    return parser.parse_args()
 
-    team_col = _pick_col(lu, ["team", "team_abbr", "batting_team"], required=True)
-    slot_col = _pick_col(lu, ["lineup_slot", "batting_order", "order_spot", "slot"])
-    batter_id_col = _pick_col(lu, ["batter_id", "player_id"], required=True)
-    game_pk_col = _pick_col(lu, ["game_pk"], required=True)
-    game_date_col = _pick_col(lu, ["game_date"], required=True)
 
-    br_batter_id = _pick_col(br, ["batter_id", "player_id"], required=True)
-    br_game_date = _pick_col(br, ["game_date"], required=True)
+def _require(path: Path) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing required file: {path}")
 
-    top3 = lu.copy()
 
-    if slot_col is not None:
-        top3[slot_col] = pd.to_numeric(top3[slot_col], errors="coerce")
-        top3 = top3.loc[top3[slot_col].le(3)].copy()
+def main() -> None:
+    args = parse_args()
 
-    merge_cols = [batter_id_col]
-    left_on = [batter_id_col]
-    right_on = [br_batter_id]
+    repo_root = Path(__file__).resolve().parents[2]
+    config = load_config((repo_root / args.config).resolve())
+    dirs = resolve_data_dirs(config=config, prefer_drive=True)
 
-    # bring in latest rolling row by same batter+game_date when available
-    if game_date_col in top3.columns and br_game_date in br.columns:
-        left_on.append(game_date_col)
-        right_on.append(br_game_date)
+    processed_dir = Path(dirs["processed_dir"])
+    raw_dir = Path(dirs["raw_dir"])
 
-    br_keep = [c for c in br.columns if c in set(right_on) or "roll" in c]
-    top3 = top3.merge(
-        br[br_keep].copy(),
-        left_on=left_on,
-        right_on=right_on,
-        how="left",
-    )
+    date_str = args.date or get_today_date()
+    season = str(args.season)
 
-    agg_map = {}
-    for c in top3.columns:
-        if "roll" in c:
-            agg_map[c] = "mean"
+    print(f"=== BUILD DAILY FEATURE VIEWS :: {date_str} ===")
 
-    if not agg_map:
-        top3_team = (
-            top3.groupby([game_pk_col, game_date_col, team_col], dropna=False)
-            .size()
-            .reset_index(name="top3_count")
+    spine_path = processed_dir / "live" / f"model_spine_game_{season}_{date_str}.parquet"
+    lineup_candidates = [
+        raw_dir / "live" / f"confirmed_lineups_{season}_{date_str}.parquet",
+        raw_dir / "live" / f"projected_lineups_{season}_{date_str}.parquet",
+    ]
+    batter_roll_path = processed_dir / "batter_statcast_rolling.parquet"
+    pitcher_roll_path = processed_dir / "pitcher_statcast_rolling.parquet"
+
+    _require(spine_path)
+    _require(batter_roll_path)
+    _require(pitcher_roll_path)
+
+    lineup_path = None
+    for p in lineup_candidates:
+        if p.exists():
+            lineup_path = p
+            break
+
+    if lineup_path is None:
+        raise FileNotFoundError(
+            f"Missing lineup parquet. Checked: {[str(p) for p in lineup_candidates]}"
         )
-        return top3_team
 
-    top3_team = (
-        top3.groupby([game_pk_col, game_date_col, team_col], dropna=False)
-        .agg(agg_map)
-        .reset_index()
-    )
-    top3_team["top3_count"] = (
-        top3.groupby([game_pk_col, game_date_col, team_col], dropna=False)[batter_id_col]
-        .count()
-        .values
-    )
-    return top3_team
+    print(f"Loading spine: {spine_path}")
+    print(f"Loading lineups: {lineup_path}")
+    print(f"Loading batter rollings: {batter_roll_path}")
+    print(f"Loading pitcher rollings: {pitcher_roll_path}")
+
+    spine = pd.read_parquet(spine_path)
+    lineups = pd.read_parquet(lineup_path)
+    batter_roll = pd.read_parquet(batter_roll_path)
+    pitcher_roll = pd.read_parquet(pitcher_roll_path)
+
+    nrfi = build_nrfi_features(spine, lineups, batter_roll, pitcher_roll)
+    ml = build_moneyline_features(spine, lineups, batter_roll, pitcher_roll)
+    hr = build_hr_features(spine, lineups, batter_roll, pitcher_roll)
+    rbi = build_rbi_features(spine, lineups, batter_roll, pitcher_roll)
+
+    out_nrfi = processed_dir / "live" / f"nrfi_features_{season}_{date_str}.parquet"
+    out_ml = processed_dir / "live" / f"ml_features_{season}_{date_str}.parquet"
+    out_hr = processed_dir / "live" / f"hr_features_{season}_{date_str}.parquet"
+    out_rbi = processed_dir / "live" / f"rbi_features_{season}_{date_str}.parquet"
+
+    nrfi.to_parquet(out_nrfi, index=False)
+    ml.to_parquet(out_ml, index=False)
+    hr.to_parquet(out_hr, index=False)
+    rbi.to_parquet(out_rbi, index=False)
+
+    print("✅ daily feature views built")
+    print(f"NRFI rows: {len(nrfi):,}")
+    print(f"Moneyline rows: {len(ml):,}")
+    print(f"HR rows: {len(hr):,}")
+    print(f"RBI rows: {len(rbi):,}")
+    print(f"out_nrfi={out_nrfi}")
+    print(f"out_ml={out_ml}")
+    print(f"out_hr={out_hr}")
+    print(f"out_rbi={out_rbi}")
 
 
-def build_nrfi_features(
-    spine: pd.DataFrame,
-    lineups: pd.DataFrame,
-    batter_roll: pd.DataFrame,
-    pitcher_roll: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Build one-row-per-game NRFI feature table.
-
-    Expected broad inputs:
-    - spine: one row per game
-    - lineups: projected or confirmed lineups for slate date
-    - batter_roll: cross-season batter rolling table
-    - pitcher_roll: cross-season pitcher rolling table
-    """
-    sp = _safe_copy(spine)
-    lu = _safe_copy(lineups)
-    br = _safe_copy(batter_roll)
-    pr = _safe_copy(pitcher_roll)
-
-    game_pk_col = _pick_col(sp, ["game_pk"], required=True)
-    game_date_col = _pick_col(sp, ["game_date"], required=True)
-    home_team_col = _pick_col(sp, ["home_team"], required=True)
-    away_team_col = _pick_col(sp, ["away_team"], required=True)
-
-    home_sp_col = _pick_col(
-        sp,
-        ["home_sp_id", "home_starting_pitcher_id", "home_pitcher_id"],
-        required=True,
-    )
-    away_sp_col = _pick_col(
-        sp,
-        ["away_sp_id", "away_starting_pitcher_id", "away_pitcher_id"],
-        required=True,
-    )
-
-    pr_pitcher_id = _pick_col(pr, ["pitcher_id"], required=True)
-    pr_game_date = _pick_col(pr, ["game_date"], required=False)
-
-    pr_keep = [c for c in pr.columns if c == pr_pitcher_id or c == pr_game_date or "roll" in c]
-    pr_use = pr[pr_keep].copy()
-
-    # home SP features
-    home_pr = pr_use.rename(
-        columns={
-            pr_pitcher_id: home_sp_col,
-            **{c: f"home_sp_{c}" for c in pr_use.columns if c not in [pr_pitcher_id]}
-        }
-    )
-    sp = sp.merge(home_pr, on=home_sp_col, how="left")
-
-    # away SP features
-    away_pr = pr_use.rename(
-        columns={
-            pr_pitcher_id: away_sp_col,
-            **{c: f"away_sp_{c}" for c in pr_use.columns if c not in [pr_pitcher_id]}
-        }
-    )
-    sp = sp.merge(away_pr, on=away_sp_col, how="left")
-
-    # top-3 lineup team features
-    team_top3 = _build_top3_team_features(lu, br)
-
-    team_top3_game_pk = _pick_col(team_top3, ["game_pk"], required=True)
-    team_top3_game_date = _pick_col(team_top3, ["game_date"], required=True)
-    team_top3_team = _pick_col(team_top3, ["team", "team_abbr", "batting_team"], required=True)
-
-    home_top3 = team_top3.loc[:, :].copy()
-    home_top3 = home_top3.add_prefix("home_top3_").rename(
-        columns={
-            "home_top3_game_pk": game_pk_col,
-            "home_top3_game_date": game_date_col,
-            "home_top3_team": home_team_col,
-        }
-    )
-
-    away_top3 = team_top3.loc[:, :].copy()
-    away_top3 = away_top3.add_prefix("away_top3_").rename(
-        columns={
-            "away_top3_game_pk": game_pk_col,
-            "away_top3_game_date": game_date_col,
-            "away_top3_team": away_team_col,
-        }
-    )
-
-    sp = sp.merge(home_top3, on=[game_pk_col, game_date_col, home_team_col], how="left")
-    sp = sp.merge(away_top3, on=[game_pk_col, game_date_col, away_team_col], how="left")
-
-    # convenience deltas for model use
-    for metric in [
-        "k_rate_roll7",
-        "bb_rate_roll7",
-        "hr_rate_roll7",
-        "runs_rate_roll7",
-        "barrel_rate_roll7",
-        "hardhit_rate_roll7",
-        "ev_mean_roll7",
-    ]:
-        home_c = f"home_sp_{metric}"
-        away_c = f"away_sp_{metric}"
-        if home_c in sp.columns and away_c in sp.columns:
-            sp[f"sp_diff_{metric}"] = pd.to_numeric(sp[home_c], errors="coerce") - pd.to_numeric(
-                sp[away_c], errors="coerce"
-            )
-
-    return sp
+if __name__ == "__main__":
+    main()
