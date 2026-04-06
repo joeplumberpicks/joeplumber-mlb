@@ -24,6 +24,20 @@ def _read_if_exists(path: Path) -> pd.DataFrame | None:
     return None
 
 
+def _ensure_binary_col(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    if col not in df.columns:
+        df[col] = 0
+    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    return df
+
+
+def _ensure_numeric_col(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.DataFrame:
+    if col not in df.columns:
+        df[col] = default
+    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(default)
+    return df
+
+
 def main() -> None:
     args = parse_args()
 
@@ -56,17 +70,38 @@ def main() -> None:
     if rename_map:
         pa = pa.rename(columns=rename_map)
 
-    for col in ["is_hit", "is_hr", "is_rbi", "is_bb", "is_so", "is_barrel", "is_hard_hit"]:
-        if col not in pa.columns:
-            pa[col] = 0
+    # required binary/stat columns used downstream
+    for col in [
+        "is_hit",
+        "is_hr",
+        "is_rbi",
+        "is_bb",
+        "is_so",
+        "is_barrel",
+        "is_hard_hit",
+        "is_1b",
+        "is_2b",
+        "is_3b",
+    ]:
+        pa = _ensure_binary_col(pa, col)
 
+    # optional numeric statcast columns
+    for col in [
+        "launch_speed",
+        "launch_angle",
+    ]:
+        pa = _ensure_numeric_col(pa, col, default=0.0)
+
+    # safe total bases build
     if "total_bases" not in pa.columns:
         pa["total_bases"] = (
-            pa.get("is_1b", 0).fillna(0).astype(int)
-            + 2 * pa.get("is_2b", 0).fillna(0).astype(int)
-            + 3 * pa.get("is_3b", 0).fillna(0).astype(int)
-            + 4 * pa.get("is_hr", 0).fillna(0).astype(int)
+            pd.to_numeric(pa["is_1b"], errors="coerce").fillna(0).astype(int)
+            + 2 * pd.to_numeric(pa["is_2b"], errors="coerce").fillna(0).astype(int)
+            + 3 * pd.to_numeric(pa["is_3b"], errors="coerce").fillna(0).astype(int)
+            + 4 * pd.to_numeric(pa["is_hr"], errors="coerce").fillna(0).astype(int)
         )
+    else:
+        pa["total_bases"] = pd.to_numeric(pa["total_bases"], errors="coerce").fillna(0)
 
     batter = build_batter_game(pa)
     pitcher = build_pitcher_game(pa)
