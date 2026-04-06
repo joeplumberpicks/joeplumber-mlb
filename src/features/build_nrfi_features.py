@@ -24,8 +24,8 @@ def _build_top3_team_features(lineups: pd.DataFrame, batter_roll: pd.DataFrame) 
     br = _safe_copy(batter_roll)
 
     team_col = _pick_col(lu, ["team", "team_abbr", "batting_team"], required=True)
-    slot_col = _pick_col(lu, ["lineup_slot", "batting_order", "order_spot", "slot"])
-    batter_id_col = _pick_col(lu, ["batter_id", "player_id"], required=True)
+    slot_col = _pick_col(lu, ["batting_order", "lineup_slot", "order_spot", "slot"])
+    batter_id_col = _pick_col(lu, ["player_id", "batter_id"], required=True)
     game_pk_col = _pick_col(lu, ["game_pk"], required=True)
     game_date_col = _pick_col(lu, ["game_date"], required=True)
 
@@ -41,7 +41,7 @@ def _build_top3_team_features(lineups: pd.DataFrame, batter_roll: pd.DataFrame) 
     left_on = [batter_id_col]
     right_on = [br_batter_id]
 
-    if game_date_col in top3.columns and br_game_date is not None and br_game_date in br.columns:
+    if br_game_date is not None:
         left_on.append(game_date_col)
         right_on.append(br_game_date)
 
@@ -59,12 +59,11 @@ def _build_top3_team_features(lineups: pd.DataFrame, batter_roll: pd.DataFrame) 
             agg_map[c] = "mean"
 
     if not agg_map:
-        top3_team = (
+        return (
             top3.groupby([game_pk_col, game_date_col, team_col], dropna=False)
             .size()
             .reset_index(name="top3_count")
         )
-        return top3_team
 
     top3_team = (
         top3.groupby([game_pk_col, game_date_col, team_col], dropna=False)
@@ -85,15 +84,6 @@ def build_nrfi_features(
     batter_roll: pd.DataFrame,
     pitcher_roll: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Build one-row-per-game NRFI feature table.
-
-    Expected broad inputs:
-    - spine: one row per game
-    - lineups: projected or confirmed lineups for slate date
-    - batter_roll: cross-season batter rolling table
-    - pitcher_roll: cross-season pitcher rolling table
-    """
     sp = _safe_copy(spine)
     lu = _safe_copy(lineups)
     br = _safe_copy(batter_roll)
@@ -106,12 +96,22 @@ def build_nrfi_features(
 
     home_sp_col = _pick_col(
         sp,
-        ["home_sp_id", "home_starting_pitcher_id", "home_pitcher_id"],
+        [
+            "home_sp_id",
+            "home_starting_pitcher_id",
+            "home_pitcher_id",
+            "home_starter_pitcher_id",
+        ],
         required=True,
     )
     away_sp_col = _pick_col(
         sp,
-        ["away_sp_id", "away_starting_pitcher_id", "away_pitcher_id"],
+        [
+            "away_sp_id",
+            "away_starting_pitcher_id",
+            "away_pitcher_id",
+            "away_starter_pitcher_id",
+        ],
         required=True,
     )
 
@@ -138,7 +138,6 @@ def build_nrfi_features(
     sp = sp.merge(away_pr, on=away_sp_col, how="left")
 
     team_top3 = _build_top3_team_features(lu, br)
-
     team_top3_team = _pick_col(team_top3, ["team", "team_abbr", "batting_team"], required=True)
 
     home_top3 = team_top3.copy().add_prefix("home_top3_").rename(
@@ -164,16 +163,16 @@ def build_nrfi_features(
         "k_rate_roll7",
         "bb_rate_roll7",
         "hr_rate_roll7",
-        "runs_rate_roll7",
-        "barrel_rate_roll7",
-        "hardhit_rate_roll7",
+        "barrel_rate_allowed_roll7",
+        "hardhit_rate_allowed_roll7",
         "ev_mean_roll7",
     ]:
         home_c = f"home_sp_{metric}"
         away_c = f"away_sp_{metric}"
         if home_c in sp.columns and away_c in sp.columns:
-            sp[f"sp_diff_{metric}"] = pd.to_numeric(sp[home_c], errors="coerce") - pd.to_numeric(
-                sp[away_c], errors="coerce"
+            sp[f"sp_diff_{metric}"] = (
+                pd.to_numeric(sp[home_c], errors="coerce")
+                - pd.to_numeric(sp[away_c], errors="coerce")
             )
 
     return sp
