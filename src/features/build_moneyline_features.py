@@ -24,7 +24,7 @@ def _build_team_lineup_features(lineups: pd.DataFrame, batter_roll: pd.DataFrame
     br = _safe_copy(batter_roll)
 
     team_col = _pick_col(lu, ["team", "team_abbr", "batting_team"], required=True)
-    batter_id_col = _pick_col(lu, ["batter_id", "player_id"], required=True)
+    batter_id_col = _pick_col(lu, ["player_id", "batter_id"], required=True)
     game_pk_col = _pick_col(lu, ["game_pk"], required=True)
     game_date_col = _pick_col(lu, ["game_date"], required=True)
 
@@ -52,12 +52,11 @@ def _build_team_lineup_features(lineups: pd.DataFrame, batter_roll: pd.DataFrame
             agg_map[c] = "mean"
 
     if not agg_map:
-        out = (
+        return (
             lu.groupby([game_pk_col, game_date_col, team_col], dropna=False)
             .size()
             .reset_index(name="lineup_count")
         )
-        return out
 
     out = (
         lu.groupby([game_pk_col, game_date_col, team_col], dropna=False)
@@ -93,12 +92,22 @@ def build_moneyline_features(
 
     home_sp_col = _pick_col(
         sp,
-        ["home_sp_id", "home_starting_pitcher_id", "home_pitcher_id"],
+        [
+            "home_sp_id",
+            "home_starting_pitcher_id",
+            "home_pitcher_id",
+            "home_starter_pitcher_id",
+        ],
         required=True,
     )
     away_sp_col = _pick_col(
         sp,
-        ["away_sp_id", "away_starting_pitcher_id", "away_pitcher_id"],
+        [
+            "away_sp_id",
+            "away_starting_pitcher_id",
+            "away_pitcher_id",
+            "away_starter_pitcher_id",
+        ],
         required=True,
     )
 
@@ -107,7 +116,6 @@ def build_moneyline_features(
     pr_keep = [c for c in pr.columns if c == pr_pitcher_id or "roll" in c]
     pr_use = pr[pr_keep].copy()
 
-    # home SP rolling features
     home_pr = pr_use.rename(
         columns={
             pr_pitcher_id: home_sp_col,
@@ -116,7 +124,6 @@ def build_moneyline_features(
     )
     sp = sp.merge(home_pr, on=home_sp_col, how="left")
 
-    # away SP rolling features
     away_pr = pr_use.rename(
         columns={
             pr_pitcher_id: away_sp_col,
@@ -125,9 +132,7 @@ def build_moneyline_features(
     )
     sp = sp.merge(away_pr, on=away_sp_col, how="left")
 
-    # team offensive form from full projected/confirmed lineup
     team_form = _build_team_lineup_features(lu, br)
-
     team_form_team_col = _pick_col(team_form, ["team", "team_abbr", "batting_team"], required=True)
 
     home_team_form = team_form.copy().add_prefix("home_team_").rename(
@@ -149,21 +154,20 @@ def build_moneyline_features(
     sp = sp.merge(home_team_form, on=[game_pk_col, game_date_col, home_team_col], how="left")
     sp = sp.merge(away_team_form, on=[game_pk_col, game_date_col, away_team_col], how="left")
 
-    # convenience deltas
     for metric in [
         "k_rate_roll7",
         "bb_rate_roll7",
         "hr_rate_roll7",
-        "runs_rate_roll7",
-        "barrel_rate_roll7",
-        "hardhit_rate_roll7",
+        "barrel_rate_allowed_roll7",
+        "hardhit_rate_allowed_roll7",
         "ev_mean_roll7",
     ]:
         home_c = f"home_sp_{metric}"
         away_c = f"away_sp_{metric}"
         if home_c in sp.columns and away_c in sp.columns:
-            sp[f"sp_diff_{metric}"] = pd.to_numeric(sp[home_c], errors="coerce") - pd.to_numeric(
-                sp[away_c], errors="coerce"
+            sp[f"sp_diff_{metric}"] = (
+                pd.to_numeric(sp[home_c], errors="coerce")
+                - pd.to_numeric(sp[away_c], errors="coerce")
             )
 
     for metric in [
@@ -178,8 +182,9 @@ def build_moneyline_features(
         home_c = f"home_team_{metric}"
         away_c = f"away_team_{metric}"
         if home_c in sp.columns and away_c in sp.columns:
-            sp[f"off_diff_{metric}"] = pd.to_numeric(sp[home_c], errors="coerce") - pd.to_numeric(
-                sp[away_c], errors="coerce"
+            sp[f"off_diff_{metric}"] = (
+                pd.to_numeric(sp[home_c], errors="coerce")
+                - pd.to_numeric(sp[away_c], errors="coerce")
             )
 
     return sp
