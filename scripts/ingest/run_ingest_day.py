@@ -108,7 +108,7 @@ def main() -> None:
     _run(
         [
             py,
-            "scripts/live/build_projected_lineups_rotowire.py",
+            "scripts/live/build_projected_lineups_fangraphs.py",
             "--season",
             str(args.season),
             "--date",
