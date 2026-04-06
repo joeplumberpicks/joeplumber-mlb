@@ -4,18 +4,18 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import pandas as pd
+
 from src.ingest.io import log_kv, log_section, write_parquet
 from src.ingest.lineups import build_confirmed_lineups
-from src.providers.rotowire import extract_lineups
+from src.providers import rotowire
 from src.utils.config import load_config
 from src.utils.drive import resolve_data_dirs
 
-from scripts.live._rotowire_live import (
-    combine_provider_tables,
-    enrich_provider_rows_with_schedule,
+from scripts.live._live_lineup_helpers import (
+    enrich_with_schedule,
     load_schedule_for_date,
-    print_join_quality,
-    pull_rotowire_tables,
+    print_quality,
 )
 
 
@@ -26,6 +26,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=str, default="configs/project.yaml")
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
+
+
+def _pull_confirmed_tables(config: dict) -> pd.DataFrame:
+    rw_cfg = config.get("rotowire", {})
+    url = str(rw_cfg.get("confirmed_lineups_url", "")).strip()
+    request_timeout = int(rw_cfg.get("request_timeout", 30))
+
+    if not url:
+        raise ValueError("Missing rotowire.confirmed_lineups_url in configs/project.yaml")
+
+    tables = rotowire.read_html_tables(
+        url=url,
+        request_timeout=request_timeout,
+        verbose=True,
+    )
+
+    frames = []
+    for idx, table in enumerate(tables):
+        try:
+            extracted = rotowire.extract_lineups(table, lineup_status="confirmed")
+        except Exception:
+            continue
+
+        if extracted is None or extracted.empty:
+            continue
+
+        extracted = extracted.copy()
+        extracted["source_table_idx"] = idx
+        frames.append(extracted)
+
+    if not frames:
+        return pd.DataFrame()
+
+    return pd.concat(frames, ignore_index=True).drop_duplicates().reset_index(drop=True)
 
 
 def main() -> None:
@@ -40,21 +74,12 @@ def main() -> None:
 
     config = load_config(config_path)
     dirs = resolve_data_dirs(config=config, prefer_drive=True)
-    raw_live_dir = Path(dirs["raw_dir"]) / "live"
 
+    raw_live_dir = Path(dirs["raw_dir"]) / "live"
     schedule_df = load_schedule_for_date(raw_live_dir, args.season, args.date)
 
-    rotowire_cfg = config.get("rotowire", {})
-    url = str(rotowire_cfg.get("confirmed_lineups_url", "")).strip()
-    request_timeout = int(rotowire_cfg.get("request_timeout", 30))
-
-    tables = pull_rotowire_tables(url=url, request_timeout=request_timeout)
-    provider_df = combine_provider_tables(
-        tables,
-        extract_lineups,
-        status_label="confirmed",
-    )
-    provider_df = enrich_provider_rows_with_schedule(provider_df, schedule_df, args.date)
+    provider_df = _pull_confirmed_tables(config)
+    provider_df = enrich_with_schedule(provider_df, schedule_df, args.date)
 
     out_df = build_confirmed_lineups(
         records=provider_df,
@@ -63,13 +88,15 @@ def main() -> None:
         verbose=True,
     )
 
-    print_join_quality(out_df, "confirmed_lineups_joined")
+    print_quality(out_df, "confirmed_lineups_out")
 
     latest_out = raw_live_dir / f"confirmed_lineups_{args.season}.parquet"
     dated_out = raw_live_dir / f"confirmed_lineups_{args.season}_{args.date}.parquet"
 
     write_parquet(out_df, latest_out)
     write_parquet(out_df, dated_out)
+
+    print(f"confirmed_lineups_out={dated_out}")
 
 
 if __name__ == "__main__":
