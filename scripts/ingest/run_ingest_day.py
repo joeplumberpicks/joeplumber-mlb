@@ -28,6 +28,12 @@ def _run(cmd: list[str], repo_root: Path) -> None:
         raise RuntimeError(f"Command failed ({result.returncode}): {' '.join(cmd)}")
 
 
+def _copy_if_exists(src: Path, dst: Path) -> None:
+    if src.exists():
+        dst.write_bytes(src.read_bytes())
+        print(f"Copied fallback: {src} -> {dst}")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -43,6 +49,8 @@ def main() -> None:
 
     raw_live_dir = Path(dirs["raw_dir"]) / "live"
     processed_live_dir = Path(dirs["processed_dir"]) / "live"
+    raw_live_dir.mkdir(parents=True, exist_ok=True)
+    processed_live_dir.mkdir(parents=True, exist_ok=True)
 
     py = sys.executable
 
@@ -105,21 +113,7 @@ def main() -> None:
         repo_root,
     )
 
-    _run(
-        [
-            py,
-            "scripts/live/build_projected_lineups_fangraphs.py",
-            "--season",
-            str(args.season),
-            "--date",
-            args.date,
-            "--config",
-            args.config,
-            "--force",
-        ],
-        repo_root,
-    )
-
+    # Rotowire confirmed lineups
     _run(
         [
             py,
@@ -135,6 +129,16 @@ def main() -> None:
         repo_root,
     )
 
+    # Use Rotowire confirmed as projected fallback
+    confirmed_latest = raw_live_dir / f"confirmed_lineups_{args.season}.parquet"
+    confirmed_dated = raw_live_dir / f"confirmed_lineups_{args.season}_{args.date}.parquet"
+    projected_latest = raw_live_dir / f"projected_lineups_{args.season}.parquet"
+    projected_dated = raw_live_dir / f"projected_lineups_{args.season}_{args.date}.parquet"
+
+    _copy_if_exists(confirmed_latest, projected_latest)
+    _copy_if_exists(confirmed_dated, projected_dated)
+
+    # Rotowire starting pitchers
     _run(
         [
             py,
