@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.ingest.id_resolution import resolve_lineup_player_ids
 from src.ingest.io import log_kv, log_section, write_parquet
 from src.utils.config import load_config
 from src.utils.drive import resolve_data_dirs
@@ -71,6 +72,7 @@ def _coerce_final_schema(df: pd.DataFrame, season: int, slate_date: str) -> pd.D
                 "lineup_status", "source", "source_pull_ts", "batting_order",
                 "player_id", "player_name", "handedness_bat", "handedness_throw",
                 "position", "is_starting_lineup", "rotowire_id",
+                "player_id_resolution_method",
             ]
         )
 
@@ -102,9 +104,9 @@ def _coerce_final_schema(df: pd.DataFrame, season: int, slate_date: str) -> pd.D
     out["lineup_status"] = out.get("lineup_status", "confirmed")
     out["source"] = out.get("source", "rotowire")
     out["source_pull_ts"] = pd.Timestamp.utcnow().isoformat()
-    out["handedness_bat"] = pd.Series(pd.NA, index=out.index, dtype="string")
+    out["handedness_bat"] = out.get("handedness_bat", pd.Series(pd.NA, index=out.index, dtype="string"))
     out["handedness_throw"] = pd.Series(pd.NA, index=out.index, dtype="string")
-    out["position"] = pd.Series(pd.NA, index=out.index, dtype="string")
+    out["position"] = out.get("position", pd.Series(pd.NA, index=out.index, dtype="string"))
     out["is_starting_lineup"] = True
 
     keep = [
@@ -119,8 +121,6 @@ def _coerce_final_schema(df: pd.DataFrame, season: int, slate_date: str) -> pd.D
             out[c] = pd.NA
 
     out = out[keep].copy()
-
-    # Keep rows even when player_id is missing
     out = out.dropna(subset=["team", "player_name"], how="any").reset_index(drop=True)
     return out
 
@@ -140,6 +140,7 @@ def main() -> None:
 
     raw_live_dir = Path(dirs["raw_dir"]) / "live"
     raw_live_dir.mkdir(parents=True, exist_ok=True)
+    processed_dir = Path(dirs["processed_dir"])
 
     schedule_df = load_schedule_for_date(raw_live_dir, args.season, args.date)
 
@@ -152,6 +153,7 @@ def main() -> None:
     enriched_df.to_parquet(debug_enriched, index=False)
 
     out_df = _coerce_final_schema(enriched_df, args.season, args.date)
+    out_df = resolve_lineup_player_ids(out_df, processed_dir)
 
     print_quality(out_df, "confirmed_lineups_out")
 
