@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.ingest.id_resolution import resolve_starting_pitcher_ids
 from src.ingest.io import log_kv, log_section, write_parquet
 from src.utils.config import load_config
 from src.utils.drive import resolve_data_dirs
@@ -70,6 +71,7 @@ def _coerce_final_schema(df: pd.DataFrame, season: int, slate_date: str) -> pd.D
                 "game_pk", "game_date", "season", "team", "opponent", "is_home",
                 "pitcher_id", "pitcher_name", "throws", "starter_status",
                 "source", "source_pull_ts", "rotowire_id",
+                "pitcher_id_resolution_method",
             ]
         )
 
@@ -91,7 +93,7 @@ def _coerce_final_schema(df: pd.DataFrame, season: int, slate_date: str) -> pd.D
     else:
         out["rotowire_id"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
 
-    out["throws"] = pd.Series(pd.NA, index=out.index, dtype="string")
+    out["throws"] = out.get("throws", pd.Series(pd.NA, index=out.index, dtype="string"))
     out["starter_status"] = out.get("starter_status", "probable")
     out["source"] = out.get("source", "rotowire")
     out["source_pull_ts"] = pd.Timestamp.utcnow().isoformat()
@@ -107,8 +109,6 @@ def _coerce_final_schema(df: pd.DataFrame, season: int, slate_date: str) -> pd.D
             out[c] = pd.NA
 
     out = out[keep].copy()
-
-    # Keep rows even when pitcher_id is missing
     out = out.dropna(subset=["team", "pitcher_name"], how="any").reset_index(drop=True)
     return out
 
@@ -128,6 +128,7 @@ def main() -> None:
 
     raw_live_dir = Path(dirs["raw_dir"]) / "live"
     raw_live_dir.mkdir(parents=True, exist_ok=True)
+    processed_dir = Path(dirs["processed_dir"])
 
     schedule_df = load_schedule_for_date(raw_live_dir, args.season, args.date)
 
@@ -140,6 +141,7 @@ def main() -> None:
     enriched_df.to_parquet(debug_enriched, index=False)
 
     out_df = _coerce_final_schema(enriched_df, args.season, args.date)
+    out_df = resolve_starting_pitcher_ids(out_df, processed_dir)
 
     print_quality(out_df, "starting_pitchers_out")
 
