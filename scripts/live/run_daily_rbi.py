@@ -72,80 +72,61 @@ def main() -> None:
 
     score = pd.Series(0.0, index=df.index, dtype="float64")
 
-    # Hitter production form
     for col, wt in {
-        "rbi_roll15": 1.10,
-        "rbi_roll30": 0.75,
-        "tb_roll15": 0.35,
-        "tb_roll30": 0.22,
-        "hardhit_rate_roll15": 0.75,
-        "hardhit_rate_roll30": 0.45,
-        "barrel_rate_roll15": 0.55,
-        "barrel_rate_roll30": 0.35,
-        "bb_rate_roll15": 0.18,
-        "k_rate_roll15": -0.15,
+        "rbi_roll15": 0.95,
+        "rbi_roll30": 0.60,
+        "tb_roll15": 0.28,
+        "tb_roll30": 0.18,
+        "hardhit_rate_roll15": 0.45,
+        "barrel_rate_roll15": 0.35,
+        "bb_rate_roll15": 0.16,
+        "k_rate_roll15": -0.08,
     }.items():
         score = add_weighted_feature(score, df, col, wt)
 
-    # Opposing pitcher run allowance / baserunner pressure
     for col, wt in {
         "opp_bb_rate_roll15": 0.30,
-        "opp_bb_rate_roll30": 0.18,
-        "opp_hr_allowed_roll15": 0.35,
-        "opp_hr_allowed_roll30": 0.22,
-        "opp_runs_rate_roll15": 0.45,
-        "opp_runs_rate_roll30": 0.28,
-        "opp_hardhit_rate_allowed_roll15": 0.30,
-        "opp_barrel_rate_allowed_roll15": 0.22,
+        "opp_hr_allowed_roll15": 0.28,
+        "opp_hardhit_rate_allowed_roll15": 0.22,
     }.items():
         score = add_weighted_feature(score, df, col, wt)
 
-    # Team context / lineup support
     for col, wt in {
-        "team_ctx_bb_rate_roll15": 0.32,
-        "team_ctx_bb_rate_roll7": 0.22,
-        "team_ctx_tb_roll15": 0.22,
-        "team_ctx_rbi_roll15": 0.18,
-        "team_ctx_hardhit_rate_roll15": 0.28,
-        "team_ctx_barrel_rate_roll15": 0.18,
+        "rbi_walk_pressure_roll15": 1.20,
+        "rbi_power_pressure_roll15": 1.00,
+        "rbi_contact_pressure_roll15": 0.90,
+        "rbi_team_onbase_pressure": 0.70,
     }.items():
         score = add_weighted_feature(score, df, col, wt)
 
-    # Builder-generated matchup pressure
     for col, wt in {
-        "rbi_walk_pressure_roll15": 0.28,
-        "rbi_power_pressure_roll15": 0.35,
-        "rbi_contact_pressure_roll15": 0.26,
+        "team_ctx_bb_rate_roll15": 0.30,
+        "team_ctx_tb_roll15": 0.20,
+        "team_ctx_rbi_roll15": 0.16,
+        "team_ctx_hardhit_rate_roll15": 0.18,
+        "team_ctx_barrel_rate_roll15": 0.12,
     }.items():
         score = add_weighted_feature(score, df, col, wt)
 
-    # Lineup slot bonus
-    lineup_slot_col = _pick_col(df, ["lineup_slot", "batting_order", "order_spot", "slot"])
-    if lineup_slot_col is not None:
-        slot_num = pd.to_numeric(df[lineup_slot_col], errors="coerce")
-        score = score + slot_num.map({
-            1: 0.10,
-            2: 0.20,
-            3: 0.45,
-            4: 0.55,
-            5: 0.35,
-            6: 0.15,
-        }).fillna(0.0)
+    if "lineup_weight" in df.columns:
+        score = score * pd.to_numeric(df["lineup_weight"], errors="coerce").fillna(1.0)
 
-    # Environment
     for col, wt in {
-        "weather_wind_out": 0.08,
-        "weather_wind_in": -0.04,
+        "weather_wind_out": 0.06,
+        "weather_wind_in": -0.03,
         "temperature_f": 0.002,
     }.items():
         score = add_weighted_feature(score, df, col, wt)
+
+    if "tie_break_noise" in df.columns:
+        score = score + pd.to_numeric(df["tie_break_noise"], errors="coerce").fillna(0.0)
 
     df["rbi_score_raw"] = score
     df["p_rbi"] = sigmoid_series(score)
 
     df["confidence"] = pd.cut(
         df["p_rbi"],
-        bins=[0.0, 0.18, 0.24, 0.31, 0.40, 1.0],
+        bins=[0.0, 0.22, 0.28, 0.35, 0.43, 1.0],
         labels=["C", "B-", "B+", "A", "A+"],
         include_lowest=True,
     )
@@ -169,9 +150,7 @@ def main() -> None:
 
     board = df[keep].sort_values("p_rbi", ascending=False).reset_index(drop=True)
     board["rank"] = range(1, len(board) + 1)
-
-    cols = ["rank"] + [c for c in board.columns if c != "rank"]
-    board = board[cols]
+    board = board[["rank"] + [c for c in board.columns if c != "rank"]]
 
     out_csv = outputs_dir / f"rbi_board_{season}_{date_str}.csv"
     out_parquet = outputs_dir / f"rbi_board_{season}_{date_str}.parquet"
