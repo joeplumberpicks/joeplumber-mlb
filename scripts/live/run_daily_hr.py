@@ -72,71 +72,62 @@ def main() -> None:
 
     score = pd.Series(0.0, index=df.index, dtype="float64")
 
-    # Hitter form / power
     for col, wt in {
-        "hr_roll15": 0.45,
-        "hr_roll30": 0.35,
-        "barrel_rate_roll15": 1.35,
-        "barrel_rate_roll30": 0.95,
-        "hardhit_rate_roll15": 0.95,
-        "hardhit_rate_roll30": 0.65,
-        "ev_mean_roll15": 0.025,
-        "ev_mean_roll30": 0.018,
-        "la_mean_roll15": 0.020,
-        "tb_roll15": 0.12,
-        "k_rate_roll15": -0.18,
+        "hr_roll15": 0.42,
+        "hr_roll30": 0.28,
+        "barrel_rate_roll15": 1.10,
+        "barrel_rate_roll30": 0.75,
+        "hardhit_rate_roll15": 0.70,
+        "hardhit_rate_roll30": 0.45,
+        "ev_mean_roll15": 0.018,
+        "ev_mean_roll30": 0.012,
+        "la_mean_roll15": 0.012,
+        "tb_roll15": 0.10,
+        "k_rate_roll15": -0.12,
     }.items():
         score = add_weighted_feature(score, df, col, wt)
 
-    # Pitcher vulnerability
     for col, wt in {
-        "opp_hr_allowed_roll15": 0.85,
-        "opp_hr_allowed_roll30": 0.65,
-        "opp_barrel_rate_allowed_roll15": 1.00,
-        "opp_barrel_rate_allowed_roll30": 0.70,
-        "opp_hardhit_rate_allowed_roll15": 0.70,
-        "opp_hardhit_rate_allowed_roll30": 0.45,
-        "opp_ev_mean_roll15": 0.015,
-        "opp_bb_rate_roll15": 0.12,
+        "opp_hr_allowed_roll15": 0.65,
+        "opp_hr_allowed_roll30": 0.45,
+        "opp_barrel_rate_allowed_roll15": 0.70,
+        "opp_barrel_rate_allowed_roll30": 0.45,
+        "opp_hardhit_rate_allowed_roll15": 0.40,
+        "opp_hardhit_rate_allowed_roll30": 0.25,
+        "opp_ev_mean_roll15": 0.010,
+        "opp_bb_rate_roll15": 0.08,
     }.items():
         score = add_weighted_feature(score, df, col, wt)
 
-    # Matchup edge features from builder
     for col, wt in {
-        "matchup_barrel_edge_roll15": 0.85,
-        "matchup_hardhit_edge_roll15": 0.60,
-        "matchup_ev_edge_roll15": 0.018,
-        "matchup_hr_pressure_roll15": 0.40,
+        "matchup_barrel_edge_roll15": 1.25,
+        "matchup_hardhit_edge_roll15": 0.90,
+        "matchup_ev_edge_roll15": 0.030,
+        "batter_vs_pitcher_hr_risk": 1.80,
+        "batter_vs_pitcher_contact_risk": 0.90,
+        "batter_vs_pitcher_power_combo": 1.40,
     }.items():
         score = add_weighted_feature(score, df, col, wt)
 
-    # Opportunity / lineup
-    lineup_slot_col = _pick_col(df, ["lineup_slot", "batting_order", "order_spot", "slot"])
-    if lineup_slot_col is not None:
-        slot_num = pd.to_numeric(df[lineup_slot_col], errors="coerce")
-        score = score + slot_num.map({
-            1: 0.18,
-            2: 0.22,
-            3: 0.35,
-            4: 0.42,
-            5: 0.30,
-            6: 0.15,
-        }).fillna(0.0)
+    if "lineup_weight" in df.columns:
+        score = score * pd.to_numeric(df["lineup_weight"], errors="coerce").fillna(1.0)
 
-    # Environment
     for col, wt in {
-        "weather_wind_out": 0.12,
-        "weather_wind_in": -0.08,
-        "temperature_f": 0.004,
+        "weather_wind_out": 0.10,
+        "weather_wind_in": -0.06,
+        "temperature_f": 0.003,
     }.items():
         score = add_weighted_feature(score, df, col, wt)
+
+    if "tie_break_noise" in df.columns:
+        score = score + pd.to_numeric(df["tie_break_noise"], errors="coerce").fillna(0.0)
 
     df["hr_score_raw"] = score
     df["p_hr"] = sigmoid_series(score)
 
     df["confidence"] = pd.cut(
         df["p_hr"],
-        bins=[0.0, 0.06, 0.09, 0.12, 0.16, 1.0],
+        bins=[0.0, 0.08, 0.12, 0.16, 0.21, 1.0],
         labels=["C", "B-", "B+", "A", "A+"],
         include_lowest=True,
     )
@@ -160,9 +151,7 @@ def main() -> None:
 
     board = df[keep].sort_values("p_hr", ascending=False).reset_index(drop=True)
     board["rank"] = range(1, len(board) + 1)
-
-    cols = ["rank"] + [c for c in board.columns if c != "rank"]
-    board = board[cols]
+    board = board[["rank"] + [c for c in board.columns if c != "rank"]]
 
     out_csv = outputs_dir / f"hr_board_{season}_{date_str}.csv"
     out_parquet = outputs_dir / f"hr_board_{season}_{date_str}.parquet"
