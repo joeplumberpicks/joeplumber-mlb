@@ -6,13 +6,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from src.ingest.io import log_kv, log_section, read_dataset
-from src.utils.config import load_config
-from src.utils.drive import resolve_data_dirs
+import pandas as pd
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run full Joe Plumber live pregame pipeline.")
+    parser = argparse.ArgumentParser(description="Run live pregame pipeline.")
     parser.add_argument("--season", type=int, required=True)
     parser.add_argument("--date", type=str, required=True)
     parser.add_argument("--config", type=str, default="configs/project.yaml")
@@ -20,34 +18,24 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _run(cmd: list[str], repo_root: Path) -> None:
-    print("")
-    print("RUNNING:", " ".join(cmd))
-    result = subprocess.run(cmd, cwd=repo_root)
+def _run(cmd: list[str]) -> None:
+    print(f"\nRUNNING: {' '.join(cmd)}")
+    result = subprocess.run(cmd)
     if result.returncode != 0:
         raise RuntimeError(f"Command failed ({result.returncode}): {' '.join(cmd)}")
-
-
-def _pct(series) -> float:
-    if len(series) == 0:
-        return 0.0
-    return float(series.fillna(False).astype("boolean").mean() * 100.0)
 
 
 def main() -> None:
     args = parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
-    config_path = (repo_root / args.config).resolve()
-
-    log_section("scripts/live/run_live_pregame_pipeline.py")
-    log_kv("repo_root", repo_root)
-    log_kv("config_path", config_path)
-
-    config = load_config(config_path)
-    dirs = resolve_data_dirs(config=config, prefer_drive=True)
+    print("========== scripts/live/run_live_pregame_pipeline.py =========")
+    print(f"repo_root: {repo_root}")
+    print(f"config_path: {repo_root / args.config}")
 
     py = sys.executable
+    config_arg = ["--config", args.config]
+    force_arg = ["--force"] if args.force else []
 
     _run(
         [
@@ -57,37 +45,35 @@ def main() -> None:
             str(args.season),
             "--date",
             args.date,
-            "--config",
-            args.config,
-            "--force",
-        ],
-        repo_root,
+            *config_arg,
+            *force_arg,
+        ]
     )
 
-    processed_live_dir = Path(dirs["processed_dir"]) / "live"
-    spine_path = processed_live_dir / f"model_spine_game_{args.season}_{args.date}.parquet"
-
+    spine_path = Path("/content/drive/MyDrive/joeplumber-mlb/data/processed/live") / f"model_spine_game_{args.season}_{args.date}.parquet"
     if not spine_path.exists():
         raise FileNotFoundError(f"Missing spine output: {spine_path}")
 
-    df = read_dataset(spine_path)
+    df = pd.read_parquet(spine_path).copy()
 
-    print("")
-    print(f"Row count [model_spine_game_{args.season}_{args.date}]: {len(df):,}")
-    print(f"Distinct game_pk: {df['game_pk'].nunique(dropna=True):,}")
+    print(f"\nRow count [model_spine_game_{args.season}_{args.date}]: {len(df):,}")
+    print(f"Distinct game_pk: {df['game_pk'].nunique() if 'game_pk' in df.columns else 0}")
 
-    if "starters_both_found" in df.columns:
-        print(f"pct_with_starters={_pct(df['starters_both_found']):.2f}")
+    if "away_starter_found" in df.columns and "home_starter_found" in df.columns:
+        starter_pct = ((df["away_starter_found"].fillna(False) & df["home_starter_found"].fillna(False)).mean()) * 100
+        print(f"pct_with_starters={starter_pct:.2f}")
 
-    if "lineups_projected_both_found" in df.columns:
-        print(f"pct_with_projected_lineups={_pct(df['lineups_projected_both_found']):.2f}")
+    if "away_projected_lineup_found" in df.columns and "home_projected_lineup_found" in df.columns:
+        projected_pct = ((df["away_projected_lineup_found"].fillna(False) & df["home_projected_lineup_found"].fillna(False)).mean()) * 100
+        print(f"pct_with_projected_lineups={projected_pct:.2f}")
 
-    if "lineups_confirmed_both_found" in df.columns:
-        print(f"pct_with_confirmed_lineups={_pct(df['lineups_confirmed_both_found']):.2f}")
+    if "away_confirmed_lineup_found" in df.columns and "home_confirmed_lineup_found" in df.columns:
+        confirmed_pct = ((df["away_confirmed_lineup_found"].fillna(False) & df["home_confirmed_lineup_found"].fillna(False)).mean()) * 100
+        print(f"pct_with_confirmed_lineups={confirmed_pct:.2f}")
 
-    for col in ["temperature_f", "wind_mph", "weather_wind_out", "weather_wind_in", "weather_crosswind"]:
-        if col in df.columns:
-            print(f"Nulls [{col}]: {int(df[col].isna().sum()):,}")
+    for c in ["temperature_f", "wind_mph", "weather_wind_out", "weather_wind_in", "weather_crosswind"]:
+        if c in df.columns:
+            print(f"Nulls [{c}]: {int(df[c].isna().sum())}")
 
     print(f"daily_out={spine_path}")
 
