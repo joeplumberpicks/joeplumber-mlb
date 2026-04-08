@@ -33,8 +33,25 @@ def sigmoid_series(x: pd.Series) -> pd.Series:
 def add_weighted_feature(score: pd.Series, df: pd.DataFrame, col: str, weight: float) -> pd.Series:
     if col in df.columns:
         vals = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-        score = score + (vals * weight)
+        score = score + vals * weight
     return score
+
+
+def zscore_series(x: pd.Series) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce").fillna(0.0)
+    std = x.std()
+    if pd.isna(std) or std == 0:
+        return pd.Series(0.0, index=x.index, dtype="float64")
+    return (x - x.mean()) / std
+
+
+def confidence_from_prob(prob: pd.Series) -> pd.Series:
+    return pd.cut(
+        prob,
+        bins=[0.0, 0.52, 0.55, 0.58, 0.62, 1.0],
+        labels=["C", "B-", "B+", "A", "A+"],
+        include_lowest=True,
+    )
 
 
 def main() -> None:
@@ -63,84 +80,42 @@ def main() -> None:
 
     score = pd.Series(0.0, index=df.index, dtype="float64")
 
-    # Starter edge
     for col, wt in {
-        "home_sp_k_rate_roll15": 1.10,
-        "away_sp_k_rate_roll15": -1.10,
-        "home_sp_bb_rate_roll15": -0.80,
-        "away_sp_bb_rate_roll15": 0.80,
-        "home_sp_hr_rate_roll15": -0.90,
-        "away_sp_hr_rate_roll15": 0.90,
-        "home_sp_barrel_rate_roll15": -0.60,
-        "away_sp_barrel_rate_roll15": 0.60,
-        "home_sp_hardhit_rate_roll15": -0.45,
-        "away_sp_hardhit_rate_roll15": 0.45,
-        "home_sp_runs_rate_roll15": -0.85,
-        "away_sp_runs_rate_roll15": 0.85,
+        "sp_diff_k_rate_roll7": 0.55,
+        "sp_diff_bb_rate_roll7": -0.45,
+        "sp_diff_hr_rate_roll7": -0.50,
+        "sp_diff_barrel_rate_allowed_roll7": -0.45,
+        "sp_diff_hardhit_rate_allowed_roll7": -0.35,
+        "off_diff_rbi_roll7": 0.30,
+        "off_diff_tb_roll7": 0.32,
+        "off_diff_barrel_rate_roll7": 0.28,
+        "off_diff_hardhit_rate_roll7": 0.22,
+        "off_diff_ev_mean_roll7": 0.015,
+        "off_diff_bb_rate_roll7": 0.10,
+        "off_diff_k_rate_roll7": -0.12,
     }.items():
         score = add_weighted_feature(score, df, col, wt)
 
-    # Explicit diff features if present
     for col, wt in {
-        "sp_diff_k_rate_roll7": 0.70,
-        "sp_diff_bb_rate_roll7": -0.55,
-        "sp_diff_hr_rate_roll7": -0.65,
-        "sp_diff_runs_rate_roll7": -0.75,
-        "sp_diff_barrel_rate_roll7": -0.35,
-        "sp_diff_hardhit_rate_roll7": -0.25,
+        "weather_wind_out": -0.03,
+        "weather_wind_in": 0.02,
+        "temperature_f": 0.001,
     }.items():
         score = add_weighted_feature(score, df, col, wt)
 
-    # Team offense edge
-    for col, wt in {
-        "home_team_rbi_roll7": 0.18,
-        "away_team_rbi_roll7": -0.18,
-        "home_team_tb_roll7": 0.22,
-        "away_team_tb_roll7": -0.22,
-        "home_team_barrel_rate_roll7": 0.55,
-        "away_team_barrel_rate_roll7": -0.55,
-        "home_team_hardhit_rate_roll7": 0.45,
-        "away_team_hardhit_rate_roll7": -0.45,
-        "home_team_ev_mean_roll7": 0.015,
-        "away_team_ev_mean_roll7": -0.015,
-        "home_team_bb_rate_roll7": 0.20,
-        "away_team_bb_rate_roll7": -0.20,
-        "home_team_k_rate_roll7": -0.15,
-        "away_team_k_rate_roll7": 0.15,
-    }.items():
-        score = add_weighted_feature(score, df, col, wt)
+    missing_starter = pd.Series(False, index=df.index)
+    for c in ["home_starter_pitcher_id", "away_starter_pitcher_id", "home_sp_id", "away_sp_id"]:
+        if c in df.columns:
+            missing_starter = missing_starter | df[c].isna()
 
-    # Offensive diff features if present
-    for col, wt in {
-        "off_diff_rbi_roll7": 0.20,
-        "off_diff_tb_roll7": 0.24,
-        "off_diff_barrel_rate_roll7": 0.60,
-        "off_diff_hardhit_rate_roll7": 0.50,
-        "off_diff_ev_mean_roll7": 0.018,
-        "off_diff_bb_rate_roll7": 0.22,
-        "off_diff_k_rate_roll7": -0.18,
-    }.items():
-        score = add_weighted_feature(score, df, col, wt)
+    score.loc[missing_starter] = score.loc[missing_starter] - 0.25
 
-    # Environment
-    for col, wt in {
-        "weather_wind_out": -0.05,
-        "weather_wind_in": 0.03,
-        "temperature_f": -0.001,
-    }.items():
-        score = add_weighted_feature(score, df, col, wt)
-
-    df["home_win_score_raw"] = score
-    df["home_win_prob"] = sigmoid_series(score)
+    score_z = zscore_series(score)
+    df["home_win_score_raw"] = score_z
+    df["home_win_prob"] = sigmoid_series(score_z * 1.10)
     df["away_win_prob"] = 1.0 - df["home_win_prob"]
-    df["pick"] = df["home_win_prob"].ge(0.5).map({True: "HOME", False: "AWAY"})
-
-    df["confidence"] = pd.cut(
-        df["home_win_prob"].where(df["home_win_prob"] >= 0.5, 1.0 - df["home_win_prob"]),
-        bins=[0.0, 0.53, 0.57, 0.62, 0.68, 1.0],
-        labels=["C", "B-", "B+", "A", "A+"],
-        include_lowest=True,
-    )
+    df["pick"] = df["home_win_prob"].ge(0.50).map({True: "HOME", False: "AWAY"})
+    df["confidence"] = confidence_from_prob(df[["home_win_prob", "away_win_prob"]].max(axis=1))
 
     keep = [
         c for c in [
@@ -166,7 +141,7 @@ def main() -> None:
 
     print(f"✅ Moneyline board built: {out_csv}")
     print(f"✅ Moneyline board parquet: {out_parquet}")
-    print(board.head(15).to_string(index=False))
+    print(board.to_string(index=False))
 
 
 if __name__ == "__main__":
