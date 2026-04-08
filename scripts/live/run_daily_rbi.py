@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import math
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -44,6 +44,23 @@ def add_weighted_feature(score: pd.Series, df: pd.DataFrame, col: str, weight: f
 def sigmoid_series(x: pd.Series) -> pd.Series:
     x = pd.to_numeric(x, errors="coerce").fillna(0.0).clip(-20, 20)
     return x.map(lambda v: 1.0 / (1.0 + math.exp(-float(v))))
+
+
+def zscore_series(x: pd.Series) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce").fillna(0.0)
+    std = x.std()
+    if pd.isna(std) or std == 0:
+        return pd.Series(0.0, index=x.index, dtype="float64")
+    return (x - x.mean()) / std
+
+
+def confidence_from_prob(prob: pd.Series) -> pd.Series:
+    return pd.cut(
+        prob,
+        bins=[0.0, 0.54, 0.60, 0.66, 0.72, 1.0],
+        labels=["C", "B-", "B+", "A", "A+"],
+        include_lowest=True,
+    )
 
 
 def main() -> None:
@@ -121,15 +138,17 @@ def main() -> None:
     if "tie_break_noise" in df.columns:
         score = score + pd.to_numeric(df["tie_break_noise"], errors="coerce").fillna(0.0)
 
-    df["rbi_score_raw"] = score
-    df["p_rbi"] = sigmoid_series(score)
+    missing_core = pd.Series(False, index=df.index)
+    for c in ["player_id", "opp_pitcher_id"]:
+        if c in df.columns:
+            missing_core = missing_core | df[c].isna()
 
-    df["confidence"] = pd.cut(
-        df["p_rbi"],
-        bins=[0.0, 0.22, 0.28, 0.35, 0.43, 1.0],
-        labels=["C", "B-", "B+", "A", "A+"],
-        include_lowest=True,
-    )
+    score.loc[missing_core] = score.loc[missing_core] - 0.20
+
+    score_z = zscore_series(score)
+    df["rbi_score_raw"] = score_z
+    df["p_rbi"] = sigmoid_series(score_z * 0.90)
+    df["confidence"] = confidence_from_prob(df["p_rbi"])
 
     batter_name_col = _pick_col(df, ["batter_name", "player_name", "name"])
     team_col = _pick_col(df, ["team", "team_abbr", "batting_team"])
@@ -165,4 +184,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
