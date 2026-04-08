@@ -18,6 +18,9 @@ from src.utils.config import load_config
 from src.utils.drive import resolve_data_dirs
 
 
+ROTOWIRE_FALLBACK_URL = "https://www.rotowire.com/baseball/daily-lineups.php"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build starting pitchers from Rotowire.")
     parser.add_argument("--season", type=str, required=True)
@@ -232,9 +235,14 @@ def _load_schedule_for_date(raw_dir: Path, season: str, date_str: str) -> pd.Dat
 
 def _pull_provider_df(config: dict) -> pd.DataFrame:
     rw_cfg = config.get("rotowire", {}) if isinstance(config, dict) else {}
-    url = rw_cfg.get("lineups_url") or rw_cfg.get("daily_lineups_url")
-    if not url:
-        raise ValueError("Missing rotowire.lineups_url in configs/project.yaml")
+
+    url = (
+        rw_cfg.get("lineups_url")
+        or rw_cfg.get("daily_lineups_url")
+        or rw_cfg.get("confirmed_lineups_url")
+        or rw_cfg.get("url")
+        or ROTOWIRE_FALLBACK_URL
+    )
 
     provider_df = rotowire.fetch_lineups(url=url)
     if provider_df is None or provider_df.empty:
