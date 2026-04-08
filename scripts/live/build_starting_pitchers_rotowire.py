@@ -58,6 +58,7 @@ def _normalize_team(team: object) -> str | None:
         "CWS": "CHW",
         "KCR": "KC",
         "KAN": "KC",
+        "LAD": "LAD",
         "SDP": "SD",
         "SFG": "SF",
         "TBR": "TB",
@@ -67,88 +68,175 @@ def _normalize_team(team: object) -> str | None:
     return aliases.get(s, s)
 
 
-def _build_pitcher_lookup(processed_dir: Path) -> pd.DataFrame:
-    lookup_path = processed_dir / "player_id_lookup_pitchers.parquet"
-    if not lookup_path.exists():
-        raise FileNotFoundError(f"Missing pitcher lookup: {lookup_path}")
+def _initial_last(name: object) -> str | None:
+    s = _normalize_name(name)
+    if not s:
+        return None
+    parts = s.split()
+    if len(parts) < 2:
+        return None
+    return f"{parts[0][0]} {parts[-1]}"
 
-    df = pd.read_parquet(lookup_path).copy()
 
-    id_col = None
-    for c in ["pitcher_id", "player_id"]:
+def _last_only(name: object) -> str | None:
+    s = _normalize_name(name)
+    if not s:
+        return None
+    parts = s.split()
+    if not parts:
+        return None
+    return parts[-1]
+
+
+def _pick_first_existing(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for c in candidates:
         if c in df.columns:
-            id_col = c
-            break
-    if id_col is None:
-        raise ValueError("Pitcher lookup missing pitcher_id/player_id column")
+            return c
+    return None
 
-    team_col = "team" if "team" in df.columns else None
 
-    # Preferred shape: lookup_key + lookup_type
-    if "lookup_key" in df.columns and "lookup_type" in df.columns:
-        out = df.copy()
-        out["lookup_key"] = out["lookup_key"].map(_normalize_name)
-        out[id_col] = pd.to_numeric(out[id_col], errors="coerce").astype("Int64")
-        if team_col is not None:
-            out[team_col] = out[team_col].map(_normalize_team)
-        keep = ["lookup_key", "lookup_type"] + ([team_col] if team_col else []) + [id_col]
-        return out[keep].dropna(subset=["lookup_key", id_col]).drop_duplicates()
+def _safe_read_parquet(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_parquet(path)
+    except Exception:
+        return pd.DataFrame()
 
-    # Fallback: build lookup from player_name
-    name_col = None
-    for c in ["player_name", "name", "full_name"]:
-        if c in df.columns:
-            name_col = c
-            break
-    if name_col is None:
-        raise ValueError("Pitcher lookup missing lookup_key and player_name/name/full_name")
 
-    out = df.copy()
-    out["name_norm"] = out[name_col].map(_normalize_name)
-    out[id_col] = pd.to_numeric(out[id_col], errors="coerce").astype("Int64")
+def _build_lookup_from_frame(df: pd.DataFrame, source_name: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["lookup_key", "lookup_type", "team_norm", "pitcher_id"])
+
+    id_col = _pick_first_existing(
+        df,
+        [
+            "pitcher_id",
+            "player_id",
+            "mlbam_id",
+            "mlb_id",
+            "id",
+        ],
+    )
+    name_col = _pick_first_existing(
+        df,
+        [
+            "pitcher_name",
+            "player_name",
+            "name",
+            "full_name",
+            "pitcher",
+            "player",
+        ],
+    )
+    team_col = _pick_first_existing(
+        df,
+        [
+            "team",
+            "pitching_team",
+            "player_team",
+            "team_abbr",
+            "tm",
+        ],
+    )
+
+    if id_col is None or name_col is None:
+        return pd.DataFrame(columns=["lookup_key", "lookup_type", "team_norm", "pitcher_id"])
+
+    base = df[[c for c in [id_col, name_col, team_col] if c is not None]].copy()
+    base = base.rename(columns={id_col: "pitcher_id", name_col: "name_raw"})
     if team_col is not None:
-        out[team_col] = out[team_col].map(_normalize_team)
+        base = base.rename(columns={team_col: "team_raw"})
+    else:
+        base["team_raw"] = pd.NA
 
-    exact = out.copy()
-    exact["lookup_key"] = exact["name_norm"]
-    exact["lookup_type"] = "exact_full_name"
+    base["pitcher_id"] = pd.to_numeric(base["pitcher_id"], errors="coerce").astype("Int64")
+    base["name_norm"] = base["name_raw"].map(_normalize_name)
+    base["team_norm"] = base["team_raw"].map(_normalize_team)
 
-    init = out.copy()
-    init["lookup_key"] = init["name_norm"].map(
-        lambda s: f"{s.split()[0][0]} {s.split()[-1]}" if isinstance(s, str) and len(s.split()) >= 2 else None
+    base = base.dropna(subset=["pitcher_id", "name_norm"]).copy()
+    if base.empty:
+        return pd.DataFrame(columns=["lookup_key", "lookup_type", "team_norm", "pitcher_id"])
+
+    exact_team = base[["pitcher_id", "team_norm", "name_norm"]].copy()
+    exact_team["lookup_key"] = exact_team["name_norm"]
+    exact_team["lookup_type"] = f"{source_name}_exact_team"
+
+    exact_global = base[["pitcher_id", "name_norm"]].copy()
+    exact_global["lookup_key"] = exact_global["name_norm"]
+    exact_global["lookup_type"] = f"{source_name}_exact_global"
+    exact_global["team_norm"] = pd.NA
+
+    init_team = base[["pitcher_id", "team_norm", "name_raw"]].copy()
+    init_team["lookup_key"] = init_team["name_raw"].map(_initial_last)
+    init_team["lookup_type"] = f"{source_name}_initial_last_team"
+    init_team = init_team.dropna(subset=["lookup_key"])
+
+    last_team = base[["pitcher_id", "team_norm", "name_raw"]].copy()
+    last_team["lookup_key"] = last_team["name_raw"].map(_last_only)
+    last_team["lookup_type"] = f"{source_name}_last_team"
+    last_team = last_team.dropna(subset=["lookup_key"])
+
+    out = pd.concat(
+        [
+            exact_team[["lookup_key", "lookup_type", "team_norm", "pitcher_id"]],
+            exact_global[["lookup_key", "lookup_type", "team_norm", "pitcher_id"]],
+            init_team[["lookup_key", "lookup_type", "team_norm", "pitcher_id"]],
+            last_team[["lookup_key", "lookup_type", "team_norm", "pitcher_id"]],
+        ],
+        ignore_index=True,
     )
-    init["lookup_type"] = "initial_last_team"
 
-    last = out.copy()
-    last["lookup_key"] = last["name_norm"].map(
-        lambda s: s.split()[-1] if isinstance(s, str) and len(s.split()) >= 1 else None
-    )
-    last["lookup_type"] = "last_name_team"
+    out = out.drop_duplicates()
+    return out
 
-    built = pd.concat([exact, init, last], ignore_index=True)
-    keep = ["lookup_key", "lookup_type"] + ([team_col] if team_col else []) + [id_col]
-    return built[keep].dropna(subset=["lookup_key", id_col]).drop_duplicates()
+
+def _build_master_pitcher_lookup(processed_dir: Path) -> pd.DataFrame:
+    frames = []
+
+    lookup_parquet = _safe_read_parquet(processed_dir / "player_id_lookup_pitchers.parquet")
+    if not lookup_parquet.empty:
+        if "lookup_key" in lookup_parquet.columns:
+            temp = lookup_parquet.copy()
+            id_col = _pick_first_existing(temp, ["pitcher_id", "player_id", "mlbam_id", "mlb_id", "id"])
+            if id_col is not None:
+                temp["lookup_key"] = temp["lookup_key"].map(_normalize_name)
+                temp["team_norm"] = temp[_pick_first_existing(temp, ["team", "team_abbr", "tm"])].map(_normalize_team) if _pick_first_existing(temp, ["team", "team_abbr", "tm"]) else pd.NA
+                temp["pitcher_id"] = pd.to_numeric(temp[id_col], errors="coerce").astype("Int64")
+                temp["lookup_type"] = temp["lookup_type"].astype("string")
+                temp = temp[["lookup_key", "lookup_type", "team_norm", "pitcher_id"]].dropna(subset=["lookup_key", "pitcher_id"])
+                frames.append(temp)
+
+        frames.append(_build_lookup_from_frame(lookup_parquet, "lookup_parquet"))
+
+    frames.append(_build_lookup_from_frame(_safe_read_parquet(processed_dir / "pitcher_game_statcast.parquet"), "game_statcast"))
+    frames.append(_build_lookup_from_frame(_safe_read_parquet(processed_dir / "pitcher_statcast_rolling.parquet"), "rolling_statcast"))
+    frames.append(_build_lookup_from_frame(_safe_read_parquet(processed_dir / "pitcher_game_rolling.parquet"), "game_rolling"))
+
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if out.empty:
+        return pd.DataFrame(columns=["lookup_key", "lookup_type", "team_norm", "pitcher_id"])
+
+    out["lookup_key"] = out["lookup_key"].map(_normalize_name)
+    out["team_norm"] = out["team_norm"].map(_normalize_team)
+    out["pitcher_id"] = pd.to_numeric(out["pitcher_id"], errors="coerce").astype("Int64")
+    out = out.dropna(subset=["lookup_key", "pitcher_id"]).drop_duplicates().reset_index(drop=True)
+    return out
 
 
 def _resolve_pitcher_ids(df: pd.DataFrame, processed_dir: Path) -> pd.DataFrame:
     if df.empty:
-        df = df.copy()
-        df["pitcher_id_resolution_method"] = pd.Series(dtype="string")
-        return df
+        out = df.copy()
+        out["pitcher_id_resolution_method"] = pd.Series(dtype="string")
+        return out
 
-    lookup = _build_pitcher_lookup(processed_dir)
-    id_col = "pitcher_id" if "pitcher_id" in lookup.columns else "player_id"
-    has_team = "team" in lookup.columns
+    lookup = _build_master_pitcher_lookup(processed_dir)
 
     out = df.copy()
     out["team_norm"] = out["team"].map(_normalize_team)
     out["pitcher_name_norm"] = out["pitcher_name"].map(_normalize_name)
-    out["pitcher_name_initial_last"] = out["pitcher_name_norm"].map(
-        lambda s: f"{s.split()[0][0]} {s.split()[-1]}" if isinstance(s, str) and len(s.split()) >= 2 else None
-    )
-    out["pitcher_name_last"] = out["pitcher_name_norm"].map(
-        lambda s: s.split()[-1] if isinstance(s, str) and len(s.split()) >= 1 else None
-    )
+    out["pitcher_name_initial_last"] = out["pitcher_name"].map(_initial_last)
+    out["pitcher_name_last"] = out["pitcher_name"].map(_last_only)
 
     if "pitcher_id" not in out.columns:
         out["pitcher_id"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
@@ -157,54 +245,37 @@ def _resolve_pitcher_ids(df: pd.DataFrame, processed_dir: Path) -> pd.DataFrame:
 
     out["pitcher_id_resolution_method"] = pd.Series("unresolved", index=out.index, dtype="string")
 
-    # exact full name + team
-    exact = lookup[lookup["lookup_type"] == "exact_full_name"].copy()
-    exact = exact.rename(columns={"lookup_key": "pitcher_name_norm", id_col: "pitcher_id_lkp"})
-    if has_team:
-        exact = exact.rename(columns={"team": "team_norm"})
-        merge_keys = ["pitcher_name_norm", "team_norm"]
-    else:
-        merge_keys = ["pitcher_name_norm"]
+    def _apply_match(
+        current: pd.DataFrame,
+        lookup_type_pattern: str,
+        left_key: str,
+        use_team: bool,
+        method_name: str,
+    ) -> pd.DataFrame:
+        lkp = lookup[lookup["lookup_type"].astype("string").str.contains(lookup_type_pattern, na=False)].copy()
+        if lkp.empty:
+            return current
 
-    out = out.merge(exact[merge_keys + ["pitcher_id_lkp"]].drop_duplicates(), on=merge_keys, how="left")
-    mask = out["pitcher_id"].isna() & out["pitcher_id_lkp"].notna()
-    out.loc[mask, "pitcher_id"] = out.loc[mask, "pitcher_id_lkp"].astype("Int64")
-    out.loc[mask, "pitcher_id_resolution_method"] = "exact_full_name_team"
-    out = out.drop(columns=["pitcher_id_lkp"])
+        lkp = lkp.rename(columns={"lookup_key": left_key, "pitcher_id": "pitcher_id_lkp"})
+        merge_cols = [left_key] + (["team_norm"] if use_team else [])
 
-    # initial + last + team
-    init = lookup[lookup["lookup_type"] == "initial_last_team"].copy()
-    if not init.empty:
-        init = init.rename(columns={"lookup_key": "pitcher_name_initial_last", id_col: "pitcher_id_lkp"})
-        if has_team:
-            init = init.rename(columns={"team": "team_norm"})
-            merge_keys = ["pitcher_name_initial_last", "team_norm"]
-        else:
-            merge_keys = ["pitcher_name_initial_last"]
+        lkp = lkp[merge_cols + ["pitcher_id_lkp"]].drop_duplicates()
 
-        out = out.merge(init[merge_keys + ["pitcher_id_lkp"]].drop_duplicates(), on=merge_keys, how="left")
-        mask = out["pitcher_id"].isna() & out["pitcher_id_lkp"].notna()
-        out.loc[mask, "pitcher_id"] = out.loc[mask, "pitcher_id_lkp"].astype("Int64")
-        out.loc[mask, "pitcher_id_resolution_method"] = "initial_last_team"
-        out = out.drop(columns=["pitcher_id_lkp"])
+        merged = current.merge(lkp, on=merge_cols, how="left")
+        mask = merged["pitcher_id"].isna() & merged["pitcher_id_lkp"].notna()
+        merged.loc[mask, "pitcher_id"] = merged.loc[mask, "pitcher_id_lkp"].astype("Int64")
+        merged.loc[mask, "pitcher_id_resolution_method"] = method_name
+        merged = merged.drop(columns=["pitcher_id_lkp"])
+        return merged
 
-    # last name + team
-    last = lookup[lookup["lookup_type"] == "last_name_team"].copy()
-    if not last.empty:
-        last = last.rename(columns={"lookup_key": "pitcher_name_last", id_col: "pitcher_id_lkp"})
-        if has_team:
-            last = last.rename(columns={"team": "team_norm"})
-            merge_keys = ["pitcher_name_last", "team_norm"]
-        else:
-            merge_keys = ["pitcher_name_last"]
+    # Most strict -> loosest
+    out = _apply_match(out, "_exact_team$", "pitcher_name_norm", True, "exact_team")
+    out = _apply_match(out, "_exact_global$", "pitcher_name_norm", False, "exact_global")
+    out = _apply_match(out, "_initial_last_team$", "pitcher_name_initial_last", True, "initial_last_team")
+    out = _apply_match(out, "_last_team$", "pitcher_name_last", True, "last_name_team")
 
-        out = out.merge(last[merge_keys + ["pitcher_id_lkp"]].drop_duplicates(), on=merge_keys, how="left")
-        mask = out["pitcher_id"].isna() & out["pitcher_id_lkp"].notna()
-        out.loc[mask, "pitcher_id"] = out.loc[mask, "pitcher_id_lkp"].astype("Int64")
-        out.loc[mask, "pitcher_id_resolution_method"] = "last_name_team"
-        out = out.drop(columns=["pitcher_id_lkp"])
-
-    return out.drop(columns=["team_norm", "pitcher_name_norm", "pitcher_name_initial_last", "pitcher_name_last"])
+    out = out.drop(columns=["team_norm", "pitcher_name_norm", "pitcher_name_initial_last", "pitcher_name_last"])
+    return out
 
 
 def _pull_starters(config: dict) -> pd.DataFrame:
@@ -220,30 +291,47 @@ def _pull_starters(config: dict) -> pd.DataFrame:
 
     request_timeout = int(rw_cfg.get("request_timeout", 30))
 
-    tables = rotowire.read_html_tables(
-        url=url,
-        request_timeout=request_timeout,
-        verbose=True,
-    )
+    # First try table reader
+    try:
+        tables = rotowire.read_html_tables(
+            url=url,
+            request_timeout=request_timeout,
+            verbose=True,
+        )
 
-    frames = []
-    for idx, table in enumerate(tables):
+        frames = []
+        for idx, table in enumerate(tables):
+            try:
+                extracted = rotowire.extract_starting_pitchers(table, starter_status="probable")
+            except Exception:
+                continue
+
+            if extracted is None or extracted.empty:
+                continue
+
+            extracted = extracted.copy()
+            extracted["source_table_idx"] = idx
+            frames.append(extracted)
+
+        if frames:
+            return pd.concat(frames, ignore_index=True).drop_duplicates().reset_index(drop=True)
+    except Exception:
+        pass
+
+    # Then try token parser if your current rotowire provider has it
+    if hasattr(rotowire, "read_html_text") and hasattr(rotowire, "parse_daily_lineups_from_text"):
         try:
-            extracted = rotowire.extract_starting_pitchers(table, starter_status="probable")
+            html = rotowire.read_html_text(url=url, request_timeout=request_timeout)
+            parsed = rotowire.parse_daily_lineups_from_text(html, verbose=True)
+            if isinstance(parsed, dict):
+                starters = parsed.get("starting_pitchers")
+                if starters is not None and not starters.empty:
+                    return starters.reset_index(drop=True)
         except Exception:
-            continue
+            pass
 
-        if extracted is None or extracted.empty:
-            continue
-
-        extracted = extracted.copy()
-        extracted["source_table_idx"] = idx
-        frames.append(extracted)
-
-    if not frames:
-        return pd.DataFrame()
-
-    return pd.concat(frames, ignore_index=True).drop_duplicates().reset_index(drop=True)
+    # Last fallback: empty frame
+    return pd.DataFrame()
 
 
 def main() -> None:
