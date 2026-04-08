@@ -130,9 +130,8 @@ def _build_lookup_from_history(
     if not rows:
         return pd.DataFrame(
             columns=[
-                "normalized_name",
-                "normalized_initial_last",
-                "normalized_last_name",
+                "lookup_key",
+                "lookup_type",
                 "team",
                 out_id_col,
                 "resolution_source",
@@ -258,25 +257,37 @@ def _resolve_ids_generic(
 
     out[resolution_method_col] = pd.Series("unresolved", index=out.index, dtype="string")
 
-    # exact full name + team
     exact = lookup[lookup["lookup_type"] == "exact_full_name"].rename(columns={"lookup_key": "normalized_name_full"})
-    merged = out.merge(exact[["normalized_name_full", "team", id_col, "resolution_source"]], on=["normalized_name_full", "team"], how="left", suffixes=("", "_lkp"))
+    merged = out.merge(
+        exact[["normalized_name_full", "team", id_col, "resolution_source"]],
+        on=["normalized_name_full", "team"],
+        how="left",
+        suffixes=("", "_lkp"),
+    )
     fill_mask = merged[id_col].isna() & merged[f"{id_col}_lkp"].notna()
     merged.loc[fill_mask, id_col] = merged.loc[fill_mask, f"{id_col}_lkp"].astype("Int64")
     merged.loc[fill_mask, resolution_method_col] = "exact_full_name_team"
     merged = merged.drop(columns=[f"{id_col}_lkp", "resolution_source"])
 
-    # initial + last + team
     init_lkp = lookup[lookup["lookup_type"] == "initial_last_team"].rename(columns={"lookup_key": "normalized_name_initial_last"})
-    merged = merged.merge(init_lkp[["normalized_name_initial_last", "team", id_col, "resolution_source"]], on=["normalized_name_initial_last", "team"], how="left", suffixes=("", "_lkp"))
+    merged = merged.merge(
+        init_lkp[["normalized_name_initial_last", "team", id_col, "resolution_source"]],
+        on=["normalized_name_initial_last", "team"],
+        how="left",
+        suffixes=("", "_lkp"),
+    )
     fill_mask = merged[id_col].isna() & merged[f"{id_col}_lkp"].notna()
     merged.loc[fill_mask, id_col] = merged.loc[fill_mask, f"{id_col}_lkp"].astype("Int64")
     merged.loc[fill_mask, resolution_method_col] = "initial_last_team"
     merged = merged.drop(columns=[f"{id_col}_lkp", "resolution_source"])
 
-    # last name + team fallback
     last_lkp = lookup[lookup["lookup_type"] == "last_name_team"].rename(columns={"lookup_key": "normalized_name_last"})
-    merged = merged.merge(last_lkp[["normalized_name_last", "team", id_col, "resolution_source"]], on=["normalized_name_last", "team"], how="left", suffixes=("", "_lkp"))
+    merged = merged.merge(
+        last_lkp[["normalized_name_last", "team", id_col, "resolution_source"]],
+        on=["normalized_name_last", "team"],
+        how="left",
+        suffixes=("", "_lkp"),
+    )
     fill_mask = merged[id_col].isna() & merged[f"{id_col}_lkp"].notna()
     merged.loc[fill_mask, id_col] = merged.loc[fill_mask, f"{id_col}_lkp"].astype("Int64")
     merged.loc[fill_mask, resolution_method_col] = "last_name_team"
