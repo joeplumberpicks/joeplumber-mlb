@@ -54,6 +54,32 @@ def _to_str(series: pd.Series) -> pd.Series:
     return series.astype("string")
 
 
+def _normalize_team_abbr(team: object) -> object:
+    if team is None or pd.isna(team):
+        return pd.NA
+    s = str(team).strip().upper()
+    aliases = {
+        "AZ": "ARI",
+        "ARZ": "ARI",
+        "ATH": "OAK",
+        "OAKLAND": "OAK",
+        "CWS": "CHW",
+        "CHIWS": "CHW",
+        "KCR": "KC",
+        "KAN": "KC",
+        "SDP": "SD",
+        "SFG": "SF",
+        "TBR": "TB",
+        "TAM": "TB",
+        "WAS": "WSH",
+    }
+    return aliases.get(s, s)
+
+
+def _fill_false_bool(series: pd.Series) -> pd.Series:
+    return series.astype("boolean").fillna(False)
+
+
 def _prep_schedule(schedule_df: pd.DataFrame) -> pd.DataFrame:
     """Prepare schedule table as the base of the spine."""
     df = schedule_df.copy()
@@ -339,14 +365,11 @@ def summarize_model_spine_game(df: pd.DataFrame, label: str = "model_spine_game"
             print(f"Nulls [{col}]: {int(df[col].isna().sum()):,}")
 
     if "away_starter_found" in df.columns and "home_starter_found" in df.columns:
-        starter_pct = ((df["away_starter_found"].fillna(False) & df["home_starter_found"].fillna(False)).mean()) * 100
+        starter_pct = ((_fill_false_bool(df["away_starter_found"]) & _fill_false_bool(df["home_starter_found"])).mean()) * 100
         print(f"Pct with both starters: {starter_pct:.2f}")
 
     if "away_projected_lineup_found" in df.columns and "home_projected_lineup_found" in df.columns:
-        lineup_pct = (
-            (df["away_projected_lineup_found"].fillna(False) & df["home_projected_lineup_found"].fillna(False)).mean()
-            * 100
-        )
+        lineup_pct = ((_fill_false_bool(df["away_projected_lineup_found"]) & _fill_false_bool(df["home_projected_lineup_found"])).mean()) * 100
         print(f"Pct with both projected lineups: {lineup_pct:.2f}")
 
 
@@ -392,10 +415,8 @@ def build_model_spine_game(
     # side keys for joining helpers
     base["away_team"] = base["away_team"].astype("string")
     base["home_team"] = base["home_team"].astype("string")
-    base = base.assign(
-        away_team=base["away_team"],
-        home_team=base["home_team"],
-    )
+    base["away_team_norm"] = base["away_team"].map(_normalize_team_abbr).astype("string")
+    base["home_team_norm"] = base["home_team"].map(_normalize_team_abbr).astype("string")
 
     games = _prep_games(_copy_or_empty(games_df))
     weather = _prep_weather(_copy_or_empty(weather_df))
@@ -405,17 +426,24 @@ def build_model_spine_game(
     conf = _summarize_lineups(_copy_or_empty(confirmed_lineups_df), prefix="confirmed")
     starters = _summarize_starters(_copy_or_empty(starting_pitchers_df))
 
+    if not proj.empty:
+        proj["team_norm"] = proj["team"].map(_normalize_team_abbr).astype("string")
+    if not conf.empty:
+        conf["team_norm"] = conf["team"].map(_normalize_team_abbr).astype("string")
+    if not starters.empty:
+        starters["team_norm"] = starters["team"].map(_normalize_team_abbr).astype("string")
+
     spine = base.merge(games, on="game_pk", how="left", validate="1:1")
     spine = spine.merge(weather, on="game_pk", how="left", validate="1:1")
     spine = spine.merge(parks, on="venue_id", how="left", validate="m:1")
 
     # team-side summaries
-    away_proj = proj.rename(columns={"team": "away_team"})
-    home_proj = proj.rename(columns={"team": "home_team"})
-    away_conf = conf.rename(columns={"team": "away_team"})
-    home_conf = conf.rename(columns={"team": "home_team"})
-    away_starters = starters.rename(columns={"team": "away_team"})
-    home_starters = starters.rename(columns={"team": "home_team"})
+    away_proj = proj.rename(columns={"team": "away_team", "team_norm": "away_team_norm"}) if not proj.empty else proj
+    home_proj = proj.rename(columns={"team": "home_team", "team_norm": "home_team_norm"}) if not proj.empty else proj
+    away_conf = conf.rename(columns={"team": "away_team", "team_norm": "away_team_norm"}) if not conf.empty else conf
+    home_conf = conf.rename(columns={"team": "home_team", "team_norm": "home_team_norm"}) if not conf.empty else conf
+    away_starters = starters.rename(columns={"team": "away_team", "team_norm": "away_team_norm"}) if not starters.empty else starters
+    home_starters = starters.rename(columns={"team": "home_team", "team_norm": "home_team_norm"}) if not starters.empty else starters
 
     if not away_proj.empty:
         away_proj = away_proj.rename(
@@ -428,7 +456,12 @@ def build_model_spine_game(
                 "projected_lineup_found": "away_projected_lineup_found",
             }
         )
-        spine = spine.merge(away_proj, on=["game_pk", "away_team"], how="left", validate="1:1")
+        spine = spine.merge(
+            away_proj,
+            on=["game_pk", "away_team_norm"],
+            how="left",
+            validate="1:1",
+        ).drop(columns=["away_team"], errors="ignore")
 
     if not home_proj.empty:
         home_proj = home_proj.rename(
@@ -441,7 +474,12 @@ def build_model_spine_game(
                 "projected_lineup_found": "home_projected_lineup_found",
             }
         )
-        spine = spine.merge(home_proj, on=["game_pk", "home_team"], how="left", validate="1:1")
+        spine = spine.merge(
+            home_proj,
+            on=["game_pk", "home_team_norm"],
+            how="left",
+            validate="1:1",
+        ).drop(columns=["home_team"], errors="ignore")
 
     if not away_conf.empty:
         away_conf = away_conf.rename(
@@ -454,7 +492,12 @@ def build_model_spine_game(
                 "confirmed_lineup_found": "away_confirmed_lineup_found",
             }
         )
-        spine = spine.merge(away_conf, on=["game_pk", "away_team"], how="left", validate="1:1")
+        spine = spine.merge(
+            away_conf,
+            on=["game_pk", "away_team_norm"],
+            how="left",
+            validate="1:1",
+        ).drop(columns=["away_team"], errors="ignore")
 
     if not home_conf.empty:
         home_conf = home_conf.rename(
@@ -467,7 +510,12 @@ def build_model_spine_game(
                 "confirmed_lineup_found": "home_confirmed_lineup_found",
             }
         )
-        spine = spine.merge(home_conf, on=["game_pk", "home_team"], how="left", validate="1:1")
+        spine = spine.merge(
+            home_conf,
+            on=["game_pk", "home_team_norm"],
+            how="left",
+            validate="1:1",
+        ).drop(columns=["home_team"], errors="ignore")
 
     if not away_starters.empty:
         away_starters = away_starters.rename(
@@ -479,7 +527,12 @@ def build_model_spine_game(
                 "starter_found": "away_starter_found",
             }
         )
-        spine = spine.merge(away_starters, on=["game_pk", "away_team"], how="left", validate="1:1")
+        spine = spine.merge(
+            away_starters,
+            on=["game_pk", "away_team_norm"],
+            how="left",
+            validate="1:1",
+        ).drop(columns=["away_team"], errors="ignore")
 
     if not home_starters.empty:
         home_starters = home_starters.rename(
@@ -491,7 +544,25 @@ def build_model_spine_game(
                 "starter_found": "home_starter_found",
             }
         )
-        spine = spine.merge(home_starters, on=["game_pk", "home_team"], how="left", validate="1:1")
+        spine = spine.merge(
+            home_starters,
+            on=["game_pk", "home_team_norm"],
+            how="left",
+            validate="1:1",
+        ).drop(columns=["home_team"], errors="ignore")
+
+    # restore raw team columns from base if merge dropped them
+    if "away_team_x" in spine.columns:
+        spine["away_team"] = spine["away_team_x"]
+        spine = spine.drop(columns=[c for c in ["away_team_x", "away_team_y"] if c in spine.columns])
+    elif "away_team" not in spine.columns:
+        spine["away_team"] = base["away_team"]
+
+    if "home_team_x" in spine.columns:
+        spine["home_team"] = spine["home_team_x"]
+        spine = spine.drop(columns=[c for c in ["home_team_x", "home_team_y"] if c in spine.columns])
+    elif "home_team" not in spine.columns:
+        spine["home_team"] = base["home_team"]
 
     # final convenience flags
     if "away_projected_lineup_found" not in spine.columns:
@@ -507,21 +578,15 @@ def build_model_spine_game(
     if "home_starter_found" not in spine.columns:
         spine["home_starter_found"] = pd.Series(False, index=spine.index, dtype="boolean")
 
-    spine["lineups_projected_both_found"] = (
-        spine["away_projected_lineup_found"].fillna(False) & spine["home_projected_lineup_found"].fillna(False)
-    ).astype("boolean")
-    spine["lineups_confirmed_both_found"] = (
-        spine["away_confirmed_lineup_found"].fillna(False) & spine["home_confirmed_lineup_found"].fillna(False)
-    ).astype("boolean")
-    spine["starters_both_found"] = (
-        spine["away_starter_found"].fillna(False) & spine["home_starter_found"].fillna(False)
-    ).astype("boolean")
+    spine["lineups_projected_both_found"] = (_fill_false_bool(spine["away_projected_lineup_found"]) & _fill_false_bool(spine["home_projected_lineup_found"])).astype("boolean")
+    spine["lineups_confirmed_both_found"] = (_fill_false_bool(spine["away_confirmed_lineup_found"]) & _fill_false_bool(spine["home_confirmed_lineup_found"])).astype("boolean")
+    spine["starters_both_found"] = (_fill_false_bool(spine["away_starter_found"]) & _fill_false_bool(spine["home_starter_found"])).astype("boolean")
 
+    spine = spine.drop(columns=["away_team_norm", "home_team_norm"], errors="ignore")
     spine = spine.sort_values(["game_date", "scheduled_start_time_et", "game_pk"], kind="stable").reset_index(drop=True)
 
     if validate:
         validate_model_spine_game(spine)
-
     if verbose:
         summarize_model_spine_game(spine)
 
