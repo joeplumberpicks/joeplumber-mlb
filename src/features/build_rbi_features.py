@@ -229,12 +229,10 @@ def build_rbi_features(
 
     df = df.merge(team_context, on=[lu_game_pk, lu_game_date, lu_team_col], how="left")
 
-    # Hitter-side lineup weighting
     for c in ["rbi_roll15", "rbi_roll30", "tb_roll15", "tb_roll30", "hardhit_rate_roll15", "barrel_rate_roll15", "bb_rate_roll15"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce") * df["lineup_weight"]
 
-    # Batter vs pitcher interaction
     if "rbi_roll15" in df.columns and "opp_bb_rate_roll15" in df.columns:
         df["rbi_walk_pressure_roll15"] = (
             pd.to_numeric(df["rbi_roll15"], errors="coerce")
