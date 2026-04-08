@@ -124,7 +124,6 @@ def build_hr_features(
     pr = _safe_copy(pitcher_roll)
 
     lu_batter_id = _pick_col(lu, ["player_id", "batter_id"], required=True)
-    lu_game_date = _pick_col(lu, ["game_date"], required=True)
     lu_team = _pick_col(lu, ["team", "team_abbr", "batting_team"], required=True)
     lu_name = _pick_col(lu, ["player_name", "batter_name", "name"], required=True)
     lineup_slot_col = _pick_col(lu, ["batting_order", "lineup_slot", "order_spot", "slot"], required=False)
@@ -169,7 +168,6 @@ def build_hr_features(
     else:
         df["lineup_weight"] = 1.0
 
-    # Batter vs pitcher interactions
     if "barrel_rate_roll15" in df.columns and "opp_barrel_rate_allowed_roll15" in df.columns:
         df["matchup_barrel_edge_roll15"] = (
             pd.to_numeric(df["barrel_rate_roll15"], errors="coerce")
@@ -206,7 +204,6 @@ def build_hr_features(
             * pd.to_numeric(df["opp_barrel_rate_allowed_roll15"], errors="coerce")
         ) / 100.0
 
-    # Apply lineup weight to hitter-side core features
     for c in ["hr_roll15", "hr_roll30", "barrel_rate_roll15", "barrel_rate_roll30", "hardhit_rate_roll15", "hardhit_rate_roll30", "ev_mean_roll15", "ev_mean_roll30", "la_mean_roll15", "tb_roll15"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce") * df["lineup_weight"]
