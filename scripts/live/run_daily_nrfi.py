@@ -33,8 +33,25 @@ def sigmoid_series(x: pd.Series) -> pd.Series:
 def add_weighted_feature(score: pd.Series, df: pd.DataFrame, col: str, weight: float) -> pd.Series:
     if col in df.columns:
         vals = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-        score = score + (vals * weight)
+        score = score + vals * weight
     return score
+
+
+def zscore_series(x: pd.Series) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce").fillna(0.0)
+    std = x.std()
+    if pd.isna(std) or std == 0:
+        return pd.Series(0.0, index=x.index, dtype="float64")
+    return (x - x.mean()) / std
+
+
+def confidence_from_prob(prob: pd.Series) -> pd.Series:
+    return pd.cut(
+        prob,
+        bins=[0.0, 0.52, 0.55, 0.58, 0.62, 1.0],
+        labels=["C", "B-", "B+", "A", "A+"],
+        include_lowest=True,
+    )
 
 
 def main() -> None:
@@ -63,57 +80,46 @@ def main() -> None:
 
     score = pd.Series(0.0, index=df.index, dtype="float64")
 
-    # Starter-driven core
     for col, wt in {
-        "home_sp_k_rate_roll7": 0.90,
-        "away_sp_k_rate_roll7": 0.90,
-        "home_sp_bb_rate_roll7": -0.75,
-        "away_sp_bb_rate_roll7": -0.75,
-        "home_sp_hr_rate_roll7": -0.85,
-        "away_sp_hr_rate_roll7": -0.85,
-        "home_sp_barrel_rate_roll7": -0.45,
-        "away_sp_barrel_rate_roll7": -0.45,
-        "home_sp_hardhit_rate_roll7": -0.35,
-        "away_sp_hardhit_rate_roll7": -0.35,
+        "home_sp_k_rate_roll7": 0.55,
+        "away_sp_k_rate_roll7": 0.55,
+        "home_sp_bb_rate_roll7": -0.45,
+        "away_sp_bb_rate_roll7": -0.45,
+        "home_sp_hr_rate_roll7": -0.50,
+        "away_sp_hr_rate_roll7": -0.50,
+        "home_sp_barrel_rate_allowed_roll7": -0.45,
+        "away_sp_barrel_rate_allowed_roll7": -0.45,
+        "home_sp_hardhit_rate_allowed_roll7": -0.35,
+        "away_sp_hardhit_rate_allowed_roll7": -0.35,
+        "home_top3_bb_rate_roll15": -0.25,
+        "away_top3_bb_rate_roll15": -0.25,
+        "home_top3_barrel_rate_roll15": -0.30,
+        "away_top3_barrel_rate_roll15": -0.30,
+        "home_top3_hardhit_rate_roll15": -0.25,
+        "away_top3_hardhit_rate_roll15": -0.25,
     }.items():
         score = add_weighted_feature(score, df, col, wt)
 
-    # Top-3 lineup pressure
     for col, wt in {
-        "home_top3_hardhit_rate_roll7": -0.55,
-        "away_top3_hardhit_rate_roll7": -0.55,
-        "home_top3_barrel_rate_roll7": -0.65,
-        "away_top3_barrel_rate_roll7": -0.65,
-        "home_top3_ev_mean_roll7": -0.015,
-        "away_top3_ev_mean_roll7": -0.015,
-        "home_top3_bb_rate_roll7": -0.30,
-        "away_top3_bb_rate_roll7": -0.30,
-        "home_top3_k_rate_roll7": 0.25,
-        "away_top3_k_rate_roll7": 0.25,
+        "weather_wind_out": -0.12,
+        "weather_wind_in": 0.06,
+        "temperature_f": -0.002,
     }.items():
         score = add_weighted_feature(score, df, col, wt)
 
-    # Park / weather environment
-    for col, wt in {
-        "weather_wind_out": -0.20,
-        "weather_wind_in": 0.12,
-        "weather_crosswind": 0.03,
-        "temperature_f": -0.003,
-    }.items():
-        score = add_weighted_feature(score, df, col, wt)
+    missing_starter = pd.Series(False, index=df.index)
+    for c in ["home_starter_pitcher_id", "away_starter_pitcher_id", "home_sp_id", "away_sp_id"]:
+        if c in df.columns:
+            missing_starter = missing_starter | df[c].isna()
 
-    df["nrfi_score_raw"] = score
-    df["nrfi_prob"] = sigmoid_series(score)
+    score.loc[missing_starter] = score.loc[missing_starter] - 0.25
+
+    score_z = zscore_series(score)
+    df["nrfi_score_raw"] = score_z
+    df["nrfi_prob"] = sigmoid_series(score_z * 1.15)
     df["yrfi_prob"] = 1.0 - df["nrfi_prob"]
-    df["pick"] = df["nrfi_prob"].ge(0.5).map({True: "NRFI", False: "YRFI"})
-
-    # Confidence bucket
-    df["confidence"] = pd.cut(
-        df["nrfi_prob"],
-        bins=[0.0, 0.52, 0.56, 0.60, 0.65, 1.0],
-        labels=["C", "B-", "B+", "A", "A+"],
-        include_lowest=True,
-    )
+    df["pick"] = df["nrfi_prob"].ge(0.50).map({True: "NRFI", False: "YRFI"})
+    df["confidence"] = confidence_from_prob(df[["nrfi_prob", "yrfi_prob"]].max(axis=1))
 
     keep = [
         c for c in [
@@ -129,7 +135,7 @@ def main() -> None:
         if c in df.columns
     ]
 
-    board = df[keep].sort_values("nrfi_prob", ascending=False).reset_index(drop=True)
+    board = df[keep].sort_values(["nrfi_prob", "yrfi_prob"], ascending=[False, True]).reset_index(drop=True)
 
     out_csv = outputs_dir / f"nrfi_board_{season}_{date_str}.csv"
     out_parquet = outputs_dir / f"nrfi_board_{season}_{date_str}.parquet"
@@ -139,7 +145,7 @@ def main() -> None:
 
     print(f"✅ NRFI board built: {out_csv}")
     print(f"✅ NRFI board parquet: {out_parquet}")
-    print(board.head(15).to_string(index=False))
+    print(board.to_string(index=False))
 
 
 if __name__ == "__main__":
