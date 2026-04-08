@@ -11,6 +11,7 @@ from src.features.build_moneyline_features import build_moneyline_features
 from src.features.build_hr_features import build_hr_features
 from src.features.build_rbi_features import build_rbi_features
 from src.features.build_tb2_features import build_tb2_features
+from src.features.build_no_hr_game_features import build_no_hr_game_features
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,18 +63,21 @@ def main() -> None:
     hr = build_hr_features(spine, lineups, batter_roll, pitcher_roll)
     rbi = build_rbi_features(spine, lineups, batter_roll, pitcher_roll)
     tb2 = build_tb2_features(spine, lineups, batter_roll, pitcher_roll)
+    no_hr = build_no_hr_game_features(spine, lineups, batter_roll, pitcher_roll)
 
     out_nrfi = processed_live / f"nrfi_features_{season}_{date_str}.parquet"
     out_ml = processed_live / f"ml_features_{season}_{date_str}.parquet"
     out_hr = processed_live / f"hr_features_{season}_{date_str}.parquet"
     out_rbi = processed_live / f"rbi_features_{season}_{date_str}.parquet"
     out_tb2 = processed_live / f"tb2_features_{season}_{date_str}.parquet"
+    out_no_hr = processed_live / f"no_hr_game_features_{season}_{date_str}.parquet"
 
     nrfi.to_parquet(out_nrfi, index=False)
     ml.to_parquet(out_ml, index=False)
     hr.to_parquet(out_hr, index=False)
     rbi.to_parquet(out_rbi, index=False)
     tb2.to_parquet(out_tb2, index=False)
+    no_hr.to_parquet(out_no_hr, index=False)
 
     print("✅ daily feature views built")
     print(f"NRFI rows: {len(nrfi):,}")
@@ -81,11 +85,13 @@ def main() -> None:
     print(f"HR rows: {len(hr):,}")
     print(f"RBI rows: {len(rbi):,}")
     print(f"2+ Bases rows: {len(tb2):,}")
+    print(f"No HR Game rows: {len(no_hr):,}")
     print(f"out_nrfi={out_nrfi}")
     print(f"out_ml={out_ml}")
     print(f"out_hr={out_hr}")
     print(f"out_rbi={out_rbi}")
     print(f"out_tb2={out_tb2}")
+    print(f"out_no_hr={out_no_hr}")
 
 
 if __name__ == "__main__":
