@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import math
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -46,6 +46,23 @@ def sigmoid_series(x: pd.Series) -> pd.Series:
     return x.map(lambda v: 1.0 / (1.0 + math.exp(-float(v))))
 
 
+def zscore_series(x: pd.Series) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce").fillna(0.0)
+    std = x.std()
+    if pd.isna(std) or std == 0:
+        return pd.Series(0.0, index=x.index, dtype="float64")
+    return (x - x.mean()) / std
+
+
+def confidence_from_prob(prob: pd.Series) -> pd.Series:
+    return pd.cut(
+        prob,
+        bins=[0.0, 0.54, 0.60, 0.66, 0.72, 1.0],
+        labels=["C", "B-", "B+", "A", "A+"],
+        include_lowest=True,
+    )
+
+
 def main() -> None:
     args = parse_args()
 
@@ -72,7 +89,6 @@ def main() -> None:
 
     score = pd.Series(0.0, index=df.index, dtype="float64")
 
-    # Hitter-side
     for col, wt in {
         "tb_roll15": 0.95,
         "tb_roll30": 0.65,
@@ -87,7 +103,6 @@ def main() -> None:
     }.items():
         score = add_weighted_feature(score, df, col, wt)
 
-    # Opposing pitcher damage
     for col, wt in {
         "opp_hardhit_rate_allowed_roll15": 0.42,
         "opp_hardhit_rate_allowed_roll30": 0.24,
@@ -98,7 +113,6 @@ def main() -> None:
     }.items():
         score = add_weighted_feature(score, df, col, wt)
 
-    # Interaction
     for col, wt in {
         "tb2_contact_pressure_roll15": 1.00,
         "tb2_barrel_pressure_roll15": 0.95,
@@ -111,7 +125,6 @@ def main() -> None:
     if "lineup_weight" in df.columns:
         score = score * pd.to_numeric(df["lineup_weight"], errors="coerce").fillna(1.0)
 
-    # Environment
     for col, wt in {
         "weather_wind_out": 0.08,
         "weather_wind_in": -0.04,
@@ -122,15 +135,17 @@ def main() -> None:
     if "tie_break_noise" in df.columns:
         score = score + pd.to_numeric(df["tie_break_noise"], errors="coerce").fillna(0.0)
 
-    df["tb2_score_raw"] = score
-    df["p_tb2"] = sigmoid_series(score)
+    missing_core = pd.Series(False, index=df.index)
+    for c in ["player_id", "opp_pitcher_id"]:
+        if c in df.columns:
+            missing_core = missing_core | df[c].isna()
 
-    df["confidence"] = pd.cut(
-        df["p_tb2"],
-        bins=[0.0, 0.30, 0.38, 0.47, 0.57, 1.0],
-        labels=["C", "B-", "B+", "A", "A+"],
-        include_lowest=True,
-    )
+    score.loc[missing_core] = score.loc[missing_core] - 0.20
+
+    score_z = zscore_series(score)
+    df["tb2_score_raw"] = score_z
+    df["p_tb2"] = sigmoid_series(score_z * 0.90)
+    df["confidence"] = confidence_from_prob(df["p_tb2"])
 
     batter_name_col = _pick_col(df, ["batter_name", "player_name", "name"])
     team_col = _pick_col(df, ["team", "team_abbr", "batting_team"])
