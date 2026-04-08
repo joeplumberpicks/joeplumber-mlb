@@ -2,17 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from src.ingest.io import log_kv, log_section, read_dataset
-from src.utils.config import load_config
-from src.utils.drive import resolve_data_dirs
-
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Joe Plumber live daily ingest.")
+    parser = argparse.ArgumentParser(description="Run one-day live ingest pipeline.")
     parser.add_argument("--season", type=int, required=True)
     parser.add_argument("--date", type=str, required=True)
     parser.add_argument("--config", type=str, default="configs/project.yaml")
@@ -20,40 +17,41 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _run(cmd: list[str], repo_root: Path) -> None:
-    print("")
-    print("RUNNING:", " ".join(cmd))
-    result = subprocess.run(cmd, cwd=repo_root)
+def _run(cmd: list[str]) -> None:
+    print(f"\nRUNNING: {' '.join(cmd)}")
+    result = subprocess.run(cmd)
     if result.returncode != 0:
         raise RuntimeError(f"Command failed ({result.returncode}): {' '.join(cmd)}")
 
 
-def _copy_if_exists(src: Path, dst: Path) -> None:
-    if src.exists():
-        dst.write_bytes(src.read_bytes())
-        print(f"Copied fallback: {src} -> {dst}")
+def _copy_confirmed_to_projected(raw_live_dir: Path, season: int, date_str: str) -> None:
+    confirmed_latest = raw_live_dir / f"confirmed_lineups_{season}.parquet"
+    confirmed_dated = raw_live_dir / f"confirmed_lineups_{season}_{date_str}.parquet"
+    projected_latest = raw_live_dir / f"projected_lineups_{season}.parquet"
+    projected_dated = raw_live_dir / f"projected_lineups_{season}_{date_str}.parquet"
+
+    if confirmed_latest.exists():
+        shutil.copy2(confirmed_latest, projected_latest)
+        print(f"Copied fallback: {confirmed_latest} -> {projected_latest}")
+
+    if confirmed_dated.exists():
+        shutil.copy2(confirmed_dated, projected_dated)
+        print(f"Copied fallback: {confirmed_dated} -> {projected_dated}")
 
 
 def main() -> None:
     args = parse_args()
 
     repo_root = Path(__file__).resolve().parents[2]
-    config_path = (repo_root / args.config).resolve()
-
-    log_section("scripts/ingest/run_ingest_day.py")
-    log_kv("repo_root", repo_root)
-    log_kv("config_path", config_path)
-
-    config = load_config(config_path)
-    dirs = resolve_data_dirs(config=config, prefer_drive=True)
-
-    raw_live_dir = Path(dirs["raw_dir"]) / "live"
-    processed_live_dir = Path(dirs["processed_dir"]) / "live"
-    raw_live_dir.mkdir(parents=True, exist_ok=True)
-    processed_live_dir.mkdir(parents=True, exist_ok=True)
+    print("========== scripts/ingest/run_ingest_day.py =========")
+    print(f"repo_root: {repo_root}")
+    print(f"config_path: {repo_root / args.config}")
 
     py = sys.executable
+    config_arg = ["--config", args.config]
+    force_arg = ["--force"] if args.force else []
 
+    # Core ingests
     _run(
         [
             py,
@@ -64,20 +62,10 @@ def main() -> None:
             args.date,
             "--end-date",
             args.date,
-            "--config",
-            args.config,
-            "--force",
-        ],
-        repo_root,
+            *config_arg,
+            *force_arg,
+        ]
     )
-
-    schedule_path = raw_live_dir / f"games_schedule_{args.season}_{args.date}.parquet"
-    if not schedule_path.exists():
-        raise FileNotFoundError(f"Expected schedule output not found: {schedule_path}")
-
-    schedule_df = read_dataset(schedule_path)
-    if schedule_df.empty:
-        raise ValueError(f"Schedule is empty for {args.date}")
 
     _run(
         [
@@ -89,11 +77,9 @@ def main() -> None:
             args.date,
             "--end-date",
             args.date,
-            "--config",
-            args.config,
-            "--force",
-        ],
-        repo_root,
+            *config_arg,
+            *force_arg,
+        ]
     )
 
     _run(
@@ -106,14 +92,12 @@ def main() -> None:
             args.date,
             "--end-date",
             args.date,
-            "--config",
-            args.config,
-            "--force",
-        ],
-        repo_root,
+            *config_arg,
+            *force_arg,
+        ]
     )
 
-    # Rotowire confirmed lineups
+    # Confirmed lineups from Rotowire
     _run(
         [
             py,
@@ -122,38 +106,48 @@ def main() -> None:
             str(args.season),
             "--date",
             args.date,
-            "--config",
-            args.config,
-            "--force",
-        ],
-        repo_root,
+            *config_arg,
+            *force_arg,
+        ]
     )
 
-    # Use Rotowire confirmed as projected fallback
-    confirmed_latest = raw_live_dir / f"confirmed_lineups_{args.season}.parquet"
-    confirmed_dated = raw_live_dir / f"confirmed_lineups_{args.season}_{args.date}.parquet"
-    projected_latest = raw_live_dir / f"projected_lineups_{args.season}.parquet"
-    projected_dated = raw_live_dir / f"projected_lineups_{args.season}_{args.date}.parquet"
+    raw_live_dir = Path("/content/drive/MyDrive/joeplumber-mlb/data/raw/live")
+    _copy_confirmed_to_projected(raw_live_dir, args.season, args.date)
 
-    _copy_if_exists(confirmed_latest, projected_latest)
-    _copy_if_exists(confirmed_dated, projected_dated)
+    # Starters: MLB primary, Rotowire fallback
+    mlb_ok = True
+    try:
+        _run(
+            [
+                py,
+                "scripts/live/build_starting_pitchers_mlb.py",
+                "--season",
+                str(args.season),
+                "--date",
+                args.date,
+                *config_arg,
+                *force_arg,
+            ]
+        )
+    except Exception as exc:
+        mlb_ok = False
+        print(f"MLB starters failed, falling back to Rotowire: {exc}")
 
-    # Rotowire starting pitchers
-    _run(
-        [
-            py,
-            "scripts/live/build_starting_pitchers_rotowire.py",
-            "--season",
-            str(args.season),
-            "--date",
-            args.date,
-            "--config",
-            args.config,
-            "--force",
-        ],
-        repo_root,
-    )
+    if not mlb_ok:
+        _run(
+            [
+                py,
+                "scripts/live/build_starting_pitchers_rotowire.py",
+                "--season",
+                str(args.season),
+                "--date",
+                args.date,
+                *config_arg,
+                *force_arg,
+            ]
+        )
 
+    # Build spine
     _run(
         [
             py,
@@ -162,15 +156,12 @@ def main() -> None:
             str(args.season),
             "--date",
             args.date,
-            "--config",
-            args.config,
-        ],
-        repo_root,
+            *config_arg,
+        ]
     )
 
-    out_path = processed_live_dir / f"model_spine_game_{args.season}_{args.date}.parquet"
-    print("")
-    print(f"daily_out={out_path}")
+    daily_out = Path("/content/drive/MyDrive/joeplumber-mlb/data/processed/live") / f"model_spine_game_{args.season}_{args.date}.parquet"
+    print(f"\ndaily_out={daily_out}")
 
 
 if __name__ == "__main__":
