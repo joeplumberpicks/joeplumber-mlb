@@ -5,9 +5,7 @@ import argparse
 import sys
 import unicodedata
 import re
-from datetime import datetime, date
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -18,7 +16,6 @@ if str(REPO_ROOT) not in sys.path:
 from src.providers import rotowire
 from src.utils.config import load_config
 from src.utils.drive import resolve_data_dirs
-from src.utils.io import ensure_directory
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,11 +49,8 @@ def _normalize_team(team: object) -> str | None:
     return s or None
 
 
-def _coerce_game_date(value: object) -> pd.Timestamp | pd.NaT:
-    try:
-        return pd.to_datetime(value).normalize()
-    except Exception:
-        return pd.NaT
+def _to_int64_nullable(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").astype("Int64")
 
 
 def _load_pitcher_lookup(processed_dir: Path) -> pd.DataFrame:
@@ -86,7 +80,6 @@ def _load_pitcher_lookup(processed_dir: Path) -> pd.DataFrame:
             subset=["lookup_key", id_col]
         )
 
-    # fallback for simpler lookup shape
     name_col = None
     for c in ["player_name", "name", "full_name"]:
         if c in df.columns:
@@ -104,7 +97,6 @@ def _load_pitcher_lookup(processed_dir: Path) -> pd.DataFrame:
     exact = base[["lookup_key"] + ([team_col] if team_col else []) + [id_col]].copy()
     exact["lookup_type"] = "exact_full_name"
 
-    # build initial-last fallback
     def _initial_last(s: object) -> str | None:
         n = _normalize_name(s)
         if not n:
@@ -114,7 +106,6 @@ def _load_pitcher_lookup(processed_dir: Path) -> pd.DataFrame:
             return None
         return f"{parts[0][0]} {parts[-1]}"
 
-    # build last-name fallback
     def _last_name(s: object) -> str | None:
         n = _normalize_name(s)
         if not n:
@@ -173,7 +164,6 @@ def _resolve_pitcher_ids(df: pd.DataFrame, processed_dir: Path) -> pd.DataFrame:
 
     out["pitcher_id_resolution_method"] = pd.Series("unresolved", index=out.index, dtype="string")
 
-    # exact full name + team
     exact = lookup[lookup["lookup_type"] == "exact_full_name"].copy()
     exact = exact.rename(columns={"lookup_key": "pitcher_name_norm", id_col: "pitcher_id_lkp"})
     merge_keys = ["pitcher_name_norm"] + (["team"] if team_col_lookup else [])
@@ -191,7 +181,6 @@ def _resolve_pitcher_ids(df: pd.DataFrame, processed_dir: Path) -> pd.DataFrame:
     out.loc[mask, "pitcher_id_resolution_method"] = "exact_full_name_team"
     out = out.drop(columns=["pitcher_id_lkp"])
 
-    # initial + last + team
     init_df = lookup[lookup["lookup_type"] == "initial_last_team"].copy()
     if not init_df.empty:
         init_df = init_df.rename(columns={"lookup_key": "pitcher_name_initial_last", id_col: "pitcher_id_lkp"})
@@ -210,7 +199,6 @@ def _resolve_pitcher_ids(df: pd.DataFrame, processed_dir: Path) -> pd.DataFrame:
         out.loc[mask, "pitcher_id_resolution_method"] = "initial_last_team"
         out = out.drop(columns=["pitcher_id_lkp"])
 
-    # last name + team
     last_df = lookup[lookup["lookup_type"] == "last_name_team"].copy()
     if not last_df.empty:
         last_df = last_df.rename(columns={"lookup_key": "pitcher_name_last", id_col: "pitcher_id_lkp"})
@@ -287,7 +275,6 @@ def _enrich_provider_df(
 
     df = provider_df.copy()
 
-    # Normalize expected provider columns
     rename_map = {}
     if "player_name" in df.columns and "pitcher_name" not in df.columns:
         rename_map["player_name"] = "pitcher_name"
@@ -305,7 +292,6 @@ def _enrich_provider_df(
     if "pitcher_id" not in df.columns:
         df["pitcher_id"] = pd.Series(pd.NA, index=df.index, dtype="Int64")
 
-    # Normalize teams/dates
     for col in ["team", "opponent"]:
         if col not in df.columns:
             df[col] = pd.NA
@@ -316,10 +302,8 @@ def _enrich_provider_df(
     else:
         df["game_date"] = pd.Timestamp(target_date).normalize()
 
-    # Resolve IDs
     df = _resolve_pitcher_ids(df, processed_dir=processed_dir)
 
-    # Attach schedule game_pk + authoritative date
     sched = schedule_df.copy()
     sched["away_team"] = sched["away_team"].astype("string").str.upper()
     sched["home_team"] = sched["home_team"].astype("string").str.upper()
@@ -337,7 +321,6 @@ def _enrich_provider_df(
     df = df.drop(columns=[c for c in ["game_pk", "is_home"] if c in df.columns], errors="ignore")
     df = df.merge(game_map, on=["team", "opponent"], how="left", suffixes=("", "_sched"))
 
-    # authoritative schedule date
     if "game_date_sched" in df.columns:
         df["game_date"] = pd.to_datetime(df["game_date_sched"], errors="coerce").fillna(df["game_date"])
         df = df.drop(columns=["game_date_sched"])
@@ -400,7 +383,7 @@ def main() -> None:
     raw_dir = Path(dirs["raw_dir"])
     processed_dir = Path(dirs["processed_dir"])
     live_dir = raw_dir / "live"
-    ensure_directory(live_dir)
+    live_dir.mkdir(parents=True, exist_ok=True)
 
     schedule_df = _load_schedule_for_date(raw_dir=raw_dir, season=args.season, date_str=args.date)
     provider_df = _pull_provider_df(config)
