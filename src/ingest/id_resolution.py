@@ -35,9 +35,7 @@ def normalize_last_name(value: object) -> str | None:
     if not s:
         return None
     parts = s.split()
-    if not parts:
-        return None
-    return parts[-1]
+    return parts[-1] if parts else None
 
 
 def normalize_initial_last(value: object) -> str | None:
@@ -47,11 +45,7 @@ def normalize_initial_last(value: object) -> str | None:
     parts = s.split()
     if len(parts) < 2:
         return None
-    first = parts[0]
-    last = parts[-1]
-    if not first or not last:
-        return None
-    return f"{first[0]} {last}"
+    return f"{parts[0][0]} {parts[-1]}"
 
 
 def _read_if_exists(path: Path) -> pd.DataFrame | None:
@@ -83,10 +77,7 @@ def _team_candidates(df: pd.DataFrame) -> list[str]:
     return [c for c in ["team", "team_abbr", "batting_team", "pitching_team"] if c in df.columns]
 
 
-def _build_lookup_from_history(
-    frames: Iterable[pd.DataFrame],
-    entity: str,
-) -> pd.DataFrame:
+def _build_lookup_from_history(frames: Iterable[pd.DataFrame], entity: str) -> pd.DataFrame:
     rows: list[pd.DataFrame] = []
 
     if entity == "batter":
@@ -129,14 +120,7 @@ def _build_lookup_from_history(
 
     if not rows:
         return pd.DataFrame(
-            columns=[
-                "lookup_key",
-                "lookup_type",
-                "team",
-                out_id_col,
-                "resolution_source",
-                "id_variant_count",
-            ]
+            columns=["lookup_key", "lookup_type", "team", out_id_col, "resolution_source", "id_variant_count"]
         )
 
     base = pd.concat(rows, ignore_index=True).drop_duplicates()
@@ -259,7 +243,7 @@ def _resolve_ids_generic(
 
     exact = lookup[lookup["lookup_type"] == "exact_full_name"].rename(columns={"lookup_key": "normalized_name_full"})
     merged = out.merge(
-        exact[["normalized_name_full", "team", id_col, "resolution_source"]],
+        exact[["normalized_name_full", "team", id_col]],
         on=["normalized_name_full", "team"],
         how="left",
         suffixes=("", "_lkp"),
@@ -267,11 +251,11 @@ def _resolve_ids_generic(
     fill_mask = merged[id_col].isna() & merged[f"{id_col}_lkp"].notna()
     merged.loc[fill_mask, id_col] = merged.loc[fill_mask, f"{id_col}_lkp"].astype("Int64")
     merged.loc[fill_mask, resolution_method_col] = "exact_full_name_team"
-    merged = merged.drop(columns=[f"{id_col}_lkp", "resolution_source"])
+    merged = merged.drop(columns=[f"{id_col}_lkp"])
 
     init_lkp = lookup[lookup["lookup_type"] == "initial_last_team"].rename(columns={"lookup_key": "normalized_name_initial_last"})
     merged = merged.merge(
-        init_lkp[["normalized_name_initial_last", "team", id_col, "resolution_source"]],
+        init_lkp[["normalized_name_initial_last", "team", id_col]],
         on=["normalized_name_initial_last", "team"],
         how="left",
         suffixes=("", "_lkp"),
@@ -279,11 +263,11 @@ def _resolve_ids_generic(
     fill_mask = merged[id_col].isna() & merged[f"{id_col}_lkp"].notna()
     merged.loc[fill_mask, id_col] = merged.loc[fill_mask, f"{id_col}_lkp"].astype("Int64")
     merged.loc[fill_mask, resolution_method_col] = "initial_last_team"
-    merged = merged.drop(columns=[f"{id_col}_lkp", "resolution_source"])
+    merged = merged.drop(columns=[f"{id_col}_lkp"])
 
     last_lkp = lookup[lookup["lookup_type"] == "last_name_team"].rename(columns={"lookup_key": "normalized_name_last"})
     merged = merged.merge(
-        last_lkp[["normalized_name_last", "team", id_col, "resolution_source"]],
+        last_lkp[["normalized_name_last", "team", id_col]],
         on=["normalized_name_last", "team"],
         how="left",
         suffixes=("", "_lkp"),
@@ -291,7 +275,7 @@ def _resolve_ids_generic(
     fill_mask = merged[id_col].isna() & merged[f"{id_col}_lkp"].notna()
     merged.loc[fill_mask, id_col] = merged.loc[fill_mask, f"{id_col}_lkp"].astype("Int64")
     merged.loc[fill_mask, resolution_method_col] = "last_name_team"
-    merged = merged.drop(columns=[f"{id_col}_lkp", "resolution_source"])
+    merged = merged.drop(columns=[f"{id_col}_lkp"])
 
     merged = merged.drop(columns=["normalized_name_full", "normalized_name_initial_last", "normalized_name_last"])
     return merged
