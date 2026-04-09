@@ -33,18 +33,30 @@ def pick_col(df: pd.DataFrame, candidates: Iterable[str], required: bool = False
     return None
 
 
-def coalesce_numeric(df: pd.DataFrame, candidates: Iterable[str], default: float = 0.0) -> pd.Series:
-    for c in candidates:
-        if c in df.columns:
-            return pd.to_numeric(df[c], errors="coerce").fillna(default)
-    return pd.Series(default, index=df.index, dtype=float)
-
-
 def coalesce_text(df: pd.DataFrame, candidates: Iterable[str], default: str = "") -> pd.Series:
     for c in candidates:
         if c in df.columns:
             return df[c].fillna(default).astype(str)
     return pd.Series(default, index=df.index, dtype="object")
+
+
+def first_non_null_numeric(df: pd.DataFrame, candidates: Iterable[str], default: float | None = None) -> pd.Series:
+    out = pd.Series(np.nan, index=df.index, dtype=float)
+    for c in candidates:
+        if c in df.columns:
+            s = pd.to_numeric(df[c], errors="coerce")
+            out = out.combine_first(s)
+    if default is not None:
+        out = out.fillna(default)
+    return out
+
+
+def fill_with_median(series: pd.Series, fallback: float = 0.0) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    non_na = s.dropna()
+    if non_na.empty:
+        return s.fillna(fallback)
+    return s.fillna(float(non_na.median()))
 
 
 def logistic(x: pd.Series | np.ndarray) -> pd.Series:
@@ -59,6 +71,10 @@ def slate_zscore(s: pd.Series) -> pd.Series:
         return pd.Series(0.0, index=s.index)
     z = (s - float(s.mean())) / std
     return z.clip(-3.0, 3.0)
+
+
+def series_null_pct(s: pd.Series) -> float:
+    return float(pd.to_numeric(s, errors="coerce").isna().mean()) * 100.0
 
 
 def main() -> None:
@@ -90,116 +106,141 @@ def main() -> None:
         raise ValueError("RBI features file is empty.")
 
     game_date_col = pick_col(df, ["game_date"], required=False)
-    team_col = pick_col(df, ["team", "bat_team", "offense_team"], required=True)
-    opp_col = pick_col(df, ["opponent", "opp_team", "pitching_team"], required=False)
-    player_col = pick_col(df, ["player_name", "batter_name", "name"], required=True)
-    lineup_col = pick_col(
-        df,
-        ["lineup_spot", "batting_order", "order_spot", "confirmed_batting_order", "projected_batting_order"],
-        required=False,
-    )
+    team_col = pick_col(df, ["team"], required=True)
+    opp_col = pick_col(df, ["opponent"], required=False)
+    player_col = pick_col(df, ["player_name"], required=True)
 
-    # Audit / fallback core RBI columns
-    hits = coalesce_numeric(df, ["hits_per_pa", "bat_hits_per_pa_roll30", "hit_rate", "bat_ba_roll30"], default=np.nan)
-    tb_per_pa = coalesce_numeric(df, ["tb_per_pa", "bat_tb_per_pa_roll30"], default=np.nan)
-    hr_per_pa = coalesce_numeric(df, ["hr_per_pa", "bat_hr_per_pa_roll30"], default=np.nan)
-    bb_rate = coalesce_numeric(df, ["bb_rate", "bat_bb_rate_roll30"], default=np.nan)
-    hard_hit_rate = coalesce_numeric(df, ["hard_hit_rate", "bat_hard_hit_rate_roll30"], default=np.nan)
-    barrel_rate = coalesce_numeric(df, ["barrel_rate", "bat_barrel_rate_roll30"], default=np.nan)
-    iso = coalesce_numeric(df, ["iso", "bat_iso_roll30"], default=np.nan)
+    hits = first_non_null_numeric(df, [
+        "bat_hits_roll30", "bat_hits_roll15", "bat_hits_roll7", "bat_hits_roll3"
+    ])
+    tb_per_pa = first_non_null_numeric(df, [
+        "bat_tb_per_pa_roll30", "bat_tb_per_pa_roll15", "bat_tb_per_pa_roll7", "bat_tb_per_pa_roll3"
+    ])
+    hr_per_pa = first_non_null_numeric(df, [
+        "bat_hr_per_pa_roll30", "bat_hr_per_pa_roll15", "bat_hr_per_pa_roll7", "bat_hr_per_pa_roll3"
+    ])
+    bb_rate = first_non_null_numeric(df, [
+        "bat_bb_rate_roll30", "bat_bb_rate_roll15", "bat_bb_rate_roll7", "bat_bb_rate_roll3"
+    ])
+    hard_hit_rate = first_non_null_numeric(df, [
+        "bat_hard_hit_rate_roll30", "bat_hard_hit_rate_roll15", "bat_hard_hit_rate_roll7", "bat_hard_hit_rate_roll3"
+    ])
+    barrel_rate = first_non_null_numeric(df, [
+        "bat_barrel_rate_roll30", "bat_barrel_rate_roll15", "bat_barrel_rate_roll7", "bat_barrel_rate_roll3"
+    ])
+    iso = first_non_null_numeric(df, [
+        "bat_iso_roll30", "bat_iso_roll15", "bat_iso_roll7", "bat_iso_roll3"
+    ])
+    lineup_spot = first_non_null_numeric(df, ["batting_order"], default=6.0)
+    lineup_weight = first_non_null_numeric(df, ["lineup_weight"], default=1.0)
 
-    park_rbi = coalesce_numeric(df, ["park_rbi_factor", "park_run_factor", "park_factor_runs"], default=1.0)
-    weather_rbi = coalesce_numeric(df, ["weather_rbi_boost", "weather_run_boost"], default=0.0)
-
-    opp_hr9 = coalesce_numeric(df, ["pitcher_hr9", "pit_hr9_roll30", "opp_pitcher_hr9"], default=0.0)
-    opp_hard_hit = coalesce_numeric(df, ["pitcher_hard_hit_rate", "pit_hard_hit_rate_roll30"], default=0.0)
-    opp_barrel = coalesce_numeric(df, ["pitcher_barrel_rate", "pit_barrel_rate_roll30"], default=0.0)
-    opp_bb = coalesce_numeric(df, ["pitcher_bb_rate", "pit_bb_rate_roll30"], default=0.0)
-
-    base_score = coalesce_numeric(df, ["rbi_score_raw", "score_raw", "score"], default=0.0)
-
-    lineup_spot = pd.Series(5, index=df.index, dtype=float)
-    if lineup_col is not None:
-        lineup_spot = pd.to_numeric(df[lineup_col], errors="coerce").fillna(5.0)
+    opp_hr9 = first_non_null_numeric(df, [
+        "opp_pit_hr9_roll30", "opp_pit_hr9_roll15", "opp_pit_hr9_roll7", "opp_pit_hr9_roll3"
+    ])
+    opp_hard_hit = first_non_null_numeric(df, [
+        "opp_pit_hard_hit_rate_roll30", "opp_pit_hard_hit_rate_roll15", "opp_pit_hard_hit_rate_roll7", "opp_pit_hard_hit_rate_roll3"
+    ])
+    opp_bb = first_non_null_numeric(df, [
+        "opp_pit_bb_rate_roll30", "opp_pit_bb_rate_roll15", "opp_pit_bb_rate_roll7", "opp_pit_bb_rate_roll3"
+    ])
+    temp_f = first_non_null_numeric(df, ["temperature_f"], default=72.0)
+    wind_out = first_non_null_numeric(df, ["weather_wind_out"], default=0.0)
+    base_score = first_non_null_numeric(df, ["rbi_score_raw", "score_raw", "score"], default=0.0)
 
     print("\n=== RBI FEATURE AUDIT ===")
-    for name, s in {
-        "hits": hits,
-        "tb_per_pa": tb_per_pa,
-        "hr_per_pa": hr_per_pa,
-        "bb_rate": bb_rate,
-        "hard_hit_rate": hard_hit_rate,
-        "barrel_rate": barrel_rate,
-        "iso": iso,
-        "lineup_spot": lineup_spot,
-    }.items():
-        print(f"{name}: null_pct={float(pd.Series(s).isna().mean()) * 100:.2f}%")
+    print(f"hits: null_pct={series_null_pct(hits):.2f}%")
+    print(f"tb_per_pa: null_pct={series_null_pct(tb_per_pa):.2f}%")
+    print(f"hr_per_pa: null_pct={series_null_pct(hr_per_pa):.2f}%")
+    print(f"bb_rate: null_pct={series_null_pct(bb_rate):.2f}%")
+    print(f"hard_hit_rate: null_pct={series_null_pct(hard_hit_rate):.2f}%")
+    print(f"barrel_rate: null_pct={series_null_pct(barrel_rate):.2f}%")
+    print(f"iso: null_pct={series_null_pct(iso):.2f}%")
+    print(f"lineup_spot: null_pct={series_null_pct(lineup_spot):.2f}%")
 
-    # Median fill, not zero fill
-    for s_name in ["hits", "tb_per_pa", "hr_per_pa", "bb_rate", "hard_hit_rate", "barrel_rate", "iso"]:
-        s = locals()[s_name]
-        med = float(pd.Series(s).median()) if not pd.Series(s).dropna().empty else 0.0
-        locals()[s_name] = pd.Series(s).fillna(med)
+    # proxy repair
+    if hits.isna().all():
+        hits = tb_per_pa * 1.55
+    if iso.isna().all():
+        iso = tb_per_pa * 0.55
+    if hard_hit_rate.isna().all():
+        hard_hit_rate = (tb_per_pa * 0.50).clip(lower=0.28, upper=0.60)
+    if barrel_rate.isna().all():
+        barrel_rate = (hr_per_pa * 2.40).clip(lower=0.03, upper=0.18)
 
-    # RBI opportunity logic
-    contact_prod = (
-        hits * 0.30 +
-        tb_per_pa * 0.30 +
-        hr_per_pa * 0.20 +
-        hard_hit_rate * 0.10 +
-        barrel_rate * 0.10
+    hits = fill_with_median(hits, 1.0)
+    tb_per_pa = fill_with_median(tb_per_pa, 0.45)
+    hr_per_pa = fill_with_median(hr_per_pa, 0.025)
+    bb_rate = fill_with_median(bb_rate, 0.08)
+    hard_hit_rate = fill_with_median(hard_hit_rate, 0.38)
+    barrel_rate = fill_with_median(barrel_rate, 0.055)
+    iso = fill_with_median(iso, 0.155)
+    lineup_spot = fill_with_median(lineup_spot, 6.0)
+    lineup_weight = fill_with_median(lineup_weight, 1.0)
+    opp_hr9 = fill_with_median(opp_hr9, 1.10)
+    opp_hard_hit = fill_with_median(opp_hard_hit, 0.40)
+    opp_bb = fill_with_median(opp_bb, 0.08)
+    temp_f = fill_with_median(temp_f, 72.0)
+    wind_out = fill_with_median(wind_out, 0.0)
+    base_score = pd.to_numeric(base_score, errors="coerce").fillna(0.0)
+
+    # RBI scoring
+    rbi_opportunity = (
+        hits * 0.55 +
+        tb_per_pa * 1.35 +
+        hr_per_pa * 1.10 +
+        iso * 0.75 +
+        hard_hit_rate * 0.55 +
+        barrel_rate * 0.55
     )
 
-    run_env = (
-        (park_rbi - 1.0) * 0.90 +
-        weather_rbi * 0.60
+    matchup = (
+        opp_hr9 * 0.18 +
+        opp_hard_hit * 0.34 +
+        opp_bb * 0.12
     )
 
-    pitcher_exploit = (
-        opp_hr9 * 0.25 +
-        opp_hard_hit * 0.50 +
-        opp_barrel * 0.70 +
-        opp_bb * 0.20
+    environment = (
+        ((temp_f - 70.0) / 15.0) * 0.04 +
+        wind_out * 0.06
     )
 
-    # Lineup multiplier: RBI needs top/middle order
-    lineup_mult = np.where(lineup_spot <= 2, 0.92, 1.00)
-    lineup_mult = np.where(lineup_spot == 3, 1.10, lineup_mult)
-    lineup_mult = np.where(lineup_spot == 4, 1.14, lineup_mult)
-    lineup_mult = np.where(lineup_spot == 5, 1.08, lineup_mult)
-    lineup_mult = np.where(lineup_spot == 6, 0.96, lineup_mult)
-    lineup_mult = np.where(lineup_spot >= 7, 0.82, lineup_mult)
-    lineup_mult = np.where(lineup_spot >= 8, 0.68, lineup_mult)
+    lineup_bonus = np.where(lineup_spot <= 2, 0.90, 1.00)
+    lineup_bonus = np.where(lineup_spot == 3, 1.18, lineup_bonus)
+    lineup_bonus = np.where(lineup_spot == 4, 1.22, lineup_bonus)
+    lineup_bonus = np.where(lineup_spot == 5, 1.10, lineup_bonus)
+    lineup_bonus = np.where(lineup_spot >= 7, 0.88, lineup_bonus)
+    lineup_bonus = np.where(lineup_spot >= 8, 0.78, lineup_bonus)
+    lineup_bonus = np.where(lineup_spot >= 9, 0.70, lineup_bonus)
 
-    # Soft weak-bat penalty
-    weak_penalty = (
-        (tb_per_pa < pd.Series(tb_per_pa).median()).astype(float) * 0.10 +
-        (hard_hit_rate < pd.Series(hard_hit_rate).median()).astype(float) * 0.08
+    score = (
+        base_score * 0.12 +
+        rbi_opportunity +
+        matchup +
+        environment
     )
-
-    score = base_score * 0.35
-    score += contact_prod * 1.20
-    score += pitcher_exploit
-    score += run_env
-    score -= weak_penalty
-    score *= lineup_mult
+    score *= lineup_bonus
+    score *= lineup_weight.clip(lower=0.80, upper=1.15)
 
     df["rbi_score_raw"] = pd.to_numeric(score, errors="coerce").fillna(0.0)
     df["z_score"] = slate_zscore(df["rbi_score_raw"])
-
-    # Separate probability calibration from raw ranking
-    df["p_rbi"] = logistic(-0.15 + (df["z_score"] * 0.80))
+    df["p_rbi"] = logistic(-0.90 + (df["z_score"] * 0.90))
 
     df["confidence"] = pd.cut(
         df["z_score"],
-        bins=[-10, -1.0, -0.25, 0.5, 1.25, 2.0, 10],
+        bins=[-10, -1.0, -0.20, 0.45, 1.10, 1.80, 10],
         labels=["F", "D", "C", "B", "A", "A+"],
         include_lowest=True,
     ).astype(str)
 
-    name_for_noise = coalesce_text(df, [player_col], default="")
-    team_for_noise = coalesce_text(df, [team_col], default="")
-    noise = (name_for_noise + "|" + team_for_noise).map(lambda x: (hash(x) % 1000) / 1_000_000.0).astype(float)
+    if "tie_break_noise" in df.columns:
+        noise = pd.to_numeric(df["tie_break_noise"], errors="coerce").fillna(0.0) / 1000.0
+    else:
+        name_for_noise = coalesce_text(df, [player_col], default="")
+        team_for_noise = coalesce_text(df, [team_col], default="")
+        noise = (name_for_noise + "|" + team_for_noise).map(
+            lambda x: (hash(x) % 1000) / 1_000_000.0
+        ).astype(float)
+
     df["sort_score"] = df["z_score"] + noise
 
     board = pd.DataFrame({
