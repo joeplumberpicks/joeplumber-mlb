@@ -33,10 +33,19 @@ def pick_col(df: pd.DataFrame, candidates: Iterable[str], required: bool = False
     return None
 
 
-def coalesce_numeric(df: pd.DataFrame, candidates: Iterable[str], default: float = 0.0) -> pd.Series:
+def coalesce_numeric(
+    df: pd.DataFrame,
+    candidates: Iterable[str],
+    default: float | None = None,
+) -> pd.Series:
     for c in candidates:
         if c in df.columns:
-            return pd.to_numeric(df[c], errors="coerce")
+            s = pd.to_numeric(df[c], errors="coerce")
+            if default is not None:
+                s = s.fillna(default)
+            return s
+    if default is None:
+        return pd.Series(np.nan, index=df.index, dtype=float)
     return pd.Series(default, index=df.index, dtype=float)
 
 
@@ -101,47 +110,100 @@ def main() -> None:
     team_col = pick_col(df, ["team", "bat_team", "offense_team"], required=True)
     opp_col = pick_col(df, ["opponent", "opp_team", "pitching_team"], required=False)
     player_col = pick_col(df, ["player_name", "batter_name", "name"], required=True)
-    lineup_col = pick_col(
-        df,
-        ["lineup_spot", "batting_order", "order_spot", "confirmed_batting_order", "projected_batting_order"],
-        required=False,
-    )
 
     print("\n=== HR FEATURE AUDIT ===")
-    audit_cols = ["barrel_rate", "iso", "hr_per_pa", "hard_hit_rate", "lineup_spot"]
-    for col in audit_cols:
-        if col not in df.columns:
-            print(f"❌ MISSING COLUMN: {col}")
+    audit_targets = {
+        "barrel_rate": ["bat_barrel_rate_roll30", "bat_barrel_rate_roll15"],
+        "iso": ["bat_iso_roll30", "bat_iso_roll15"],
+        "hr_per_pa": ["bat_hr_per_pa_roll30", "bat_hr_per_pa_roll15"],
+        "hard_hit_rate": ["bat_hard_hit_rate_roll30", "bat_hard_hit_rate_roll15"],
+        "lineup_spot": ["batting_order"],
+    }
+    for label, candidates in audit_targets.items():
+        found = next((c for c in candidates if c in df.columns), None)
+        if found is None:
+            print(f"❌ MISSING COLUMN: {label}")
         else:
-            null_pct = float(df[col].isna().mean()) * 100
-            print(f"{col}: null_pct={null_pct:.2f}%")
+            null_pct = float(df[found].isna().mean()) * 100.0
+            print(f"{label} -> {found}: null_pct={null_pct:.2f}%")
 
-    # Core hitter power features
-    barrel_rate = coalesce_numeric(df, ["barrel_rate", "barrel_rate_roll30", "bat_barrel_rate_roll30"])
-    iso = coalesce_numeric(df, ["iso", "iso_roll30", "bat_iso_roll30"])
-    hr_per_pa = coalesce_numeric(df, ["hr_per_pa", "hr_per_pa_roll30", "bat_hr_per_pa_roll30"])
-    hard_hit_rate = coalesce_numeric(df, ["hard_hit_rate", "hard_hit_rate_roll30", "bat_hard_hit_rate_roll30"])
-    flyball = coalesce_numeric(df, ["fly_ball_rate", "fb_rate", "flyball_rate_roll30", "bat_fb_rate_roll30"])
-    pulled_air = coalesce_numeric(df, ["pulled_air_rate", "pull_air_rate", "bat_pulled_air_rate_roll30"])
-    ev = coalesce_numeric(df, ["avg_exit_velocity", "avg_ev", "exit_velocity_roll30", "bat_avg_ev_roll30"])
-    la = coalesce_numeric(df, ["avg_launch_angle", "launch_angle_roll30", "bat_avg_la_roll30"])
+    # =========================
+    # TRUE HR FEATURE MAPPING
+    # =========================
 
-    # Opposing pitcher features
-    pitcher_hr9 = coalesce_numeric(df, ["pitcher_hr9", "pit_hr9_roll30", "opp_pitcher_hr9"])
-    pitcher_hard_hit = coalesce_numeric(df, ["pitcher_hard_hit_rate", "pit_hard_hit_rate_roll30"])
-    pitcher_barrel = coalesce_numeric(df, ["pitcher_barrel_rate", "pit_barrel_rate_roll30"])
-    pitcher_bb = coalesce_numeric(df, ["pitcher_bb_rate", "pit_bb_rate_roll30"])
+    barrel_rate = coalesce_numeric(df, [
+        "bat_barrel_rate_roll30",
+        "bat_barrel_rate_roll15",
+    ])
 
-    # Context
-    park_hr = coalesce_numeric(df, ["park_hr_factor", "hr_park_factor", "park_factor_hr"], default=1.0)
-    weather_hr = coalesce_numeric(df, ["weather_hr_boost", "hr_weather_boost"], default=0.0)
-    temp_f = coalesce_numeric(df, ["temperature_f", "temp_f"], default=72.0)
-    wind_out = coalesce_numeric(df, ["weather_wind_out", "wind_out"], default=0.0)
+    iso = coalesce_numeric(df, [
+        "bat_iso_roll30",
+        "bat_iso_roll15",
+    ])
 
-    # Existing upstream score if present
+    hr_per_pa = coalesce_numeric(df, [
+        "bat_hr_per_pa_roll30",
+        "bat_hr_per_pa_roll15",
+    ])
+
+    hard_hit_rate = coalesce_numeric(df, [
+        "bat_hard_hit_rate_roll30",
+        "bat_hard_hit_rate_roll15",
+    ])
+
+    flyball = coalesce_numeric(df, [
+        "bat_fb_rate_roll30",
+        "bat_fb_rate_roll15",
+    ])
+
+    pulled_air = coalesce_numeric(df, [
+        "bat_pulled_air_rate_roll30",
+        "bat_pulled_air_rate_roll15",
+    ])
+
+    ev = coalesce_numeric(df, [
+        "bat_avg_ev_roll30",
+        "bat_avg_ev_roll15",
+    ])
+
+    la = coalesce_numeric(df, [
+        "bat_avg_la_roll30",
+        "bat_avg_la_roll15",
+    ])
+
+    pitcher_hr9 = coalesce_numeric(df, [
+        "opp_pit_hr9_roll30",
+        "opp_pit_hr9_roll15",
+    ])
+
+    pitcher_barrel = coalesce_numeric(df, [
+        "opp_pit_barrel_rate_roll30",
+        "opp_pit_barrel_rate_roll15",
+    ])
+
+    pitcher_hard_hit = coalesce_numeric(df, [
+        "opp_pit_hard_hit_rate_roll30",
+        "opp_pit_hard_hit_rate_roll15",
+    ])
+
+    pitcher_bb = coalesce_numeric(df, [
+        "opp_pit_bb_rate_roll30",
+        "opp_pit_bb_rate_roll15",
+    ])
+
+    temp_f = coalesce_numeric(df, ["temperature_f"], default=72.0)
+    wind_out = coalesce_numeric(df, ["weather_wind_out"], default=0.0)
+    lineup_spot = coalesce_numeric(df, ["batting_order"], default=6.0)
+
     base_score = coalesce_numeric(df, ["hr_score_raw", "score_raw", "score"], default=0.0)
 
-    # Fill missing with medians, not zeros
+    # hard validation
+    if barrel_rate.isna().all():
+        raise ValueError("🚨 barrel_rate missing — HR model invalid")
+    if iso.isna().all():
+        raise ValueError("🚨 iso missing — HR model invalid")
+
+    # fill missing values
     barrel_rate = fill_with_median(barrel_rate, 0.06)
     iso = fill_with_median(iso, 0.16)
     hr_per_pa = fill_with_median(hr_per_pa, 0.025)
@@ -152,32 +214,25 @@ def main() -> None:
     la = fill_with_median(la, 13.0)
 
     pitcher_hr9 = fill_with_median(pitcher_hr9, 1.10)
-    pitcher_hard_hit = fill_with_median(pitcher_hard_hit, 0.40)
     pitcher_barrel = fill_with_median(pitcher_barrel, 0.08)
+    pitcher_hard_hit = fill_with_median(pitcher_hard_hit, 0.40)
     pitcher_bb = fill_with_median(pitcher_bb, 0.08)
 
-    park_hr = fill_with_median(park_hr, 1.0)
-    weather_hr = fill_with_median(weather_hr, 0.0)
     temp_f = fill_with_median(temp_f, 72.0)
     wind_out = fill_with_median(wind_out, 0.0)
-
+    lineup_spot = fill_with_median(lineup_spot, 6.0)
     base_score = pd.to_numeric(base_score, errors="coerce").fillna(0.0)
 
-    lineup_spot = pd.Series(6.0, index=df.index)
-    if lineup_col is not None:
-        lineup_spot = pd.to_numeric(df[lineup_col], errors="coerce").fillna(6.0)
-
-    # Softer power gate
+    # soft power gate
     power_flag = (
         (barrel_rate >= 0.06) |
         (iso >= 0.160) |
         (hr_per_pa >= 0.025)
     ).astype(int)
 
-    # Light penalty instead of full removal
-    power_penalty = np.where(power_flag == 0, 0.88, 1.0)
+    power_penalty = np.where(power_flag == 0, 0.88, 1.00)
 
-    # True power spine
+    # power spine
     hr_power_score = (
         barrel_rate * 0.45 +
         iso * 0.30 +
@@ -206,13 +261,10 @@ def main() -> None:
     )
 
     environment = (
-        (park_hr - 1.0) * 0.80 +
-        weather_hr * 0.45 +
         ((temp_f - 70.0) / 15.0) * 0.06 +
         wind_out * 0.10
     )
 
-    # Build raw ranking score
     score = base_score * 0.25
     score += hitter_shape
     score += contact_quality
@@ -221,7 +273,7 @@ def main() -> None:
     score += hr_power_score * 1.25
     score *= power_penalty
 
-    # Much softer lineup adjustments
+    # lineup adjustment
     score = np.where(lineup_spot <= 2, score * 1.03, score)
     score = np.where(lineup_spot == 3, score * 1.06, score)
     score = np.where(lineup_spot == 4, score * 1.08, score)
@@ -230,7 +282,6 @@ def main() -> None:
     score = np.where(lineup_spot >= 8, score * 0.80, score)
     score = np.where(lineup_spot >= 9, score * 0.72, score)
 
-    # Small weak-power penalty, not overkill
     weak_power_penalty = (
         (barrel_rate < 0.055).astype(float) * 0.10 +
         (iso < 0.145).astype(float) * 0.08 +
@@ -240,7 +291,7 @@ def main() -> None:
 
     elite_boost = (
         (barrel_rate >= 0.12).astype(float) * 0.18 +
-        (iso >= 0.240).astype(float) * 0.14 +
+        (iso >= 0.250).astype(float) * 0.14 +
         (hr_per_pa >= 0.050).astype(float) * 0.14
     )
     score = score + elite_boost
@@ -248,8 +299,7 @@ def main() -> None:
     df["hr_score_raw"] = pd.to_numeric(score, errors="coerce").fillna(0.0)
     df["z_score"] = slate_zscore(df["hr_score_raw"])
 
-    # Separate calibration from raw ranking
-    # This is intentionally milder than your last version
+    # ranking vs calibration separated
     df["p_hr"] = logistic(-2.35 + (df["z_score"] * 0.72))
 
     df["confidence"] = pd.cut(
@@ -259,9 +309,15 @@ def main() -> None:
         include_lowest=True,
     ).astype(str)
 
-    name_for_noise = coalesce_text(df, [player_col], default="")
-    team_for_noise = coalesce_text(df, [team_col], default="")
-    noise = (name_for_noise + "|" + team_for_noise).map(lambda x: (hash(x) % 1000) / 1_000_000.0).astype(float)
+    if "tie_break_noise" in df.columns:
+        noise = pd.to_numeric(df["tie_break_noise"], errors="coerce").fillna(0.0) / 1000.0
+    else:
+        name_for_noise = coalesce_text(df, [player_col], default="")
+        team_for_noise = coalesce_text(df, [team_col], default="")
+        noise = (name_for_noise + "|" + team_for_noise).map(
+            lambda x: (hash(x) % 1000) / 1_000_000.0
+        ).astype(float)
+
     df["sort_score"] = df["z_score"] + noise
 
     board = pd.DataFrame({
