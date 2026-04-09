@@ -2,184 +2,228 @@
 from __future__ import annotations
 
 import argparse
-import math
-from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from typing import Iterable
 
+import numpy as np
 import pandas as pd
-
-from src.utils.config import load_config
-from src.utils.drive import resolve_data_dirs
+import yaml
 
 
-def get_today_date() -> str:
-    return datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+def load_config(config_path: str) -> dict:
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run daily RBI board.")
-    parser.add_argument("--date", type=str, default=None)
-    parser.add_argument("--season", type=str, default="2026")
-    parser.add_argument("--config", type=str, default="configs/project.yaml")
-    return parser.parse_args()
+def resolve_data_root(config: dict) -> Path:
+    drive_root = config.get("drive_data_root", "joeplumber-mlb/data")
+    return Path("/content/drive/MyDrive") / drive_root
 
 
-def _pick_col(df: pd.DataFrame, candidates: list[str], required: bool = False) -> str | None:
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def pick_col(df: pd.DataFrame, candidates: Iterable[str], required: bool = False) -> str | None:
     for c in candidates:
         if c in df.columns:
             return c
     if required:
-        raise KeyError(f"Missing required column. Tried: {candidates}")
+        raise KeyError(f"Missing required column. Tried: {list(candidates)}")
     return None
 
 
-def add_weighted_feature(score: pd.Series, df: pd.DataFrame, col: str, weight: float) -> pd.Series:
-    if col in df.columns:
-        vals = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-        score = score + (vals * weight)
-    return score
+def coalesce_numeric(df: pd.DataFrame, candidates: Iterable[str], default: float = 0.0) -> pd.Series:
+    for c in candidates:
+        if c in df.columns:
+            return pd.to_numeric(df[c], errors="coerce").fillna(default)
+    return pd.Series(default, index=df.index, dtype=float)
 
 
-def sigmoid_series(x: pd.Series) -> pd.Series:
-    x = pd.to_numeric(x, errors="coerce").fillna(0.0).clip(-20, 20)
-    return x.map(lambda v: 1.0 / (1.0 + math.exp(-float(v))))
+def coalesce_text(df: pd.DataFrame, candidates: Iterable[str], default: str = "") -> pd.Series:
+    for c in candidates:
+        if c in df.columns:
+            return df[c].fillna(default).astype(str)
+    return pd.Series(default, index=df.index, dtype="object")
 
 
-def zscore_series(x: pd.Series) -> pd.Series:
-    x = pd.to_numeric(x, errors="coerce").fillna(0.0)
-    std = x.std()
-    if pd.isna(std) or std == 0:
-        return pd.Series(0.0, index=x.index, dtype="float64")
-    return (x - x.mean()) / std
+def logistic(x: pd.Series | np.ndarray) -> pd.Series:
+    x = pd.Series(x)
+    return 1.0 / (1.0 + np.exp(-x.clip(-20, 20)))
 
 
-def confidence_from_prob(prob: pd.Series) -> pd.Series:
-    return pd.cut(
-        prob,
-        bins=[0.0, 0.54, 0.60, 0.66, 0.72, 1.0],
-        labels=["C", "B-", "B+", "A", "A+"],
-        include_lowest=True,
-    )
+def slate_zscore(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce").fillna(0.0)
+    std = float(s.std(ddof=0))
+    if std <= 1e-12:
+        return pd.Series(0.0, index=s.index)
+    z = (s - float(s.mean())) / std
+    return z.clip(-3.0, 3.0)
 
 
 def main() -> None:
-    args = parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--season", type=int, required=True)
+    parser.add_argument("--date", type=str, required=True)
+    parser.add_argument("--config", type=str, default="configs/project.yaml")
+    args = parser.parse_args()
 
-    repo_root = Path(__file__).resolve().parents[2]
-    config = load_config((repo_root / args.config).resolve())
-    dirs = resolve_data_dirs(config=config, prefer_drive=True)
+    print(f"=== JOE PLUMBER RBI RUN :: {args.date} ===")
 
-    processed_dir = Path(dirs["processed_dir"])
-    outputs_dir = Path(dirs["outputs_dir"])
-    outputs_dir.mkdir(parents=True, exist_ok=True)
+    config = load_config(args.config)
+    data_root = resolve_data_root(config)
+    processed_live = data_root / "processed" / "live"
+    outputs_dir = data_root / "outputs"
+    ensure_dir(outputs_dir)
 
-    date_str = args.date or get_today_date()
-    season = str(args.season)
+    features_path = processed_live / f"rbi_features_{args.season}_{args.date}.parquet"
+    out_csv = outputs_dir / f"rbi_board_{args.season}_{args.date}.csv"
+    out_parquet = outputs_dir / f"rbi_board_{args.season}_{args.date}.parquet"
 
-    feat_path = processed_dir / "live" / f"rbi_features_{season}_{date_str}.parquet"
-    if not feat_path.exists():
-        raise FileNotFoundError(f"Missing: {feat_path}")
+    print(f"Loading features: {features_path}")
+    if not features_path.exists():
+        raise FileNotFoundError(f"Missing features file: {features_path}")
 
-    df = pd.read_parquet(feat_path).copy()
-
-    print(f"=== JOE PLUMBER RBI RUN :: {date_str} ===")
-    print(f"Loading features: {feat_path}")
+    df = pd.read_parquet(features_path).copy()
     print(f"Row count [rbi_features]: {len(df):,}")
+    if df.empty:
+        raise ValueError("RBI features file is empty.")
 
-    score = pd.Series(0.0, index=df.index, dtype="float64")
+    game_date_col = pick_col(df, ["game_date"], required=False)
+    team_col = pick_col(df, ["team", "bat_team", "offense_team"], required=True)
+    opp_col = pick_col(df, ["opponent", "opp_team", "pitching_team"], required=False)
+    player_col = pick_col(df, ["player_name", "batter_name", "name"], required=True)
+    lineup_col = pick_col(
+        df,
+        ["lineup_spot", "batting_order", "order_spot", "confirmed_batting_order", "projected_batting_order"],
+        required=False,
+    )
 
-    for col, wt in {
-        "rbi_roll15": 0.95,
-        "rbi_roll30": 0.60,
-        "tb_roll15": 0.28,
-        "tb_roll30": 0.18,
-        "hardhit_rate_roll15": 0.45,
-        "barrel_rate_roll15": 0.35,
-        "bb_rate_roll15": 0.16,
-        "k_rate_roll15": -0.08,
+    # Audit / fallback core RBI columns
+    hits = coalesce_numeric(df, ["hits_per_pa", "bat_hits_per_pa_roll30", "hit_rate", "bat_ba_roll30"], default=np.nan)
+    tb_per_pa = coalesce_numeric(df, ["tb_per_pa", "bat_tb_per_pa_roll30"], default=np.nan)
+    hr_per_pa = coalesce_numeric(df, ["hr_per_pa", "bat_hr_per_pa_roll30"], default=np.nan)
+    bb_rate = coalesce_numeric(df, ["bb_rate", "bat_bb_rate_roll30"], default=np.nan)
+    hard_hit_rate = coalesce_numeric(df, ["hard_hit_rate", "bat_hard_hit_rate_roll30"], default=np.nan)
+    barrel_rate = coalesce_numeric(df, ["barrel_rate", "bat_barrel_rate_roll30"], default=np.nan)
+    iso = coalesce_numeric(df, ["iso", "bat_iso_roll30"], default=np.nan)
+
+    park_rbi = coalesce_numeric(df, ["park_rbi_factor", "park_run_factor", "park_factor_runs"], default=1.0)
+    weather_rbi = coalesce_numeric(df, ["weather_rbi_boost", "weather_run_boost"], default=0.0)
+
+    opp_hr9 = coalesce_numeric(df, ["pitcher_hr9", "pit_hr9_roll30", "opp_pitcher_hr9"], default=0.0)
+    opp_hard_hit = coalesce_numeric(df, ["pitcher_hard_hit_rate", "pit_hard_hit_rate_roll30"], default=0.0)
+    opp_barrel = coalesce_numeric(df, ["pitcher_barrel_rate", "pit_barrel_rate_roll30"], default=0.0)
+    opp_bb = coalesce_numeric(df, ["pitcher_bb_rate", "pit_bb_rate_roll30"], default=0.0)
+
+    base_score = coalesce_numeric(df, ["rbi_score_raw", "score_raw", "score"], default=0.0)
+
+    lineup_spot = pd.Series(5, index=df.index, dtype=float)
+    if lineup_col is not None:
+        lineup_spot = pd.to_numeric(df[lineup_col], errors="coerce").fillna(5.0)
+
+    print("\n=== RBI FEATURE AUDIT ===")
+    for name, s in {
+        "hits": hits,
+        "tb_per_pa": tb_per_pa,
+        "hr_per_pa": hr_per_pa,
+        "bb_rate": bb_rate,
+        "hard_hit_rate": hard_hit_rate,
+        "barrel_rate": barrel_rate,
+        "iso": iso,
+        "lineup_spot": lineup_spot,
     }.items():
-        score = add_weighted_feature(score, df, col, wt)
+        print(f"{name}: null_pct={float(pd.Series(s).isna().mean()) * 100:.2f}%")
 
-    for col, wt in {
-        "opp_bb_rate_roll15": 0.30,
-        "opp_hr_allowed_roll15": 0.28,
-        "opp_hardhit_rate_allowed_roll15": 0.22,
-    }.items():
-        score = add_weighted_feature(score, df, col, wt)
+    # Median fill, not zero fill
+    for s_name in ["hits", "tb_per_pa", "hr_per_pa", "bb_rate", "hard_hit_rate", "barrel_rate", "iso"]:
+        s = locals()[s_name]
+        med = float(pd.Series(s).median()) if not pd.Series(s).dropna().empty else 0.0
+        locals()[s_name] = pd.Series(s).fillna(med)
 
-    for col, wt in {
-        "rbi_walk_pressure_roll15": 1.20,
-        "rbi_power_pressure_roll15": 1.00,
-        "rbi_contact_pressure_roll15": 0.90,
-        "rbi_team_onbase_pressure": 0.70,
-    }.items():
-        score = add_weighted_feature(score, df, col, wt)
+    # RBI opportunity logic
+    contact_prod = (
+        hits * 0.30 +
+        tb_per_pa * 0.30 +
+        hr_per_pa * 0.20 +
+        hard_hit_rate * 0.10 +
+        barrel_rate * 0.10
+    )
 
-    for col, wt in {
-        "team_ctx_bb_rate_roll15": 0.30,
-        "team_ctx_tb_roll15": 0.20,
-        "team_ctx_rbi_roll15": 0.16,
-        "team_ctx_hardhit_rate_roll15": 0.18,
-        "team_ctx_barrel_rate_roll15": 0.12,
-    }.items():
-        score = add_weighted_feature(score, df, col, wt)
+    run_env = (
+        (park_rbi - 1.0) * 0.90 +
+        weather_rbi * 0.60
+    )
 
-    if "lineup_weight" in df.columns:
-        score = score * pd.to_numeric(df["lineup_weight"], errors="coerce").fillna(1.0)
+    pitcher_exploit = (
+        opp_hr9 * 0.25 +
+        opp_hard_hit * 0.50 +
+        opp_barrel * 0.70 +
+        opp_bb * 0.20
+    )
 
-    for col, wt in {
-        "weather_wind_out": 0.06,
-        "weather_wind_in": -0.03,
-        "temperature_f": 0.002,
-    }.items():
-        score = add_weighted_feature(score, df, col, wt)
+    # Lineup multiplier: RBI needs top/middle order
+    lineup_mult = np.where(lineup_spot <= 2, 0.92, 1.00)
+    lineup_mult = np.where(lineup_spot == 3, 1.10, lineup_mult)
+    lineup_mult = np.where(lineup_spot == 4, 1.14, lineup_mult)
+    lineup_mult = np.where(lineup_spot == 5, 1.08, lineup_mult)
+    lineup_mult = np.where(lineup_spot == 6, 0.96, lineup_mult)
+    lineup_mult = np.where(lineup_spot >= 7, 0.82, lineup_mult)
+    lineup_mult = np.where(lineup_spot >= 8, 0.68, lineup_mult)
 
-    if "tie_break_noise" in df.columns:
-        score = score + pd.to_numeric(df["tie_break_noise"], errors="coerce").fillna(0.0)
+    # Soft weak-bat penalty
+    weak_penalty = (
+        (tb_per_pa < pd.Series(tb_per_pa).median()).astype(float) * 0.10 +
+        (hard_hit_rate < pd.Series(hard_hit_rate).median()).astype(float) * 0.08
+    )
 
-    missing_core = pd.Series(False, index=df.index)
-    for c in ["player_id", "opp_pitcher_id"]:
-        if c in df.columns:
-            missing_core = missing_core | df[c].isna()
+    score = base_score * 0.35
+    score += contact_prod * 1.20
+    score += pitcher_exploit
+    score += run_env
+    score -= weak_penalty
+    score *= lineup_mult
 
-    score.loc[missing_core] = score.loc[missing_core] - 0.20
+    df["rbi_score_raw"] = pd.to_numeric(score, errors="coerce").fillna(0.0)
+    df["z_score"] = slate_zscore(df["rbi_score_raw"])
 
-    score_z = zscore_series(score)
-    df["rbi_score_raw"] = score_z
-    df["p_rbi"] = sigmoid_series(score_z * 0.90)
-    df["confidence"] = confidence_from_prob(df["p_rbi"])
+    # Separate probability calibration from raw ranking
+    df["p_rbi"] = logistic(-0.15 + (df["z_score"] * 0.80))
 
-    batter_name_col = _pick_col(df, ["batter_name", "player_name", "name"])
-    team_col = _pick_col(df, ["team", "team_abbr", "batting_team"])
-    opp_col = _pick_col(df, ["opponent"])
+    df["confidence"] = pd.cut(
+        df["z_score"],
+        bins=[-10, -1.0, -0.25, 0.5, 1.25, 2.0, 10],
+        labels=["F", "D", "C", "B", "A", "A+"],
+        include_lowest=True,
+    ).astype(str)
 
-    keep = [
-        c for c in [
-            "game_date",
-            team_col,
-            opp_col,
-            batter_name_col,
-            "rbi_score_raw",
-            "p_rbi",
-            "confidence",
-        ]
-        if c is not None and c in df.columns
-    ]
+    name_for_noise = coalesce_text(df, [player_col], default="")
+    team_for_noise = coalesce_text(df, [team_col], default="")
+    noise = (name_for_noise + "|" + team_for_noise).map(lambda x: (hash(x) % 1000) / 1_000_000.0).astype(float)
+    df["sort_score"] = df["z_score"] + noise
 
-    board = df[keep].sort_values("p_rbi", ascending=False).reset_index(drop=True)
-    board["rank"] = range(1, len(board) + 1)
-    board = board[["rank"] + [c for c in board.columns if c != "rank"]]
+    board = pd.DataFrame({
+        "game_date": coalesce_text(df, [game_date_col] if game_date_col else [], default=args.date),
+        "team": coalesce_text(df, [team_col]),
+        "opponent": coalesce_text(df, [opp_col] if opp_col else [], default=""),
+        "player_name": coalesce_text(df, [player_col]),
+        "rbi_score_raw": df["rbi_score_raw"],
+        "p_rbi": df["p_rbi"],
+        "confidence": df["confidence"],
+        "sort_score": df["sort_score"],
+    })
 
-    out_csv = outputs_dir / f"rbi_board_{season}_{date_str}.csv"
-    out_parquet = outputs_dir / f"rbi_board_{season}_{date_str}.parquet"
+    board = board.sort_values(["sort_score", "p_rbi"], ascending=[False, False]).reset_index(drop=True)
+    board.insert(0, "rank", np.arange(1, len(board) + 1))
+    board = board.drop(columns=["sort_score"])
+    board_top = board.head(25).copy()
 
-    board.to_csv(out_csv, index=False)
-    board.to_parquet(out_parquet, index=False)
+    board_top.to_csv(out_csv, index=False)
+    board_top.to_parquet(out_parquet, index=False)
 
     print(f"✅ RBI board built: {out_csv}")
     print(f"✅ RBI board parquet: {out_parquet}")
-    print(board.head(25).to_string(index=False))
+    print(board_top.to_string(index=False))
 
 
 if __name__ == "__main__":
