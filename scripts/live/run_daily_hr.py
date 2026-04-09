@@ -125,7 +125,6 @@ def main() -> None:
     temp_f = coalesce_numeric(df, ["temperature_f", "temp_f"], default=72.0)
     wind_out = coalesce_numeric(df, ["weather_wind_out", "wind_out"], default=0.0)
 
-    # Fallback raw score if already present
     prior_raw = coalesce_numeric(df, ["hr_score_raw", "score_raw", "score"], default=0.0)
 
     # -----------------------------
@@ -139,7 +138,6 @@ def main() -> None:
 
     filtered = df.loc[hard_filter].copy()
 
-    # If the filter gets too tight on a weird slate, soften it enough to keep a board alive.
     if filtered.empty:
         relaxed_filter = (
             (barrel_rate >= 0.06) |
@@ -151,7 +149,6 @@ def main() -> None:
     if filtered.empty:
         filtered = df.copy()
 
-    # Rebuild aligned series after filtering
     idx = filtered.index
 
     barrel_rate = barrel_rate.loc[idx]
@@ -219,7 +216,7 @@ def main() -> None:
         environment
     )
 
-    # Mandatory HR weight boost
+    # HR power boost
     score = score + (hr_power_score * 2.0)
 
     # -----------------------------
@@ -229,20 +226,17 @@ def main() -> None:
     if lineup_col is not None:
         lineup_spot = pd.to_numeric(filtered[lineup_col], errors="coerce").fillna(5.0)
 
-    # Extra reward for premium lineup spots
     score = np.where(lineup_spot <= 2, score * 1.08, score)
     score = np.where(lineup_spot == 3, score * 1.06, score)
     score = np.where(lineup_spot == 4, score * 1.04, score)
     score = np.where(lineup_spot == 5, score * 1.01, score)
 
-    # User-requested penalties
     score = np.where(lineup_spot >= 7, score * 0.75, score)
     score = np.where(lineup_spot >= 8, score * 0.60, score)
 
     # -----------------------------
     # Additional guardrails
     # -----------------------------
-    # Penalize obvious low-HR archetypes that barely slipped through
     weak_power_penalty = (
         (barrel_rate < 0.075).astype(float) * 0.35 +
         (iso < 0.170).astype(float) * 0.25 +
@@ -250,7 +244,6 @@ def main() -> None:
     )
     score = score - weak_power_penalty
 
-    # Slight bump for elite HR archetypes
     elite_boost = (
         (barrel_rate >= 0.12).astype(float) * 0.25 +
         (iso >= 0.240).astype(float) * 0.20 +
@@ -264,7 +257,6 @@ def main() -> None:
     filtered["hr_score_raw"] = pd.to_numeric(score, errors="coerce").fillna(0.0)
     filtered["z_score"] = slate_zscore(filtered["hr_score_raw"])
 
-    # Wider spread
     filtered["confidence"] = pd.cut(
         filtered["z_score"],
         bins=[-10, -1, 0, 1, 1.8, 2.5, 10],
@@ -272,11 +264,8 @@ def main() -> None:
         include_lowest=True,
     ).astype(str)
 
-    # Convert z-score to a more realistic HR probability scale
-    # This is intentionally restrained so top plays don't all look like locks.
     filtered["p_hr"] = logistic(-3.10 + (filtered["z_score"] * 0.95))
 
-    # Noise tie-breaker to prevent same-score clumps
     name_for_noise = coalesce_text(filtered, [player_col], default="")
     team_for_noise = coalesce_text(filtered, [team_col], default="")
     noise_key = name_for_noise + "|" + team_for_noise
@@ -294,13 +283,16 @@ def main() -> None:
         "hr_score_raw": filtered["hr_score_raw"],
         "p_hr": filtered["p_hr"],
         "confidence": filtered["confidence"],
+        "sort_score": filtered["sort_score"],  # <-- FIX
     }
 
     board = pd.DataFrame(keep_cols).copy()
     board = board.sort_values(["sort_score", "p_hr"], ascending=[False, False]).reset_index(drop=True)
     board.insert(0, "rank", np.arange(1, len(board) + 1))
 
-    # Keep top 25 for standard display
+    # Remove helper column after sorting
+    board = board.drop(columns=["sort_score"])
+
     board_top = board.head(25).copy()
 
     board_top.to_csv(out_csv, index=False)
