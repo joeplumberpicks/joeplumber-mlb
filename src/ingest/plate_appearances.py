@@ -213,6 +213,12 @@ def _empty_plate_appearances_df() -> pd.DataFrame:
             "is_rbi",
             "is_sac_fly",
             "is_reached_on_error",
+            "launch_speed",
+            "launch_angle",
+            "hit_distance_sc",
+            "bb_type",
+            "hc_x",
+            "hc_y",
             "source",
             "source_pull_ts",
         ]
@@ -274,6 +280,73 @@ def normalize_plate_appearance_records(
     )
     event_text = _to_string(_coalesce_series(df, ["event_text", "description", "play_description", "result_text"]))
 
+    # Preserve Statcast contact-quality fields for downstream EV/LA and batted-ball features
+    launch_speed = _to_nullable_float(
+        _coalesce_series(
+            df,
+            [
+                "launch_speed",
+                "hit_speed",
+            ],
+            default=None,
+        )
+    )
+
+    launch_angle = _to_nullable_float(
+        _coalesce_series(
+            df,
+            [
+                "launch_angle",
+                "hit_angle",
+            ],
+            default=None,
+        )
+    )
+
+    hit_distance_sc = _to_nullable_float(
+        _coalesce_series(
+            df,
+            [
+                "hit_distance_sc",
+                "hit_distance",
+            ],
+            default=None,
+        )
+    )
+
+    bb_type = _to_string(
+        _coalesce_series(
+            df,
+            [
+                "bb_type",
+                "batted_ball_type",
+            ],
+            default=None,
+        )
+    )
+
+    hc_x = _to_nullable_float(
+        _coalesce_series(
+            df,
+            [
+                "hc_x",
+                "hit_coordinate_x",
+            ],
+            default=None,
+        )
+    )
+
+    hc_y = _to_nullable_float(
+        _coalesce_series(
+            df,
+            [
+                "hc_y",
+                "hit_coordinate_y",
+            ],
+            default=None,
+        )
+    )
+
     out = pd.DataFrame(
         {
             "game_pk": game_pk,
@@ -311,6 +384,12 @@ def normalize_plate_appearance_records(
             "is_rbi": flags["is_rbi"],
             "is_sac_fly": flags["is_sac_fly"],
             "is_reached_on_error": flags["is_reached_on_error"],
+            "launch_speed": launch_speed,
+            "launch_angle": launch_angle,
+            "hit_distance_sc": hit_distance_sc,
+            "bb_type": bb_type,
+            "hc_x": hc_x,
+            "hc_y": hc_y,
             "source": _to_string(_coalesce_series(df, ["source"], default=source if source is not None else "unknown")),
             "source_pull_ts": pd.to_datetime(
                 _coalesce_series(df, ["source_pull_ts"], default=pd.Timestamp.utcnow()),
@@ -391,7 +470,15 @@ def summarize_plate_appearances(df: pd.DataFrame, label: str = "plate_appearance
     print(f"Min game_date: {min_date}")
     print(f"Max game_date: {max_date}")
 
-    for col in ["game_pk", "pa_index", "batter_name", "pitcher_name", "event_type"]:
+    for col in [
+        "game_pk",
+        "pa_index",
+        "batter_name",
+        "pitcher_name",
+        "event_type",
+        "launch_speed",
+        "launch_angle",
+    ]:
         if col in df.columns:
             print(f"Nulls [{col}]: {int(df[col].isna().sum()):,}")
 
