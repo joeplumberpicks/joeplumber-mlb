@@ -41,7 +41,7 @@ def rate(num: pd.Series, den: pd.Series) -> pd.Series:
     return pd.Series(out, index=num.index, dtype=float)
 
 
-def fetch_statcast_daily(start_date: str, end_date: str) -> pd.DataFrame:
+def fetch_statcast_raw(start_date: str, end_date: str) -> pd.DataFrame:
     from pybaseball import statcast
 
     print(f"Fetching Statcast from {start_date} to {end_date}")
@@ -94,15 +94,17 @@ def build_statcast_batter_daily(sc: pd.DataFrame) -> pd.DataFrame:
             columns=[
                 "game_date",
                 "batter_id",
-                "launch_speed",
-                "launch_angle",
-                "hit_distance_sc",
-                "bb_type",
-                "hc_x",
-                "hc_y",
-                "barrels",
-                "hard_hit",
-                "bbe",
+                "launch_speed_sc",
+                "launch_angle_sc",
+                "hit_distance_sc_sc",
+                "bb_type_sc",
+                "hc_x_sc",
+                "hc_y_sc",
+                "sc_events",
+                "sc_description",
+                "barrels_sc",
+                "hard_hit_sc",
+                "bbe_sc",
                 "barrel_rate_sc",
                 "hard_hit_rate_sc",
             ]
@@ -122,29 +124,30 @@ def build_statcast_batter_daily(sc: pd.DataFrame) -> pd.DataFrame:
     sc["is_hard_hit"] = (ls >= 95).fillna(False).astype(int)
     sc["is_barrel"] = ((ls >= 98) & la.between(26, 30, inclusive="both")).fillna(False).astype(int)
 
-    grouped = (
+    daily = (
         sc.groupby(["game_date", "batter"], dropna=False)
         .agg(
-            launch_speed=("launch_speed", "mean"),
-            launch_angle=("launch_angle", "mean"),
-            hit_distance_sc=("hit_distance_sc", "mean"),
-            hc_x=("hc_x", "mean"),
-            hc_y=("hc_y", "mean"),
-            bb_type=("bb_type", lambda x: x.dropna().iloc[0] if x.dropna().shape[0] else pd.NA),
-            barrels=("is_barrel", "sum"),
-            hard_hit=("is_hard_hit", "sum"),
-            bbe=("is_bbe", "sum"),
+            launch_speed_sc=("launch_speed", "mean"),
+            launch_angle_sc=("launch_angle", "mean"),
+            hit_distance_sc_sc=("hit_distance_sc", "mean"),
+            hc_x_sc=("hc_x", "mean"),
+            hc_y_sc=("hc_y", "mean"),
+            bb_type_sc=("bb_type", lambda x: x.dropna().iloc[0] if x.dropna().shape[0] else pd.NA),
+            sc_events=("events", lambda x: x.dropna().iloc[0] if x.dropna().shape[0] else pd.NA),
+            sc_description=("description", lambda x: x.dropna().iloc[0] if x.dropna().shape[0] else pd.NA),
+            barrels_sc=("is_barrel", "sum"),
+            hard_hit_sc=("is_hard_hit", "sum"),
+            bbe_sc=("is_bbe", "sum"),
         )
         .reset_index()
     )
 
-    grouped = grouped.rename(columns={"batter": "batter_id"})
-    grouped["batter_id"] = to_num(grouped["batter_id"]).astype("Int64")
+    daily = daily.rename(columns={"batter": "batter_id"})
+    daily["batter_id"] = to_num(daily["batter_id"]).astype("Int64")
+    daily["barrel_rate_sc"] = rate(daily["barrels_sc"], daily["bbe_sc"])
+    daily["hard_hit_rate_sc"] = rate(daily["hard_hit_sc"], daily["bbe_sc"])
 
-    grouped["barrel_rate_sc"] = rate(grouped["barrels"], grouped["bbe"])
-    grouped["hard_hit_rate_sc"] = rate(grouped["hard_hit"], grouped["bbe"])
-
-    return grouped
+    return daily
 
 
 def enrich_pa_with_statcast(pa: pd.DataFrame, sc_daily: pd.DataFrame) -> pd.DataFrame:
@@ -156,8 +159,45 @@ def enrich_pa_with_statcast(pa: pd.DataFrame, sc_daily: pd.DataFrame) -> pd.Data
     out["game_date"] = safe_date_series(out["game_date"])
     out["batter_id"] = to_num(out["batter_id"]).astype("Int64")
 
+    # Drop any old/duplicate statcast enrichment fields before merging
+    drop_cols = [
+        "launch_speed",
+        "launch_angle",
+        "hit_distance_sc",
+        "bb_type",
+        "hc_x",
+        "hc_y",
+        "sc_events",
+        "sc_description",
+        "launch_speed_sc",
+        "launch_angle_sc",
+        "hit_distance_sc_sc",
+        "bb_type_sc",
+        "hc_x_sc",
+        "hc_y_sc",
+        "barrels_sc",
+        "hard_hit_sc",
+        "bbe_sc",
+        "barrel_rate_sc",
+        "hard_hit_rate_sc",
+        "launch_speed_scdup",
+        "launch_angle_scdup",
+        "hit_distance_sc_scdup",
+        "bb_type_scdup",
+        "hc_x_scdup",
+        "hc_y_scdup",
+        "barrels_sc_scdup",
+        "hard_hit_sc_scdup",
+        "bbe_sc_scdup",
+        "barrel_rate_sc_scdup",
+        "hard_hit_rate_sc_scdup",
+    ]
+    drop_existing = [c for c in drop_cols if c in out.columns]
+    if drop_existing:
+        out = out.drop(columns=drop_existing)
+
     if sc_daily.empty:
-        print("⚠️ No Statcast daily table available; returning PA unchanged with empty Statcast columns.")
+        print("⚠️ No Statcast daily rows available; returning PA unchanged with empty columns.")
         for c in [
             "launch_speed",
             "launch_angle",
@@ -165,6 +205,8 @@ def enrich_pa_with_statcast(pa: pd.DataFrame, sc_daily: pd.DataFrame) -> pd.Data
             "bb_type",
             "hc_x",
             "hc_y",
+            "sc_events",
+            "sc_description",
             "barrels_sc",
             "hard_hit_sc",
             "bbe_sc",
@@ -176,28 +218,31 @@ def enrich_pa_with_statcast(pa: pd.DataFrame, sc_daily: pd.DataFrame) -> pd.Data
         return out
 
     merged = out.merge(
-        sc_daily.rename(
-            columns={
-                "barrels": "barrels_sc",
-                "hard_hit": "hard_hit_sc",
-                "bbe": "bbe_sc",
-            }
-        ),
+        sc_daily,
         how="left",
         on=["game_date", "batter_id"],
-        suffixes=("", "_scdup"),
+        validate="m:1",
     )
 
-    # Prefer real Statcast values for these fields
-    for c in ["launch_speed", "launch_angle", "hit_distance_sc", "bb_type", "hc_x", "hc_y"]:
-        if c not in merged.columns:
-            merged[c] = np.nan
+    # Promote Statcast columns to canonical PA columns
+    rename_map = {
+        "launch_speed_sc": "launch_speed",
+        "launch_angle_sc": "launch_angle",
+        "hit_distance_sc_sc": "hit_distance_sc",
+        "bb_type_sc": "bb_type",
+        "hc_x_sc": "hc_x",
+        "hc_y_sc": "hc_y",
+    }
+    merged = merged.rename(columns=rename_map)
+
+    # Remove any accidental duplicated columns by name, keep first
+    merged = merged.loc[:, ~merged.columns.duplicated()].copy()
 
     return merged
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Enrich season PA parquet with Statcast daily batter data.")
+    parser = argparse.ArgumentParser(description="Enrich season PA parquet with Statcast batter-day data.")
     parser.add_argument("--season", type=int, required=True)
     parser.add_argument("--config", type=str, default=CONFIG_PATH)
     parser.add_argument("--start-date", type=str, default=None)
@@ -213,7 +258,10 @@ def main() -> None:
     data_root = resolve_data_root(config)
     processed_dir = data_root / "processed"
     by_season_dir = processed_dir / "by_season"
+    debug_dir = processed_dir / "debug"
+
     ensure_dir(by_season_dir)
+    ensure_dir(debug_dir)
 
     pa_path = by_season_dir / f"pa_{args.season}.parquet"
     if not pa_path.exists():
@@ -233,7 +281,7 @@ def main() -> None:
     start_date = args.start_date or str(pd.Series(pa["game_date"]).dropna().min())
     end_date = args.end_date or str(pd.Series(pa["game_date"]).dropna().max())
 
-    sc_raw = fetch_statcast_daily(start_date, end_date)
+    sc_raw = fetch_statcast_raw(start_date, end_date)
     print(f"Raw Statcast rows: {len(sc_raw):,}")
 
     sc_daily = build_statcast_batter_daily(sc_raw)
@@ -241,7 +289,7 @@ def main() -> None:
 
     enriched = enrich_pa_with_statcast(pa, sc_daily)
 
-    for c in [
+    audit_cols = [
         "launch_speed",
         "launch_angle",
         "hit_distance_sc",
@@ -250,7 +298,8 @@ def main() -> None:
         "hc_y",
         "barrel_rate_sc",
         "hard_hit_rate_sc",
-    ]:
+    ]
+    for c in audit_cols:
         if c in enriched.columns:
             if str(enriched[c].dtype) == "string" or enriched[c].dtype == object:
                 pct = enriched[c].notna().mean() * 100.0
@@ -258,25 +307,23 @@ def main() -> None:
                 pct = pd.to_numeric(enriched[c], errors="coerce").notna().mean() * 100.0
             print(f"{c} non-null %: {pct:.2f}")
 
+    # Write full enriched PA
     enriched.to_parquet(pa_path, index=False)
     print(f"✅ Enriched PA written: {pa_path}")
 
     if args.write_debug:
-        debug_dir = processed_dir / "debug"
-        ensure_dir(debug_dir)
-
         raw_path = debug_dir / f"statcast_raw_{args.season}_{start_date}_{end_date}.parquet"
         daily_path = debug_dir / f"statcast_batter_daily_{args.season}_{start_date}_{end_date}.parquet"
-        enriched_path = debug_dir / f"pa_enriched_preview_{args.season}_{start_date}_{end_date}.parquet"
+        preview_path = debug_dir / f"pa_enriched_preview_{args.season}_{start_date}_{end_date}.parquet"
 
         sc_raw.to_parquet(raw_path, index=False)
         sc_daily.to_parquet(daily_path, index=False)
-        enriched.head(50000).to_parquet(enriched_path, index=False)
+        enriched.head(50000).to_parquet(preview_path, index=False)
 
         print(f"debug_statcast_raw={raw_path}")
         print(f"debug_statcast_batter_daily={daily_path}")
-        print(f"debug_pa_enriched_preview={enriched_path}")
+        print(f"debug_pa_enriched_preview={preview_path}")
 
 
 if __name__ == "__main__":
-    main() 
+    main()
