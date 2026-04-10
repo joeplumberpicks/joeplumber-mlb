@@ -39,113 +39,214 @@ def safe_rate(num: pd.Series, den: pd.Series) -> pd.Series:
     return (num / den).replace([np.inf, -np.inf], np.nan)
 
 
+def rolling_sum(shifted: pd.Series, group_key: pd.Series, window: int) -> pd.Series:
+    return (
+        shifted.groupby(group_key)
+        .rolling(window, min_periods=1)
+        .sum()
+        .reset_index(level=0, drop=True)
+    )
+
+
+def rolling_mean(shifted: pd.Series, group_key: pd.Series, window: int) -> pd.Series:
+    return (
+        shifted.groupby(group_key)
+        .rolling(window, min_periods=1)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
+
+
+def add_missing_numeric_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    df = df.copy()
+    for c in cols:
+        if c not in df.columns:
+            df[c] = np.nan
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
 def add_batter_rollings(df: pd.DataFrame) -> pd.DataFrame:
     batter_id_col = first_existing_col(df, ["batter_id", "batter"])
     date_col = first_existing_col(df, ["game_date"])
+
     df = df.copy()
-    df[date_col] = pd.to_datetime(df[date_col])
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df.sort_values([batter_id_col, date_col, "game_pk"]).reset_index(drop=True)
 
-    # Core numeric coercions
-    numeric_cols = [
-        "pa", "ab", "hits", "1b", "2b", "3b", "hr", "bb", "so",
-        "tb", "barrels", "hard_hit", "bip", "fb", "pull_air",
-        "avg_exit_velocity", "avg_launch_angle"
+    # ------------------------------------------------------------------
+    # Backward-compatible normalization of expected input columns
+    # ------------------------------------------------------------------
+    rename_map = {}
+    if "avg_exit_velocity" in df.columns and "avg_ev" not in df.columns:
+        rename_map["avg_exit_velocity"] = "avg_ev"
+    if "avg_launch_angle" in df.columns and "avg_la" not in df.columns:
+        rename_map["avg_launch_angle"] = "avg_la"
+    if "hardhit_rate" in df.columns and "hard_hit_rate" not in df.columns:
+        rename_map["hardhit_rate"] = "hard_hit_rate"
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    # ------------------------------------------------------------------
+    # Ensure required columns exist
+    # ------------------------------------------------------------------
+    required_numeric = [
+        "pa",
+        "hits",
+        "hr",
+        "rbi",
+        "tb",
+        "bb",
+        "so",
+        "barrels",
+        "barrel_rate",
+        "hardhit",
+        "hard_hit_rate",
+        "avg_ev",
+        "avg_la",
+        "iso",
+        "hr_per_pa",
+        "tb_per_pa",
+        "bb_rate",
+        "k_rate",
+        "fb_rate",
+        "pulled_air_rate",
     ]
-    for c in numeric_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = add_missing_numeric_cols(df, required_numeric)
 
-    df = df.sort_values([batter_id_col, date_col]).reset_index(drop=True)
+    # Optional old-style components if available
+    optional_old = ["ab", "1b", "2b", "3b", "bip", "fb", "pull_air", "hard_hit"]
+    df = add_missing_numeric_cols(df, optional_old)
 
-    # Derived columns
-    if "tb" not in df.columns:
-        df["tb"] = (
-            df.get("1b", 0).fillna(0)
-            + 2 * df.get("2b", 0).fillna(0)
-            + 3 * df.get("3b", 0).fillna(0)
-            + 4 * df.get("hr", 0).fillna(0)
-        )
+    # ------------------------------------------------------------------
+    # Fill in derivable fields if absent
+    # ------------------------------------------------------------------
+    if df["hard_hit_rate"].isna().all():
+        if "hard_hit" in df.columns and "bip" in df.columns and df["hard_hit"].notna().any():
+            df["hard_hit_rate"] = safe_rate(df["hard_hit"], df["bip"])
+        elif "hardhit" in df.columns:
+            df["hard_hit_rate"] = safe_rate(df["hardhit"], df["pa"])
 
-    if "hits" not in df.columns:
-        df["hits"] = (
-            df.get("1b", 0).fillna(0)
-            + df.get("2b", 0).fillna(0)
-            + df.get("3b", 0).fillna(0)
-            + df.get("hr", 0).fillna(0)
-        )
+    if df["barrel_rate"].isna().all() and "barrels" in df.columns:
+        df["barrel_rate"] = safe_rate(df["barrels"], df["pa"])
 
-    windows = [3, 7, 15, 30]
+    if df["hr_per_pa"].isna().all():
+        df["hr_per_pa"] = safe_rate(df["hr"], df["pa"])
+
+    if df["tb_per_pa"].isna().all():
+        df["tb_per_pa"] = safe_rate(df["tb"], df["pa"])
+
+    if df["bb_rate"].isna().all():
+        df["bb_rate"] = safe_rate(df["bb"], df["pa"])
+
+    if df["k_rate"].isna().all():
+        df["k_rate"] = safe_rate(df["so"], df["pa"])
+
+    if df["iso"].isna().all():
+        if "ab" in df.columns and df["ab"].notna().any():
+            singles = df["1b"] if "1b" in df.columns else 0
+            doubles = df["2b"] if "2b" in df.columns else 0
+            triples = df["3b"] if "3b" in df.columns else 0
+            extra_bases = pd.to_numeric(doubles, errors="coerce").fillna(0)
+            extra_bases += 2 * pd.to_numeric(triples, errors="coerce").fillna(0)
+            extra_bases += 3 * pd.to_numeric(df["hr"], errors="coerce").fillna(0)
+            df["iso"] = safe_rate(extra_bases, df["ab"])
+        else:
+            df["iso"] = safe_rate(df["tb"] - df["hits"], df["pa"])
+
+    if df["fb_rate"].isna().all() and "fb" in df.columns and "bip" in df.columns and df["fb"].notna().any():
+        df["fb_rate"] = safe_rate(df["fb"], df["bip"])
+
+    if df["pulled_air_rate"].isna().all() and "pull_air" in df.columns and "bip" in df.columns and df["pull_air"].notna().any():
+        df["pulled_air_rate"] = safe_rate(df["pull_air"], df["bip"])
+
+    # If avg_ev / avg_la are still absent, try old columns directly
+    if df["avg_ev"].isna().all() and "ev_mean" in df.columns:
+        df["avg_ev"] = pd.to_numeric(df["ev_mean"], errors="coerce")
+    if df["avg_la"].isna().all() and "la_mean" in df.columns:
+        df["avg_la"] = pd.to_numeric(df["la_mean"], errors="coerce")
 
     grouped = df.groupby(batter_id_col, sort=False)
+    windows = [3, 7, 15, 30]
 
-    # Shift(1) to avoid leakage
-    pa_s = grouped["pa"].shift(1) if "pa" in df.columns else pd.Series(np.nan, index=df.index)
-    ab_s = grouped["ab"].shift(1) if "ab" in df.columns else pd.Series(np.nan, index=df.index)
+    # ------------------------------------------------------------------
+    # Shifted event totals
+    # ------------------------------------------------------------------
+    pa_s = grouped["pa"].shift(1)
     hits_s = grouped["hits"].shift(1)
-    hr_s = grouped["hr"].shift(1) if "hr" in df.columns else pd.Series(np.nan, index=df.index)
+    hr_s = grouped["hr"].shift(1)
+    rbi_s = grouped["rbi"].shift(1)
     tb_s = grouped["tb"].shift(1)
-    bb_s = grouped["bb"].shift(1) if "bb" in df.columns else pd.Series(np.nan, index=df.index)
-    so_s = grouped["so"].shift(1) if "so" in df.columns else pd.Series(np.nan, index=df.index)
-    barrels_s = grouped["barrels"].shift(1) if "barrels" in df.columns else pd.Series(np.nan, index=df.index)
-    hard_hit_s = grouped["hard_hit"].shift(1) if "hard_hit" in df.columns else pd.Series(np.nan, index=df.index)
-    bip_s = grouped["bip"].shift(1) if "bip" in df.columns else pd.Series(np.nan, index=df.index)
-    fb_s = grouped["fb"].shift(1) if "fb" in df.columns else pd.Series(np.nan, index=df.index)
-    pull_air_s = grouped["pull_air"].shift(1) if "pull_air" in df.columns else pd.Series(np.nan, index=df.index)
-    ev_s = grouped["avg_exit_velocity"].shift(1) if "avg_exit_velocity" in df.columns else pd.Series(np.nan, index=df.index)
-    la_s = grouped["avg_launch_angle"].shift(1) if "avg_launch_angle" in df.columns else pd.Series(np.nan, index=df.index)
+    bb_s = grouped["bb"].shift(1)
+    so_s = grouped["so"].shift(1)
+
+    # ------------------------------------------------------------------
+    # Shifted game-level rates/means
+    # ------------------------------------------------------------------
+    barrel_rate_s = grouped["barrel_rate"].shift(1)
+    hard_hit_rate_s = grouped["hard_hit_rate"].shift(1)
+    avg_ev_s = grouped["avg_ev"].shift(1)
+    avg_la_s = grouped["avg_la"].shift(1)
+    iso_s = grouped["iso"].shift(1)
+    hr_per_pa_s = grouped["hr_per_pa"].shift(1)
+    tb_per_pa_s = grouped["tb_per_pa"].shift(1)
+    bb_rate_s = grouped["bb_rate"].shift(1)
+    k_rate_s = grouped["k_rate"].shift(1)
+    fb_rate_s = grouped["fb_rate"].shift(1)
+    pulled_air_rate_s = grouped["pulled_air_rate"].shift(1)
 
     for w in windows:
-        pa_roll = pa_s.groupby(df[batter_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-        ab_roll = ab_s.groupby(df[batter_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-        hits_roll = hits_s.groupby(df[batter_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-        hr_roll = hr_s.groupby(df[batter_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-        tb_roll = tb_s.groupby(df[batter_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-        bb_roll = bb_s.groupby(df[batter_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-        so_roll = so_s.groupby(df[batter_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-        barrels_roll = barrels_s.groupby(df[batter_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-        hard_hit_roll = hard_hit_s.groupby(df[batter_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-        bip_roll = bip_s.groupby(df[batter_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-        fb_roll = fb_s.groupby(df[batter_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-        pull_air_roll = pull_air_s.groupby(df[batter_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
+        # Volume rollups
+        hits_roll = rolling_sum(hits_s, df[batter_id_col], w)
+        hr_roll = rolling_sum(hr_s, df[batter_id_col], w)
+        rbi_roll = rolling_sum(rbi_s, df[batter_id_col], w)
+        tb_roll = rolling_sum(tb_s, df[batter_id_col], w)
+        bb_roll = rolling_sum(bb_s, df[batter_id_col], w)
+        so_roll = rolling_sum(so_s, df[batter_id_col], w)
 
-        ev_roll = ev_s.groupby(df[batter_id_col]).rolling(w, min_periods=1).mean().reset_index(level=0, drop=True)
-        la_roll = la_s.groupby(df[batter_id_col]).rolling(w, min_periods=1).mean().reset_index(level=0, drop=True)
+        # Rate/mean rollups
+        barrel_rate_roll = rolling_mean(barrel_rate_s, df[batter_id_col], w)
+        hard_hit_rate_roll = rolling_mean(hard_hit_rate_s, df[batter_id_col], w)
+        avg_ev_roll = rolling_mean(avg_ev_s, df[batter_id_col], w)
+        avg_la_roll = rolling_mean(avg_la_s, df[batter_id_col], w)
+        iso_roll = rolling_mean(iso_s, df[batter_id_col], w)
+        hr_per_pa_roll = rolling_mean(hr_per_pa_s, df[batter_id_col], w)
+        tb_per_pa_roll = rolling_mean(tb_per_pa_s, df[batter_id_col], w)
+        bb_rate_roll = rolling_mean(bb_rate_s, df[batter_id_col], w)
+        k_rate_roll = rolling_mean(k_rate_s, df[batter_id_col], w)
+        fb_rate_roll = rolling_mean(fb_rate_s, df[batter_id_col], w)
+        pulled_air_rate_roll = rolling_mean(pulled_air_rate_s, df[batter_id_col], w)
+
+        # Legacy batting average if AB exists, otherwise use hit/pa proxy
+        if "ab" in df.columns and df["ab"].notna().any():
+            ab_s = grouped["ab"].shift(1)
+            ab_roll = rolling_sum(ab_s, df[batter_id_col], w)
+            ba_roll = safe_rate(hits_roll, ab_roll)
+        else:
+            pa_roll = rolling_sum(pa_s, df[batter_id_col], w)
+            ba_roll = safe_rate(hits_roll, pa_roll)
 
         df[f"bat_hits_roll{w}"] = hits_roll
         df[f"bat_hr_roll{w}"] = hr_roll
+        df[f"bat_rbi_roll{w}"] = rbi_roll
         df[f"bat_tb_roll{w}"] = tb_roll
         df[f"bat_bb_roll{w}"] = bb_roll
         df[f"bat_so_roll{w}"] = so_roll
 
-        df[f"bat_ba_roll{w}"] = safe_rate(hits_roll, ab_roll)
-        df[f"bat_hr_per_pa_roll{w}"] = safe_rate(hr_roll, pa_roll)
-        df[f"bat_tb_per_pa_roll{w}"] = safe_rate(tb_roll, pa_roll)
-        df[f"bat_bb_rate_roll{w}"] = safe_rate(bb_roll, pa_roll)
-        df[f"bat_k_rate_roll{w}"] = safe_rate(so_roll, pa_roll)
+        df[f"bat_ba_roll{w}"] = ba_roll
+        df[f"bat_hr_per_pa_roll{w}"] = hr_per_pa_roll
+        df[f"bat_tb_per_pa_roll{w}"] = tb_per_pa_roll
+        df[f"bat_bb_rate_roll{w}"] = bb_rate_roll
+        df[f"bat_k_rate_roll{w}"] = k_rate_roll
 
-        df[f"bat_barrel_rate_roll{w}"] = safe_rate(barrels_roll, bip_roll)
-        df[f"bat_hard_hit_rate_roll{w}"] = safe_rate(hard_hit_roll, bip_roll)
-        df[f"bat_fb_rate_roll{w}"] = safe_rate(fb_roll, bip_roll)
-        df[f"bat_pulled_air_rate_roll{w}"] = safe_rate(pull_air_roll, bip_roll)
+        df[f"bat_barrel_rate_roll{w}"] = barrel_rate_roll
+        df[f"bat_hard_hit_rate_roll{w}"] = hard_hit_rate_roll
+        df[f"bat_fb_rate_roll{w}"] = fb_rate_roll
+        df[f"bat_pulled_air_rate_roll{w}"] = pulled_air_rate_roll
 
-        df[f"bat_avg_ev_roll{w}"] = ev_roll
-        df[f"bat_avg_la_roll{w}"] = la_roll
-
-        # ISO proxy
-        singles_roll = (
-            grouped["1b"].shift(1).groupby(df[batter_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-            if "1b" in df.columns else 0
-        )
-        doubles_roll = (
-            grouped["2b"].shift(1).groupby(df[batter_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-            if "2b" in df.columns else 0
-        )
-        triples_roll = (
-            grouped["3b"].shift(1).groupby(df[batter_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-            if "3b" in df.columns else 0
-        )
-        extra_bases = doubles_roll + 2 * triples_roll + 3 * hr_roll
-        df[f"bat_iso_roll{w}"] = safe_rate(extra_bases, ab_roll)
+        df[f"bat_avg_ev_roll{w}"] = avg_ev_roll
+        df[f"bat_avg_la_roll{w}"] = avg_la_roll
+        df[f"bat_iso_roll{w}"] = iso_roll
 
     return df
 
@@ -153,46 +254,63 @@ def add_batter_rollings(df: pd.DataFrame) -> pd.DataFrame:
 def add_pitcher_rollings(df: pd.DataFrame) -> pd.DataFrame:
     pitcher_id_col = first_existing_col(df, ["pitcher_id", "pitcher"])
     date_col = first_existing_col(df, ["game_date"])
+
     df = df.copy()
-    df[date_col] = pd.to_datetime(df[date_col])
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df.sort_values([pitcher_id_col, date_col, "game_pk"]).reset_index(drop=True)
 
-    numeric_cols = [
-        "batters_faced", "ip_outs", "hits_allowed", "hr_allowed", "bb_allowed", "so",
-        "barrels_allowed", "hard_hit_allowed", "bip_allowed"
+    required_numeric = [
+        "batters_faced",
+        "bb_allowed",
+        "so",
+        "hr_allowed",
+        "barrels_allowed",
+        "hardhit_allowed",
+        "barrel_rate",
+        "hard_hit_rate",
+        "bb_rate",
+        "k_rate",
+        "hr_per_bf",
+        "hr9",
     ]
-    for c in numeric_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = add_missing_numeric_cols(df, required_numeric)
 
-    df = df.sort_values([pitcher_id_col, date_col]).reset_index(drop=True)
+    if df["bb_rate"].isna().all():
+        df["bb_rate"] = safe_rate(df["bb_allowed"], df["batters_faced"])
+    if df["k_rate"].isna().all():
+        df["k_rate"] = safe_rate(df["so"], df["batters_faced"])
+    if df["barrel_rate"].isna().all():
+        df["barrel_rate"] = safe_rate(df["barrels_allowed"], df["batters_faced"])
+    if df["hard_hit_rate"].isna().all():
+        df["hard_hit_rate"] = safe_rate(df["hardhit_allowed"], df["batters_faced"])
+    if df["hr_per_bf"].isna().all():
+        df["hr_per_bf"] = safe_rate(df["hr_allowed"], df["batters_faced"])
+    if df["hr9"].isna().all():
+        df["hr9"] = df["hr_per_bf"] * 27.0
+
     grouped = df.groupby(pitcher_id_col, sort=False)
-
-    bf_s = grouped["batters_faced"].shift(1) if "batters_faced" in df.columns else pd.Series(np.nan, index=df.index)
-    hr_s = grouped["hr_allowed"].shift(1) if "hr_allowed" in df.columns else pd.Series(np.nan, index=df.index)
-    bb_s = grouped["bb_allowed"].shift(1) if "bb_allowed" in df.columns else pd.Series(np.nan, index=df.index)
-    so_s = grouped["so"].shift(1) if "so" in df.columns else pd.Series(np.nan, index=df.index)
-    barrels_s = grouped["barrels_allowed"].shift(1) if "barrels_allowed" in df.columns else pd.Series(np.nan, index=df.index)
-    hard_hit_s = grouped["hard_hit_allowed"].shift(1) if "hard_hit_allowed" in df.columns else pd.Series(np.nan, index=df.index)
-    bip_s = grouped["bip_allowed"].shift(1) if "bip_allowed" in df.columns else pd.Series(np.nan, index=df.index)
-
     windows = [3, 7, 15, 30]
-    for w in windows:
-        bf_roll = bf_s.groupby(df[pitcher_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-        hr_roll = hr_s.groupby(df[pitcher_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-        bb_roll = bb_s.groupby(df[pitcher_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-        so_roll = so_s.groupby(df[pitcher_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-        barrels_roll = barrels_s.groupby(df[pitcher_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-        hard_hit_roll = hard_hit_s.groupby(df[pitcher_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
-        bip_roll = bip_s.groupby(df[pitcher_id_col]).rolling(w, min_periods=1).sum().reset_index(level=0, drop=True)
 
-        df[f"pit_hr_allowed_roll{w}"] = hr_roll
-        df[f"pit_bb_allowed_roll{w}"] = bb_roll
-        df[f"pit_so_roll{w}"] = so_roll
-        df[f"pit_hr9_roll{w}"] = safe_rate(hr_roll * 27.0, bf_roll)
-        df[f"pit_bb_rate_roll{w}"] = safe_rate(bb_roll, bf_roll)
-        df[f"pit_k_rate_roll{w}"] = safe_rate(so_roll, bf_roll)
-        df[f"pit_barrel_rate_roll{w}"] = safe_rate(barrels_roll, bip_roll)
-        df[f"pit_hard_hit_rate_roll{w}"] = safe_rate(hard_hit_roll, bip_roll)
+    hr_allowed_s = grouped["hr_allowed"].shift(1)
+    bb_allowed_s = grouped["bb_allowed"].shift(1)
+    so_s = grouped["so"].shift(1)
+
+    hr9_s = grouped["hr9"].shift(1)
+    bb_rate_s = grouped["bb_rate"].shift(1)
+    k_rate_s = grouped["k_rate"].shift(1)
+    barrel_rate_s = grouped["barrel_rate"].shift(1)
+    hard_hit_rate_s = grouped["hard_hit_rate"].shift(1)
+
+    for w in windows:
+        df[f"pit_hr_allowed_roll{w}"] = rolling_sum(hr_allowed_s, df[pitcher_id_col], w)
+        df[f"pit_bb_allowed_roll{w}"] = rolling_sum(bb_allowed_s, df[pitcher_id_col], w)
+        df[f"pit_so_roll{w}"] = rolling_sum(so_s, df[pitcher_id_col], w)
+
+        df[f"pit_hr9_roll{w}"] = rolling_mean(hr9_s, df[pitcher_id_col], w)
+        df[f"pit_bb_rate_roll{w}"] = rolling_mean(bb_rate_s, df[pitcher_id_col], w)
+        df[f"pit_k_rate_roll{w}"] = rolling_mean(k_rate_s, df[pitcher_id_col], w)
+        df[f"pit_barrel_rate_roll{w}"] = rolling_mean(barrel_rate_s, df[pitcher_id_col], w)
+        df[f"pit_hard_hit_rate_roll{w}"] = rolling_mean(hard_hit_rate_s, df[pitcher_id_col], w)
 
     return df
 
@@ -202,7 +320,6 @@ def main() -> None:
     data_root = resolve_data_root(config)
     processed_dir = data_root / "processed"
 
-    # Make absolutely sure destination exists
     ensure_dir(processed_dir)
 
     batter_in = processed_dir / "batter_game_statcast.parquet"
@@ -227,7 +344,6 @@ def main() -> None:
     bat_out = processed_dir / "batter_statcast_rolling.parquet"
     pit_out = processed_dir / "pitcher_statcast_rolling.parquet"
 
-    # Safety again, in case of odd runtime state
     ensure_dir(bat_out.parent)
     ensure_dir(pit_out.parent)
 
