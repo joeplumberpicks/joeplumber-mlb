@@ -62,7 +62,9 @@ def build_batter_game_table(pa_df: pd.DataFrame) -> pd.DataFrame:
     batter_name_col = pick_col(pa_df, ["batter_name", "player_name"], required=False)
     team_col = pick_col(pa_df, ["batting_team", "team", "batter_team", "offense_team"], required=False)
 
-    launch_speed_col = pick_col(pa_df, ["launch_speed", "launch_speed_angle", "hit_speed"], required=False)
+    # IMPORTANT:
+    # Do NOT use launch_speed_angle as EV. It is not exit velocity.
+    launch_speed_col = pick_col(pa_df, ["launch_speed", "hit_speed"], required=False)
     launch_angle_col = pick_col(pa_df, ["launch_angle", "hit_angle"], required=False)
 
     is_hit_col = pick_col(pa_df, ["is_hit"], required=False)
@@ -126,12 +128,34 @@ def build_batter_game_table(pa_df: pd.DataFrame) -> pd.DataFrame:
         df["_launch_angle_null"] = np.nan
         launch_angle_col = "_launch_angle_null"
 
-    df["_barrel_event"] = (
-        df[launch_speed_col].ge(98)
-        & df[launch_angle_col].between(26, 30, inclusive="both")
+    # Tracked batted-ball contact
+    df["_tracked_contact"] = (
+        df[launch_speed_col].notna() &
+        df[launch_angle_col].notna()
     ).astype(int)
 
-    df["_hard_hit_event"] = df[launch_speed_col].ge(95).astype(int)
+    # Barrel proxy
+    df["_barrel_event"] = (
+        df["_tracked_contact"].eq(1) &
+        df[launch_speed_col].ge(98) &
+        df[launch_angle_col].between(26, 30, inclusive="both")
+    ).astype(int)
+
+    # Hard-hit proxy
+    df["_hard_hit_event"] = (
+        df["_tracked_contact"].eq(1) &
+        df[launch_speed_col].ge(95)
+    ).astype(int)
+
+    # Fly-ball proxy
+    df["_flyball_event"] = (
+        df["_tracked_contact"].eq(1) &
+        df[launch_angle_col].between(10, 50, inclusive="both")
+    ).astype(int)
+
+    # Pulled-air placeholder
+    # Without spray-angle / direction data, we cannot do true pulled_air here.
+    df["_pulled_air_event"] = np.nan
 
     df["_total_bases"] = (
         pd.to_numeric(df[is_1b_col], errors="coerce").fillna(0) * 1
@@ -154,11 +178,13 @@ def build_batter_game_table(pa_df: pd.DataFrame) -> pd.DataFrame:
             hr=(is_hr_col, "sum"),
             rbi=(is_rbi_col, "sum"),
             tb=("_total_bases", "sum"),
+            tracked_bbe=("_tracked_contact", "sum"),
             ev_mean=(launch_speed_col, "mean"),
             ev_max=(launch_speed_col, "max"),
             la_mean=(launch_angle_col, "mean"),
             barrels=("_barrel_event", "sum"),
             hardhit=("_hard_hit_event", "sum"),
+            flyballs=("_flyball_event", "sum"),
             bb=(is_bb_col, "sum"),
             so=(is_so_col, "sum"),
         )
@@ -184,23 +210,20 @@ def build_batter_game_table(pa_df: pd.DataFrame) -> pd.DataFrame:
 
     grouped["team"] = normalize_team_abbr(grouped["team"])
 
-    grouped["barrel_rate"] = safe_div(grouped["barrels"], grouped["pa"])
-    grouped["hardhit_rate"] = safe_div(grouped["hardhit"], grouped["pa"])
+    # Core rates
+    grouped["barrel_rate"] = safe_div(grouped["barrels"], grouped["tracked_bbe"])
+    grouped["hardhit_rate"] = safe_div(grouped["hardhit"], grouped["tracked_bbe"])
     grouped["k_rate"] = safe_div(grouped["so"], grouped["pa"])
     grouped["bb_rate"] = safe_div(grouped["bb"], grouped["pa"])
 
-    # ------------------------------------------------------------------
-    # NORMALIZED COLUMNS REQUIRED BY ROLLING + LIVE PROP BUILDERS
-    # ------------------------------------------------------------------
+    # Normalized columns required downstream
     grouped["avg_ev"] = grouped["ev_mean"]
     grouped["avg_la"] = grouped["la_mean"]
     grouped["hard_hit_rate"] = grouped["hardhit_rate"]
     grouped["iso"] = safe_div(grouped["tb"] - grouped["hits"], grouped["pa"])
     grouped["hr_per_pa"] = safe_div(grouped["hr"], grouped["pa"])
     grouped["tb_per_pa"] = safe_div(grouped["tb"], grouped["pa"])
-
-    # placeholders until richer event build exists
-    grouped["fb_rate"] = np.nan
+    grouped["fb_rate"] = safe_div(grouped["flyballs"], grouped["tracked_bbe"])
     grouped["pulled_air_rate"] = np.nan
 
     ordered_cols = [
@@ -214,11 +237,13 @@ def build_batter_game_table(pa_df: pd.DataFrame) -> pd.DataFrame:
         "hr",
         "rbi",
         "tb",
+        "tracked_bbe",
         "ev_mean",
         "ev_max",
         "la_mean",
         "barrels",
         "hardhit",
+        "flyballs",
         "bb",
         "so",
         "barrel_rate",
@@ -254,7 +279,8 @@ def build_pitcher_game_table(pa_df: pd.DataFrame) -> pd.DataFrame:
     is_bb_col = pick_col(pa_df, ["is_bb"], required=False)
     is_so_col = pick_col(pa_df, ["is_so"], required=False)
     is_hr_col = pick_col(pa_df, ["is_hr"], required=False)
-    launch_speed_col = pick_col(pa_df, ["launch_speed", "launch_speed_angle", "hit_speed"], required=False)
+
+    launch_speed_col = pick_col(pa_df, ["launch_speed", "hit_speed"], required=False)
     launch_angle_col = pick_col(pa_df, ["launch_angle", "hit_angle"], required=False)
 
     df = pa_df.copy()
@@ -285,11 +311,21 @@ def build_pitcher_game_table(pa_df: pd.DataFrame) -> pd.DataFrame:
         df["_launch_angle_null"] = np.nan
         launch_angle_col = "_launch_angle_null"
 
-    df["_barrel_event"] = (
-        df[launch_speed_col].ge(98)
-        & df[launch_angle_col].between(26, 30, inclusive="both")
+    df["_tracked_contact"] = (
+        df[launch_speed_col].notna() &
+        df[launch_angle_col].notna()
     ).astype(int)
-    df["_hard_hit_event"] = df[launch_speed_col].ge(95).astype(int)
+
+    df["_barrel_event"] = (
+        df["_tracked_contact"].eq(1) &
+        df[launch_speed_col].ge(98) &
+        df[launch_angle_col].between(26, 30, inclusive="both")
+    ).astype(int)
+
+    df["_hard_hit_event"] = (
+        df["_tracked_contact"].eq(1) &
+        df[launch_speed_col].ge(95)
+    ).astype(int)
 
     group_cols = [game_pk_col, game_date_col, pitcher_id_col]
     if pitcher_name_col:
@@ -301,6 +337,7 @@ def build_pitcher_game_table(pa_df: pd.DataFrame) -> pd.DataFrame:
         df.groupby(group_cols, dropna=False)
         .agg(
             batters_faced=(pitcher_id_col, "size"),
+            tracked_bbe=("_tracked_contact", "sum"),
             bb_allowed=(is_bb_col, "sum"),
             so=(is_so_col, "sum"),
             hr_allowed=(is_hr_col, "sum"),
@@ -331,8 +368,8 @@ def build_pitcher_game_table(pa_df: pd.DataFrame) -> pd.DataFrame:
 
     grouped["bb_rate"] = safe_div(grouped["bb_allowed"], grouped["batters_faced"])
     grouped["k_rate"] = safe_div(grouped["so"], grouped["batters_faced"])
-    grouped["barrel_rate"] = safe_div(grouped["barrels_allowed"], grouped["batters_faced"])
-    grouped["hard_hit_rate"] = safe_div(grouped["hardhit_allowed"], grouped["batters_faced"])
+    grouped["barrel_rate"] = safe_div(grouped["barrels_allowed"], grouped["tracked_bbe"])
+    grouped["hard_hit_rate"] = safe_div(grouped["hardhit_allowed"], grouped["tracked_bbe"])
     grouped["hr_per_bf"] = safe_div(grouped["hr_allowed"], grouped["batters_faced"])
     grouped["hr9"] = grouped["hr_per_bf"] * 27.0
 
