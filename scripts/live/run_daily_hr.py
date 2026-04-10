@@ -64,7 +64,7 @@ def fill_with_median(series: pd.Series, fallback: float = 0.0) -> pd.Series:
 
 
 def logistic(x: pd.Series | np.ndarray) -> pd.Series:
-    x = pd.Series(x)
+    x = pd.Series(x, dtype=float)
     return 1.0 / (1.0 + np.exp(-x.clip(-20, 20)))
 
 
@@ -79,6 +79,42 @@ def slate_zscore(s: pd.Series) -> pd.Series:
 
 def series_null_pct(s: pd.Series) -> float:
     return float(pd.to_numeric(s, errors="coerce").isna().mean()) * 100.0
+
+
+def clamp_prob_by_rank(p: pd.Series, rank_index: pd.Index) -> pd.Series:
+    """
+    Soft cap probability shape so top ranks do not all plateau.
+    rank_index is 0-based after sorting descending.
+    """
+    p = pd.Series(p, index=rank_index, dtype=float).copy()
+
+    # soft descending caps by rank bucket
+    caps = []
+    for i in rank_index:
+        r = int(i) + 1
+        if r <= 3:
+            caps.append(0.24)
+        elif r <= 5:
+            caps.append(0.21)
+        elif r <= 10:
+            caps.append(0.18)
+        elif r <= 15:
+            caps.append(0.15)
+        elif r <= 25:
+            caps.append(0.12)
+        else:
+            caps.append(0.10)
+    caps = pd.Series(caps, index=rank_index, dtype=float)
+
+    p = p.clip(lower=0.03)
+    p = np.minimum(p, caps)
+
+    # enforce slight monotone decay after sort
+    vals = p.values.astype(float)
+    for i in range(1, len(vals)):
+        vals[i] = min(vals[i], vals[i - 1] - 0.0005 if vals[i - 1] > 0.031 else vals[i])
+        vals[i] = max(vals[i], 0.03)
+    return pd.Series(vals, index=rank_index)
 
 
 def main() -> None:
@@ -109,14 +145,14 @@ def main() -> None:
     if df.empty:
         raise ValueError("HR features file is empty.")
 
-    game_date_col = pick_col(df, ["game_date"], required=False)
+    game_date_col = pick_col(df, ["game_date"])
     team_col = pick_col(df, ["team"], required=True)
-    opp_col = pick_col(df, ["opponent"], required=False)
+    opp_col = pick_col(df, ["opponent"])
     player_col = pick_col(df, ["player_name"], required=True)
 
-    # -------------------------
-    # SMART FALLBACK FEATURE MAP
-    # -------------------------
+    # ------------------------------------------------------------------
+    # FEATURE MAP
+    # ------------------------------------------------------------------
     barrel_rate = first_non_null_numeric(df, [
         "bat_barrel_rate_roll30",
         "bat_barrel_rate_roll15",
@@ -225,24 +261,38 @@ def main() -> None:
     print(f"la: null_pct={series_null_pct(la):.2f}%")
     print(f"lineup_spot: null_pct={series_null_pct(lineup_spot):.2f}%")
 
-    # -------------------------
-    # SOFT PROXY REPAIR
-    # -------------------------
-    # Do not hard fail. Repair sparse early-season live slates.
-    if barrel_rate.isna().all():
-        barrel_rate = (tb_per_pa.fillna(np.nan) * 0.18) + ((ev - 88.0).clip(lower=0) * 0.0025)
-    if iso.isna().all():
-        iso = (tb_per_pa.fillna(np.nan) * 0.60) + (flyball.fillna(np.nan) * 0.08)
-    if hard_hit_rate.isna().all():
+    # ------------------------------------------------------------------
+    # SOFT REPAIRS FOR SPARSE EARLY-SEASON DATA
+    # ------------------------------------------------------------------
+    if hard_hit_rate.isna().all() and ev.notna().any():
         hard_hit_rate = ((ev - 80.0) / 25.0).clip(lower=0.20, upper=0.65)
-    if hr_per_pa.isna().all():
-        hr_per_pa = (
-            barrel_rate.fillna(np.nan) * 0.22 +
-            iso.fillna(np.nan) * 0.06 +
-            flyball.fillna(np.nan) * 0.01
+
+    if barrel_rate.isna().all():
+        barrel_rate = (
+            tb_per_pa.fillna(np.nan) * 0.12
+            + ((ev - 88.0).clip(lower=0) * 0.0020)
+            + ((la - 12.0).clip(lower=0) * 0.0010)
         )
 
-    # fill remaining nulls
+    if iso.isna().all():
+        iso = (
+            tb_per_pa.fillna(np.nan) * 0.58
+            + flyball.fillna(np.nan) * 0.05
+            + pulled_air.fillna(np.nan) * 0.04
+        )
+
+    if hr_per_pa.isna().all():
+        hr_per_pa = (
+            barrel_rate.fillna(np.nan) * 0.18
+            + iso.fillna(np.nan) * 0.05
+            + flyball.fillna(np.nan) * 0.01
+        )
+
+    if ev.isna().all():
+        ev = pd.Series(np.nan, index=df.index, dtype=float)
+    if la.isna().all():
+        la = pd.Series(np.nan, index=df.index, dtype=float)
+
     barrel_rate = fill_with_median(barrel_rate, 0.055)
     iso = fill_with_median(iso, 0.155)
     hr_per_pa = fill_with_median(hr_per_pa, 0.025)
@@ -264,42 +314,52 @@ def main() -> None:
     lineup_weight = fill_with_median(lineup_weight, 1.0)
     base_score = pd.to_numeric(base_score, errors="coerce").fillna(0.0)
 
-    # -------------------------
-    # HR SCORING
-    # -------------------------
-    power_flag = (
+    # ------------------------------------------------------------------
+    # HARD / SOFT POWER FILTERS
+    # ------------------------------------------------------------------
+    hard_power_flag = (
+        (barrel_rate >= 0.08) |
+        (iso >= 0.180) |
+        (hr_per_pa >= 0.040)
+    ).astype(int)
+
+    soft_power_flag = (
         (barrel_rate >= 0.055) |
         (iso >= 0.150) |
         (hr_per_pa >= 0.022)
     ).astype(int)
 
-    power_penalty = np.where(power_flag == 0, 0.92, 1.00)
+    # Do not wipe out the pool, but penalize weak profiles
+    score_penalty = (
+        (soft_power_flag == 0).astype(float) * 0.16
+        + (hard_power_flag == 0).astype(float) * 0.08
+    )
 
     hr_power_score = (
-        barrel_rate * 0.46 +
+        barrel_rate * 0.40 +
         iso * 0.30 +
-        hard_hit_rate * 0.24
+        hard_hit_rate * 0.30
     )
 
     hitter_shape = (
-        barrel_rate * 1.90 +
-        iso * 1.30 +
-        hr_per_pa * 1.75 +
-        hard_hit_rate * 0.72 +
-        flyball * 0.42 +
+        barrel_rate * 2.20 +
+        iso * 1.55 +
+        hr_per_pa * 1.95 +
+        hard_hit_rate * 0.85 +
+        flyball * 0.40 +
         pulled_air * 0.34
     )
 
     contact_quality = (
-        (ev - 88.0) * 0.020 +
+        (ev - 88.0) * 0.022 +
         (la - 12.0).clip(-10, 18) * 0.010
     )
 
     matchup = (
-        pitcher_hr9 * 0.28 +
+        pitcher_hr9 * 0.30 +
         pitcher_hard_hit * 0.42 +
-        pitcher_barrel * 0.58 +
-        pitcher_bb * 0.06
+        pitcher_barrel * 0.60 +
+        pitcher_bb * 0.05
     )
 
     environment = (
@@ -307,49 +367,54 @@ def main() -> None:
         wind_out * 0.09
     )
 
-    score = base_score * 0.18
+    score = base_score * 0.16
     score += hitter_shape
     score += contact_quality
     score += matchup
     score += environment
-    score += hr_power_score * 1.10
-    score *= power_penalty
+    score += hr_power_score * 1.35
+    score -= score_penalty
 
-    # lineup adjustments
-    score = np.where(lineup_spot <= 2, score * 1.02, score)
+    # lineup penalty / boost
+    score = np.where(lineup_spot <= 2, score * 1.01, score)
     score = np.where(lineup_spot == 3, score * 1.05, score)
     score = np.where(lineup_spot == 4, score * 1.07, score)
     score = np.where(lineup_spot == 5, score * 1.03, score)
-    score = np.where(lineup_spot >= 7, score * 0.92, score)
-    score = np.where(lineup_spot >= 8, score * 0.84, score)
-    score = np.where(lineup_spot >= 9, score * 0.76, score)
+    score = np.where(lineup_spot >= 7, score * 0.75, score)
+    score = np.where(lineup_spot >= 8, score * 0.60, score)
 
     score *= lineup_weight.clip(lower=0.80, upper=1.15)
 
+    # additional weak-power penalty
     weak_power_penalty = (
-        (barrel_rate < 0.050).astype(float) * 0.08 +
-        (iso < 0.140).astype(float) * 0.06 +
-        (hard_hit_rate < 0.34).astype(float) * 0.05
+        (barrel_rate < 0.050).astype(float) * 0.10 +
+        (iso < 0.140).astype(float) * 0.08 +
+        (hard_hit_rate < 0.34).astype(float) * 0.06
     )
-    score = score - weak_power_penalty
+    score -= weak_power_penalty
 
+    # elite separation
     elite_boost = (
         (barrel_rate >= 0.12).astype(float) * 0.18 +
-        (iso >= 0.25).astype(float) * 0.14 +
+        (iso >= 0.25).astype(float) * 0.16 +
         (hr_per_pa >= 0.050).astype(float) * 0.14
     )
-    score = score + elite_boost
+    score += elite_boost
 
     df["hr_score_raw"] = pd.to_numeric(score, errors="coerce").fillna(0.0)
     df["z_score"] = slate_zscore(df["hr_score_raw"])
 
-    # Separate ranking from probability mapping
-    # Less compressed and less broken than before
-    df["p_hr"] = logistic(-2.05 + (df["z_score"] * 0.95))
+    # ------------------------------------------------------------------
+    # PROBABILITY CALIBRATION
+    # ------------------------------------------------------------------
+    # Use softer mapping so ranking survives but probability isn't inflated
+    raw_p = logistic(-2.25 + (df["z_score"] * 0.82))
+    df["p_hr_raw"] = raw_p
 
+    # confidence widening
     df["confidence"] = pd.cut(
         df["z_score"],
-        bins=[-10, -1.0, -0.20, 0.45, 1.10, 1.80, 10],
+        bins=[-10, -1.0, 0.0, 1.0, 1.8, 2.5, 10],
         labels=["F", "D", "C", "B", "A", "A+"],
         include_lowest=True,
     ).astype(str)
@@ -371,14 +436,19 @@ def main() -> None:
         "opponent": coalesce_text(df, [opp_col] if opp_col else [], default=""),
         "player_name": coalesce_text(df, [player_col]),
         "hr_score_raw": df["hr_score_raw"],
-        "p_hr": df["p_hr"],
+        "z_score": df["z_score"],
+        "p_hr_raw": df["p_hr_raw"],
         "confidence": df["confidence"],
         "sort_score": df["sort_score"],
     })
 
-    board = board.sort_values(["sort_score", "p_hr"], ascending=[False, False]).reset_index(drop=True)
+    board = board.sort_values(["sort_score", "p_hr_raw"], ascending=[False, False]).reset_index(drop=True)
+
+    # apply probability shape after ranking
+    board["p_hr"] = clamp_prob_by_rank(board["p_hr_raw"], board.index)
+
     board.insert(0, "rank", np.arange(1, len(board) + 1))
-    board = board.drop(columns=["sort_score"])
+    board = board.drop(columns=["sort_score", "p_hr_raw", "z_score"])
     board_top = board.head(25).copy()
 
     board_top.to_csv(out_csv, index=False)
