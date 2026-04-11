@@ -87,8 +87,7 @@ def _first_numeric(df: pd.DataFrame, candidates: list[str], default: float = np.
     for c in candidates:
         if c in df.columns:
             found = True
-            s = pd.to_numeric(df[c], errors="coerce")
-            out = out.combine_first(s)
+            out = out.combine_first(pd.to_numeric(df[c], errors="coerce"))
     if not found:
         out = pd.Series(default, index=df.index, dtype="float64")
     if not np.isnan(default):
@@ -106,22 +105,41 @@ def _latest_batter_rollings(lineups: pd.DataFrame, batter_roll: pd.DataFrame) ->
     lu_batter_id = _pick_col(lu, ["batter_id", "player_id"], required=True)
     br_batter_id = _pick_col(br, ["batter_id", "player_id"], required=True)
 
+    lu[lu_batter_id] = lu[lu_batter_id].astype("string")
+    br[br_batter_id] = br[br_batter_id].astype("string")
+
     br_cols = [c for c in br.columns if c.startswith("bat_")]
     br_small = br[[br_batter_id, "game_date", *br_cols]].copy()
 
-    lu = lu.sort_values([lu_batter_id, "game_date"]).reset_index(drop=True)
-    br_small = br_small.sort_values([br_batter_id, "game_date"]).reset_index(drop=True)
+    lu = lu[lu["game_date"].notna() & lu[lu_batter_id].notna()].copy()
+    br_small = br_small[br_small["game_date"].notna() & br_small[br_batter_id].notna()].copy()
 
-    merged = pd.merge_asof(
-        lu,
-        br_small,
-        left_on="game_date",
-        right_on="game_date",
-        left_by=lu_batter_id,
-        right_by=br_batter_id,
-        direction="backward",
-        allow_exact_matches=False,
-    )
+    lu = lu.sort_values([lu_batter_id, "game_date"], kind="mergesort").reset_index(drop=True)
+    br_small = br_small.sort_values([br_batter_id, "game_date"], kind="mergesort").reset_index(drop=True)
+
+    merged_parts = []
+    for batter_id, lu_grp in lu.groupby(lu_batter_id, sort=False):
+        br_grp = br_small[br_small[br_batter_id] == batter_id].copy()
+        if br_grp.empty:
+            lu_grp = lu_grp.copy()
+            for c in br_cols:
+                lu_grp[c] = np.nan
+            merged_parts.append(lu_grp)
+            continue
+
+        lu_grp = lu_grp.sort_values("game_date", kind="mergesort").reset_index(drop=True)
+        br_grp = br_grp.sort_values("game_date", kind="mergesort").reset_index(drop=True)
+
+        mg = pd.merge_asof(
+            lu_grp,
+            br_grp,
+            on="game_date",
+            direction="backward",
+            allow_exact_matches=False,
+        )
+        merged_parts.append(mg)
+
+    merged = pd.concat(merged_parts, ignore_index=True)
 
     if br_batter_id in merged.columns and br_batter_id != lu_batter_id:
         merged = merged.drop(columns=[br_batter_id])
@@ -137,29 +155,49 @@ def _latest_pitcher_rollings(df: pd.DataFrame, pitcher_roll: pd.DataFrame) -> pd
     pr["game_date"] = pd.to_datetime(pr["game_date"], errors="coerce")
 
     pr_pitcher_id = _pick_col(pr, ["pitcher_id"], required=True)
+
+    out["opp_pitcher_id"] = out["opp_pitcher_id"].astype("string")
+    pr[pr_pitcher_id] = pr[pr_pitcher_id].astype("string")
+
     pr_cols = [c for c in pr.columns if c.startswith("pit_")]
     pr_small = pr[[pr_pitcher_id, "game_date", *pr_cols]].copy()
 
-    out = out.sort_values(["opp_pitcher_id", "game_date"]).reset_index(drop=True)
-    pr_small = pr_small.sort_values([pr_pitcher_id, "game_date"]).reset_index(drop=True)
+    out = out[out["game_date"].notna() & out["opp_pitcher_id"].notna()].copy()
+    pr_small = pr_small[pr_small["game_date"].notna() & pr_small[pr_pitcher_id].notna()].copy()
 
-    merged = pd.merge_asof(
-        out,
-        pr_small,
-        left_on="game_date",
-        right_on="game_date",
-        left_by="opp_pitcher_id",
-        right_by=pr_pitcher_id,
-        direction="backward",
-        allow_exact_matches=False,
-    )
+    out = out.sort_values(["opp_pitcher_id", "game_date"], kind="mergesort").reset_index(drop=True)
+    pr_small = pr_small.sort_values([pr_pitcher_id, "game_date"], kind="mergesort").reset_index(drop=True)
 
-    rename_map = {c: f"opp_{c}" for c in pr_cols}
-    merged = merged.rename(columns=rename_map)
+    merged_parts = []
+    for pitcher_id, out_grp in out.groupby("opp_pitcher_id", sort=False):
+        pr_grp = pr_small[pr_small[pr_pitcher_id] == pitcher_id].copy()
+        if pr_grp.empty:
+            out_grp = out_grp.copy()
+            for c in pr_cols:
+                out_grp[f"opp_{c}"] = np.nan
+            merged_parts.append(out_grp)
+            continue
 
-    if pr_pitcher_id in merged.columns:
-        merged = merged.drop(columns=[pr_pitcher_id])
+        out_grp = out_grp.sort_values("game_date", kind="mergesort").reset_index(drop=True)
+        pr_grp = pr_grp.sort_values("game_date", kind="mergesort").reset_index(drop=True)
 
+        mg = pd.merge_asof(
+            out_grp,
+            pr_grp,
+            on="game_date",
+            direction="backward",
+            allow_exact_matches=False,
+        )
+
+        rename_map = {c: f"opp_{c}" for c in pr_cols}
+        mg = mg.rename(columns=rename_map)
+
+        if pr_pitcher_id in mg.columns:
+            mg = mg.drop(columns=[pr_pitcher_id])
+
+        merged_parts.append(mg)
+
+    merged = pd.concat(merged_parts, ignore_index=True)
     return merged
 
 
@@ -197,17 +235,13 @@ def build_tb2_features(
         "weather_crosswind",
     ]].copy()
 
-    df = lu.merge(
-        sp_small,
-        on=["game_pk", "game_date"],
-        how="left",
-    )
+    df = lu.merge(sp_small, on=["game_pk", "game_date"], how="left")
 
     df["opp_pitcher_id"] = np.where(
         df["is_home"].eq(True),
         df["away_starter_pitcher_id"],
         df["home_starter_pitcher_id"],
-    )
+    ).astype("string")
 
     df["park_team"] = df["home_team"]
 
