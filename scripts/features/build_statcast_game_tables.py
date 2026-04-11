@@ -56,20 +56,15 @@ def normalize_team_abbr(series: pd.Series) -> pd.Series:
 
 
 def coerce_flag_to_int(series: pd.Series) -> pd.Series:
-    """
-    Safely convert nullable boolean / bool / numeric-ish event flags to int.
-    Handles pandas nullable boolean dtype without crashing on fillna(0).
-    """
     s = series.copy()
 
     dtype_str = str(s.dtype).lower()
-    if dtype_str == "boolean" or dtype_str == "bool":
+    if dtype_str in {"boolean", "bool"}:
         return s.fillna(False).astype("int64")
 
     if pd.api.types.is_bool_dtype(s):
         return s.fillna(False).astype("int64")
 
-    # robust mapping for mixed/object columns
     true_values = {True, 1, 1.0, "1", "true", "True", "TRUE", "y", "Y", "yes", "YES"}
     false_values = {False, 0, 0.0, "0", "false", "False", "FALSE", "n", "N", "no", "NO"}
 
@@ -86,6 +81,15 @@ def coerce_flag_to_int(series: pd.Series) -> pd.Series:
             return 0
 
     return s.map(_map).astype("int64")
+
+
+def safe_bool_event(series: pd.Series) -> pd.Series:
+    """
+    Convert nullable boolean-like comparison output into clean int event flag.
+    """
+    if str(series.dtype).lower() == "boolean" or pd.api.types.is_bool_dtype(series):
+        return series.fillna(False).astype("int64")
+    return series.fillna(False).astype(bool).astype("int64")
 
 
 def build_batter_game_table(pa_df: pd.DataFrame) -> pd.DataFrame:
@@ -159,12 +163,14 @@ def build_batter_game_table(pa_df: pd.DataFrame) -> pd.DataFrame:
         df["_launch_angle_null"] = np.nan
         launch_angle_col = "_launch_angle_null"
 
-    df["_barrel_event"] = (
+    barrel_bool = (
         df[launch_speed_col].ge(98)
         & df[launch_angle_col].between(26, 30, inclusive="both")
-    ).astype("int64")
+    )
+    df["_barrel_event"] = safe_bool_event(barrel_bool)
 
-    df["_hard_hit_event"] = df[launch_speed_col].ge(95).astype("int64")
+    hard_hit_bool = df[launch_speed_col].ge(95)
+    df["_hard_hit_event"] = safe_bool_event(hard_hit_bool)
 
     df["_total_bases"] = (
         coerce_flag_to_int(df[is_1b_col]) * 1
@@ -314,11 +320,14 @@ def build_pitcher_game_table(pa_df: pd.DataFrame) -> pd.DataFrame:
         df["_launch_angle_null"] = np.nan
         launch_angle_col = "_launch_angle_null"
 
-    df["_barrel_event"] = (
+    barrel_bool = (
         df[launch_speed_col].ge(98)
         & df[launch_angle_col].between(26, 30, inclusive="both")
-    ).astype("int64")
-    df["_hard_hit_event"] = df[launch_speed_col].ge(95).astype("int64")
+    )
+    df["_barrel_event"] = safe_bool_event(barrel_bool)
+
+    hard_hit_bool = df[launch_speed_col].ge(95)
+    df["_hard_hit_event"] = safe_bool_event(hard_hit_bool)
 
     group_cols = [game_pk_col, game_date_col, pitcher_id_col]
     if pitcher_name_col:
