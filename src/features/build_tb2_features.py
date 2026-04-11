@@ -237,10 +237,13 @@ def build_tb2_features(
 
     df = lu.merge(sp_small, on=["game_pk", "game_date"], how="left")
 
-    df["opp_pitcher_id"] = np.where(
-        df["is_home"].eq(True),
-        df["away_starter_pitcher_id"],
-        df["home_starter_pitcher_id"],
+    df["opp_pitcher_id"] = pd.Series(
+        np.where(
+            df["is_home"].eq(True),
+            df["away_starter_pitcher_id"],
+            df["home_starter_pitcher_id"],
+        ),
+        index=df.index,
     ).astype("string")
 
     df["park_team"] = df["home_team"]
