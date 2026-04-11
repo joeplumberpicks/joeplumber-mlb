@@ -47,16 +47,15 @@ def _pick_col(df: pd.DataFrame, candidates: list[str], required: bool = False) -
     return None
 
 
-def _safe_copy(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if "game_date" in out.columns:
-        out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce")
-    return out
-
-
 def _normalize_team(series: pd.Series) -> pd.Series:
     s = series.astype("string").str.upper().str.strip()
-    return s.replace({"ATH": "OAK", "AZ": "ARI", "WSN": "WSH", "WAS": "WSH", "CWS": "CHW"})
+    return s.replace({
+        "ATH": "OAK",
+        "AZ": "ARI",
+        "WSN": "WSH",
+        "WAS": "WSH",
+        "CWS": "CHW",
+    })
 
 
 def _normalize_is_home(series: pd.Series) -> pd.Series:
@@ -64,22 +63,20 @@ def _normalize_is_home(series: pd.Series) -> pd.Series:
         series.astype("string")
         .str.strip()
         .str.lower()
-        .map(
-            {
-                "true": True,
-                "false": False,
-                "1": True,
-                "0": False,
-                "y": True,
-                "n": False,
-                "yes": True,
-                "no": False,
-                "home": True,
-                "away": False,
-                "@": False,
-                "vs": True,
-            }
-        )
+        .map({
+            "true": True,
+            "false": False,
+            "1": True,
+            "0": False,
+            "y": True,
+            "n": False,
+            "yes": True,
+            "no": False,
+            "home": True,
+            "away": False,
+            "@": False,
+            "vs": True,
+        })
         .astype("boolean")
     )
 
@@ -94,63 +91,76 @@ def _first_numeric(df: pd.DataFrame, candidates: list[str], default: float = np.
             out = out.combine_first(s)
     if not found:
         out = pd.Series(default, index=df.index, dtype="float64")
-    return out.fillna(default) if not np.isnan(default) else out
-
-
-def _attach_context(lineups: pd.DataFrame, spine: pd.DataFrame) -> pd.DataFrame:
-    lu = _safe_copy(lineups)
-    sp = _safe_copy(spine)
-
-    game_pk_col = _pick_col(lu, ["game_pk"], required=True)
-    lu_is_home_col = _pick_col(lu, ["is_home"], required=True)
-    team_col = _pick_col(lu, ["team"], required=True)
-
-    lu[lu_is_home_col] = _normalize_is_home(lu[lu_is_home_col])
-    lu[team_col] = _normalize_team(lu[team_col])
-
-    sp_game_pk = _pick_col(sp, ["game_pk"], required=True)
-    home_sp_col = _pick_col(sp, ["home_starter_pitcher_id", "home_sp_id", "home_pitcher_id"], required=True)
-    away_sp_col = _pick_col(sp, ["away_starter_pitcher_id", "away_sp_id", "away_pitcher_id"], required=True)
-    home_team_col = _pick_col(sp, ["home_team"], required=True)
-    away_team_col = _pick_col(sp, ["away_team"], required=True)
-
-    keep = [
-        sp_game_pk,
-        home_sp_col,
-        away_sp_col,
-        home_team_col,
-        away_team_col,
-        *[c for c in ["temperature_f", "wind_mph", "weather_wind_out", "weather_wind_in", "weather_crosswind"] if c in sp.columns],
-    ]
-    spj = sp[keep].copy().rename(columns={sp_game_pk: game_pk_col})
-    spj[home_team_col] = _normalize_team(spj[home_team_col])
-    spj[away_team_col] = _normalize_team(spj[away_team_col])
-
-    lu = lu.merge(spj, on=game_pk_col, how="left")
-
-    lu["opp_pitcher_id"] = pd.NA
-    lu.loc[lu[lu_is_home_col].eq(True), "opp_pitcher_id"] = lu.loc[lu[lu_is_home_col].eq(True), away_sp_col]
-    lu.loc[lu[lu_is_home_col].eq(False), "opp_pitcher_id"] = lu.loc[lu[lu_is_home_col].eq(False), home_sp_col]
-
-    lu["opponent"] = pd.NA
-    lu.loc[lu[lu_is_home_col].eq(True), "opponent"] = lu.loc[lu[lu_is_home_col].eq(True), away_team_col]
-    lu.loc[lu[lu_is_home_col].eq(False), "opponent"] = lu.loc[lu[lu_is_home_col].eq(False), home_team_col]
-
-    lu["park_team"] = lu[home_team_col]
-    return lu
-
-
-def _apply_park_factors(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out["park_hr_factor"] = 1.00
-    out["park_run_factor"] = 1.00
-    out["park_1b_factor"] = 1.00
-    out["park_2b3b_factor"] = 1.00
-    for team, vals in PARK_FACTORS.items():
-        mask = out["park_team"].astype("string").eq(team)
-        for k, v in vals.items():
-            out.loc[mask, k] = v
+    if not np.isnan(default):
+        out = out.fillna(default)
     return out
+
+
+def _latest_batter_rollings(lineups: pd.DataFrame, batter_roll: pd.DataFrame) -> pd.DataFrame:
+    lu = lineups.copy()
+    br = batter_roll.copy()
+
+    lu["game_date"] = pd.to_datetime(lu["game_date"], errors="coerce")
+    br["game_date"] = pd.to_datetime(br["game_date"], errors="coerce")
+
+    lu_batter_id = _pick_col(lu, ["batter_id", "player_id"], required=True)
+    br_batter_id = _pick_col(br, ["batter_id", "player_id"], required=True)
+
+    br_cols = [c for c in br.columns if c.startswith("bat_")]
+    br_small = br[[br_batter_id, "game_date", *br_cols]].copy()
+
+    lu = lu.sort_values([lu_batter_id, "game_date"]).reset_index(drop=True)
+    br_small = br_small.sort_values([br_batter_id, "game_date"]).reset_index(drop=True)
+
+    merged = pd.merge_asof(
+        lu,
+        br_small,
+        left_on="game_date",
+        right_on="game_date",
+        left_by=lu_batter_id,
+        right_by=br_batter_id,
+        direction="backward",
+        allow_exact_matches=False,
+    )
+
+    if br_batter_id in merged.columns and br_batter_id != lu_batter_id:
+        merged = merged.drop(columns=[br_batter_id])
+
+    return merged
+
+
+def _latest_pitcher_rollings(df: pd.DataFrame, pitcher_roll: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    pr = pitcher_roll.copy()
+
+    out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce")
+    pr["game_date"] = pd.to_datetime(pr["game_date"], errors="coerce")
+
+    pr_pitcher_id = _pick_col(pr, ["pitcher_id"], required=True)
+    pr_cols = [c for c in pr.columns if c.startswith("pit_")]
+    pr_small = pr[[pr_pitcher_id, "game_date", *pr_cols]].copy()
+
+    out = out.sort_values(["opp_pitcher_id", "game_date"]).reset_index(drop=True)
+    pr_small = pr_small.sort_values([pr_pitcher_id, "game_date"]).reset_index(drop=True)
+
+    merged = pd.merge_asof(
+        out,
+        pr_small,
+        left_on="game_date",
+        right_on="game_date",
+        left_by="opp_pitcher_id",
+        right_by=pr_pitcher_id,
+        direction="backward",
+        allow_exact_matches=False,
+    )
+
+    rename_map = {c: f"opp_{c}" for c in pr_cols}
+    merged = merged.rename(columns=rename_map)
+
+    if pr_pitcher_id in merged.columns:
+        merged = merged.drop(columns=[pr_pitcher_id])
+
+    return merged
 
 
 def build_rbi_features(
@@ -159,57 +169,60 @@ def build_rbi_features(
     batter_roll: pd.DataFrame,
     pitcher_roll: pd.DataFrame,
 ) -> pd.DataFrame:
-    sp = _safe_copy(spine)
-    lu = _attach_context(lineups, sp)
-    br = _safe_copy(batter_roll)
-    pr = _safe_copy(pitcher_roll)
+    sp = spine.copy()
+    lu = lineups.copy()
 
-    lu_batter_id = _pick_col(lu, ["batter_id", "player_id"], required=True)
-    lu_game_date = _pick_col(lu, ["game_date"], required=True)
+    sp["game_date"] = pd.to_datetime(sp["game_date"], errors="coerce")
+    lu["game_date"] = pd.to_datetime(lu["game_date"], errors="coerce")
 
-    br_batter_id = _pick_col(br, ["batter_id", "player_id"], required=True)
-    br_game_date = _pick_col(br, ["game_date"], required=False)
+    lu["team"] = _normalize_team(lu["team"])
+    if "opponent" in lu.columns:
+        lu["opponent"] = _normalize_team(lu["opponent"])
+    lu["is_home"] = _normalize_is_home(lu["is_home"])
 
-    left_on = [lu_batter_id]
-    right_on = [br_batter_id]
-    if br_game_date is not None:
-        left_on.append(lu_game_date)
-        right_on.append(br_game_date)
+    sp["home_team"] = _normalize_team(sp["home_team"])
+    sp["away_team"] = _normalize_team(sp["away_team"])
 
-    br_keep = [c for c in br.columns if c in set(right_on) or c.startswith("bat_")]
-    if br_keep:
-        df = lu.merge(br[br_keep].copy(), left_on=left_on, right_on=right_on, how="left")
-    else:
-        df = lu.copy()
+    sp_small = sp[[
+        "game_pk",
+        "game_date",
+        "home_team",
+        "away_team",
+        "home_starter_pitcher_id",
+        "away_starter_pitcher_id",
+        "temperature_f",
+        "wind_mph",
+        "weather_wind_out",
+        "weather_wind_in",
+        "weather_crosswind",
+    ]].copy()
 
-    pr_pitcher_id = _pick_col(pr, ["pitcher_id"], required=True)
-    pr_game_date = _pick_col(pr, ["game_date"], required=False)
-
-    left_on = ["opp_pitcher_id"]
-    right_on = [pr_pitcher_id]
-    if pr_game_date is not None:
-        left_on.append(lu_game_date)
-        right_on.append(pr_game_date)
-
-    pr_keep = [c for c in pr.columns if c in set(right_on) or c.startswith("pit_")]
-    pr_use = pr[pr_keep].copy()
-
-    rename_map = {}
-    for c in pr_use.columns:
-        if c == pr_pitcher_id:
-            rename_map[c] = "opp_pitcher_id"
-        elif c != pr_game_date:
-            rename_map[c] = f"opp_{c}"
-    pr_use = pr_use.rename(columns=rename_map)
-
-    df = df.merge(
-        pr_use,
-        left_on=left_on,
-        right_on=[rename_map.get(c, c) for c in right_on],
+    df = lu.merge(
+        sp_small,
+        on=["game_pk", "game_date"],
         how="left",
     )
 
-    df = _apply_park_factors(df)
+    df["opp_pitcher_id"] = np.where(
+        df["is_home"].eq(True),
+        df["away_starter_pitcher_id"],
+        df["home_starter_pitcher_id"],
+    )
+
+    df["park_team"] = df["home_team"]
+
+    df = _latest_batter_rollings(df, batter_roll)
+    df = _latest_pitcher_rollings(df, pitcher_roll)
+
+    df["park_hr_factor"] = 1.00
+    df["park_run_factor"] = 1.00
+    df["park_1b_factor"] = 1.00
+    df["park_2b3b_factor"] = 1.00
+
+    for team, vals in PARK_FACTORS.items():
+        mask = df["park_team"].astype("string").eq(team)
+        for k, v in vals.items():
+            df.loc[mask, k] = v
 
     df["tb_per_pa"] = _first_numeric(df, ["bat_tb_per_pa_roll30", "bat_tb_per_pa_roll15", "bat_tb_per_pa_roll7", "bat_tb_per_pa_roll3"])
     df["hr_per_pa"] = _first_numeric(df, ["bat_hr_per_pa_roll30", "bat_hr_per_pa_roll15", "bat_hr_per_pa_roll7", "bat_hr_per_pa_roll3"])
