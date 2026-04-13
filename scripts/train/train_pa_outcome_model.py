@@ -1,20 +1,19 @@
-%%bash
-cd /content/joeplumber-mlb
-
-mkdir -p scripts/train
-
-cat > scripts/train/train_pa_outcome_model.py <<'PY'
 #!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import log_loss, accuracy_score, top_k_accuracy_score
+from sklearn.metrics import accuracy_score, log_loss, top_k_accuracy_score
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from src.models.pa_outcome_model import (
     PA_OUTCOME_CLASSES,
@@ -30,15 +29,30 @@ from src.utils.drive import resolve_data_dirs
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train PA outcome model.")
-    parser.add_argument("--train-seasons", type=str, default="2019,2020,2021,2022,2023,2024")
-    parser.add_argument("--test-seasons", type=str, default="2025")
-    parser.add_argument("--config", type=str, default="configs/project.yaml")
+    parser.add_argument(
+        "--train-seasons",
+        type=str,
+        default="2019,2020,2021,2022,2023,2024",
+        help="Comma-separated training seasons.",
+    )
+    parser.add_argument(
+        "--test-seasons",
+        type=str,
+        default="2025",
+        help="Comma-separated test seasons.",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="configs/project.yaml",
+        help="Project config path relative to repo root.",
+    )
     parser.add_argument("--random-state", type=int, default=42)
     return parser.parse_args()
 
 
 def _parse_seasons(text: str) -> list[int]:
-    vals = []
+    vals: list[int] = []
     for token in str(text).split(","):
         token = token.strip()
         if token:
@@ -64,7 +78,28 @@ def _load_parquet_if_exists(path: Path) -> pd.DataFrame:
 
 
 def _load_base_tables(processed_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    pa = _load_parquet_if_exists(processed_dir / "pa.parquet")
+    pa_path = processed_dir / "pa.parquet"
+    by_season_dir = processed_dir / "by_season"
+
+    if pa_path.exists():
+        pa = pd.read_parquet(pa_path)
+        print(f"Loaded PA table: {pa_path} rows={len(pa):,}")
+    else:
+        pa_files = sorted(by_season_dir.glob("pa_*.parquet"))
+        if not pa_files:
+            raise FileNotFoundError(
+                f"Missing {pa_path} and found no by-season PA files in {by_season_dir}"
+            )
+
+        parts: list[pd.DataFrame] = []
+        for fp in pa_files:
+            part = pd.read_parquet(fp)
+            print(f"Loaded by-season PA file: {fp.name} rows={len(part):,}")
+            parts.append(part)
+
+        pa = pd.concat(parts, ignore_index=True)
+        print(f"Concatenated PA rows={len(pa):,}")
+
     batter_roll = _load_parquet_if_exists(processed_dir / "batter_game_rolling.parquet")
     pitcher_roll = _load_parquet_if_exists(processed_dir / "pitcher_game_rolling.parquet")
     return pa, batter_roll, pitcher_roll
@@ -73,11 +108,24 @@ def _load_base_tables(processed_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, 
 def _prep_pa(pa: pd.DataFrame) -> pd.DataFrame:
     out = pa.copy()
 
-    out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce")
+    if "game_date" in out.columns:
+        out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce")
+    else:
+        raise ValueError("PA table missing required column: game_date")
+
+    if "season" not in out.columns:
+        if "game_date" in out.columns:
+            out["season"] = out["game_date"].dt.year
+        else:
+            raise ValueError("PA table missing required column: season")
+
+    required_id_cols = ["game_pk", "batter_id", "pitcher_id"]
+    for col in required_id_cols:
+        if col not in out.columns:
+            raise ValueError(f"PA table missing required column: {col}")
+        out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
+
     out["season"] = pd.to_numeric(out["season"], errors="coerce").astype("Int64")
-    out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
-    out["batter_id"] = pd.to_numeric(out["batter_id"], errors="coerce").astype("Int64")
-    out["pitcher_id"] = pd.to_numeric(out["pitcher_id"], errors="coerce").astype("Int64")
 
     for col in ["inning", "outs_before_pa", "outs_after_pa", "rbi", "runs_scored_on_pa"]:
         if col in out.columns:
@@ -98,19 +146,42 @@ def _prep_pa(pa: pd.DataFrame) -> pd.DataFrame:
     out = out[out["season"].notna()].copy()
     out = out[out["batter_id"].notna()].copy()
     out = out[out["pitcher_id"].notna()].copy()
-    out = out[out["is_pa"] == True].copy()
+    out = out[out["game_pk"].notna()].copy()
+
+    if "is_pa" in out.columns:
+        out = out[out["is_pa"] == True].copy()
 
     out["pa_outcome_target"] = build_pa_target(out)
 
     return out
 
 
-def _prep_rollings(batter_roll: pd.DataFrame, pitcher_roll: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _prep_rollings(
+    batter_roll: pd.DataFrame,
+    pitcher_roll: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     br = batter_roll.copy()
     pr = pitcher_roll.copy()
 
+    br_id_col = "batter_id" if "batter_id" in br.columns else ("batter" if "batter" in br.columns else None)
+    pr_id_col = "pitcher_id" if "pitcher_id" in pr.columns else ("pitcher" if "pitcher" in pr.columns else None)
+
+    if br_id_col is None:
+        raise ValueError("batter_game_rolling.parquet missing batter_id/batter column")
+    if pr_id_col is None:
+        raise ValueError("pitcher_game_rolling.parquet missing pitcher_id/pitcher column")
+
+    if br_id_col != "batter_id":
+        br = br.rename(columns={br_id_col: "batter_id"})
+    if pr_id_col != "pitcher_id":
+        pr = pr.rename(columns={pr_id_col: "pitcher_id"})
+
     for df, id_col in [(br, "batter_id"), (pr, "pitcher_id")]:
-        df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+        if "game_date" in df.columns:
+            df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+        if "game_pk" not in df.columns:
+            raise ValueError(f"Rolling table missing required column: game_pk ({id_col})")
+
         df["game_pk"] = pd.to_numeric(df["game_pk"], errors="coerce").astype("Int64")
         df[id_col] = pd.to_numeric(df[id_col], errors="coerce").astype("Int64")
 
@@ -188,8 +259,9 @@ def _add_context_features(df: pd.DataFrame) -> pd.DataFrame:
         out["base_runner_count"] = out[["on_1b", "on_2b", "on_3b"]].sum(axis=1)
 
     if "inning_topbot" in out.columns:
-        out["is_top_inning"] = out["inning_topbot"].astype("string").str.upper().eq("TOP").astype(int)
-        out["is_bot_inning"] = out["inning_topbot"].astype("string").str.upper().eq("BOT").astype(int)
+        itb = out["inning_topbot"].astype("string").str.upper()
+        out["is_top_inning"] = itb.eq("TOP").astype(int)
+        out["is_bot_inning"] = itb.eq("BOT").astype(int)
 
     numeric_to_force = _pick_existing(
         out,
@@ -288,8 +360,21 @@ def _multiclass_metrics(df: pd.DataFrame, proba: pd.DataFrame, pred: pd.Series) 
     metrics = {
         "n_test": int(len(df)),
         "accuracy": float(accuracy_score(y_true, pred)),
-        "top2_accuracy": float(top_k_accuracy_score(y_true_id, proba_mat, k=2, labels=np.arange(len(PA_OUTCOME_CLASSES)))),
-        "logloss": float(log_loss(y_true_id, proba_mat, labels=np.arange(len(PA_OUTCOME_CLASSES)))),
+        "top2_accuracy": float(
+            top_k_accuracy_score(
+                y_true_id,
+                proba_mat,
+                k=2,
+                labels=np.arange(len(PA_OUTCOME_CLASSES)),
+            )
+        ),
+        "logloss": float(
+            log_loss(
+                y_true_id,
+                proba_mat,
+                labels=np.arange(len(PA_OUTCOME_CLASSES)),
+            )
+        ),
         "class_rates_test": {
             c: float((y_true == c).mean()) for c in PA_OUTCOME_CLASSES
         },
@@ -307,8 +392,7 @@ def main() -> None:
     train_seasons = _parse_seasons(args.train_seasons)
     test_seasons = _parse_seasons(args.test_seasons)
 
-    repo_root = Path(__file__).resolve().parents[2]
-    config = load_config((repo_root / args.config).resolve())
+    config = load_config((REPO_ROOT / args.config).resolve())
     dirs = resolve_data_dirs(config=config, prefer_drive=True)
 
     processed_dir = Path(dirs["processed_dir"])
@@ -413,6 +497,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-PY
-
-chmod +x scripts/train/train_pa_outcome_model.py
