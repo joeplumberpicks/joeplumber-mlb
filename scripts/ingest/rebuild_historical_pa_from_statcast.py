@@ -1,9 +1,3 @@
-%%bash
-cd /content/joeplumber-mlb
-
-mkdir -p scripts/ingest
-
-cat > scripts/ingest/rebuild_historical_pa_from_statcast.py <<'PY'
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -24,30 +18,38 @@ from src.utils.config import load_config
 from src.utils.drive import resolve_data_dirs
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Rebuild historical plate appearance files from Statcast."
+    )
     parser.add_argument("--season", type=int, required=True)
     parser.add_argument("--config", type=str, default="configs/project.yaml")
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
-def month_chunks(start_date, end_date):
+def build_month_chunks(start_date: str, end_date: str) -> list[tuple[str, str]]:
     start = pd.Timestamp(start_date)
     end = pd.Timestamp(end_date)
 
-    chunks = []
+    chunks: list[tuple[str, str]] = []
     cur = pd.Timestamp(year=start.year, month=start.month, day=1)
 
     while cur <= end:
         last_day = monthrange(cur.year, cur.month)[1]
-        chunk_start = max(cur, start)
-        chunk_end = min(pd.Timestamp(year=cur.year, month=cur.month, day=last_day), end)
 
-        chunks.append((
-            chunk_start.strftime("%Y-%m-%d"),
-            chunk_end.strftime("%Y-%m-%d")
-        ))
+        chunk_start = max(cur, start)
+        chunk_end = min(
+            pd.Timestamp(year=cur.year, month=cur.month, day=last_day),
+            end,
+        )
+
+        chunks.append(
+            (
+                chunk_start.strftime("%Y-%m-%d"),
+                chunk_end.strftime("%Y-%m-%d"),
+            )
+        )
 
         if cur.month == 12:
             cur = pd.Timestamp(year=cur.year + 1, month=1, day=1)
@@ -57,34 +59,72 @@ def month_chunks(start_date, end_date):
     return chunks
 
 
-def main():
+def dedupe_pas(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    if {"game_pk", "pa_index"}.issubset(out.columns):
+        sort_cols = [
+            c
+            for c in ["game_date", "game_pk", "inning", "inning_topbot", "pa_index"]
+            if c in out.columns
+        ]
+
+        out = (
+            out.sort_values(sort_cols, kind="stable")
+            .drop_duplicates(["game_pk", "pa_index"], keep="last")
+            .reset_index(drop=True)
+        )
+
+    return out
+
+
+def main() -> None:
     args = parse_args()
 
     config = load_config(REPO_ROOT / args.config)
     dirs = resolve_data_dirs(config=config, prefer_drive=True)
 
-    out_dir = Path(dirs["processed_dir"]) / "by_season"
+    processed_dir = Path(dirs["processed_dir"])
+    out_dir = processed_dir / "by_season"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     out_path = out_dir / f"pa_{args.season}.parquet"
 
     if out_path.exists() and not args.overwrite:
-        print(f"Skipping existing: {out_path}")
+        print(f"Skipping existing file: {out_path}")
         return
 
-    all_parts = []
+    start_date = f"{args.season}-03-01"
+    end_date = f"{args.season}-11-30"
 
-    for start_date, end_date in month_chunks(f"{args.season}-03-01", f"{args.season}-11-30"):
-        print(f"Pulling {start_date} -> {end_date}")
+    month_chunks = build_month_chunks(start_date, end_date)
 
-        raw_df = fetch_statcast(start_date, end_date, verbose=True)
+    all_parts: list[pd.DataFrame] = []
+
+    print("========================================")
+    print("JOE PLUMBER HISTORICAL PA REBUILD")
+    print("========================================")
+    print(f"season={args.season}")
+    print(f"chunks={len(month_chunks)}")
+    print("")
+
+    for chunk_start, chunk_end in month_chunks:
+        print(f"Pulling Statcast {chunk_start} -> {chunk_end}")
+
+        raw_df = fetch_statcast(
+            start_date=chunk_start,
+            end_date=chunk_end,
+            verbose=True,
+        )
 
         if raw_df.empty:
+            print("No rows returned.")
             continue
 
         pa_like = extract_plate_appearances_from_statcast(raw_df)
 
         if pa_like.empty:
+            print("No PA rows after extraction.")
             continue
 
         normalized = build_plate_appearances(
@@ -95,19 +135,35 @@ def main():
         )
 
         normalized["season"] = args.season
+
+        normalized = dedupe_pas(normalized)
+
         all_parts.append(normalized)
 
+        print(f"normalized_rows={len(normalized):,}")
+        print("")
+
     if not all_parts:
-        raise RuntimeError(f"No PA data found for season {args.season}")
+        raise RuntimeError(f"No PA rows built for season {args.season}")
 
     season_pa = pd.concat(all_parts, ignore_index=True)
 
-    if {"game_pk", "pa_index"}.issubset(season_pa.columns):
-        season_pa = (
-            season_pa.sort_values(["game_date", "game_pk", "pa_index"])
-            .drop_duplicates(["game_pk", "pa_index"], keep="last")
-            .reset_index(drop=True)
+    season_pa = dedupe_pas(season_pa)
+
+    if "game_date" in season_pa.columns:
+        season_pa["game_date"] = pd.to_datetime(
+            season_pa["game_date"],
+            errors="coerce",
         )
+
+    season_pa = season_pa.sort_values(
+        [
+            c
+            for c in ["game_date", "game_pk", "inning", "inning_topbot", "pa_index"]
+            if c in season_pa.columns
+        ],
+        kind="stable",
+    ).reset_index(drop=True)
 
     season_pa.to_parquet(out_path, index=False)
 
@@ -122,6 +178,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-PY
-
-chmod +x scripts/ingest/rebuild_historical_pa_from_statcast.py
