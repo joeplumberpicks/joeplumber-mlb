@@ -1,9 +1,3 @@
-%%bash
-cd /content/joeplumber-mlb
-
-mkdir -p src/models
-
-cat > src/models/pa_outcome_model.py <<'PY'
 from __future__ import annotations
 
 import json
@@ -45,20 +39,14 @@ class PaOutcomeArtifact:
 
 
 def build_pa_target(df: pd.DataFrame) -> pd.Series:
-    """
-    Collapse PA results into 6 mutually exclusive classes.
-
-    Priority:
-    HR > 3B > 2B > 1B > BB/HBP > OUT
-    """
     out = pd.Series("out", index=df.index, dtype="string")
 
-    is_bb = df.get("is_bb", pd.Series(False, index=df.index)).fillna(False).astype(bool)
-    is_hbp = df.get("is_hbp", pd.Series(False, index=df.index)).fillna(False).astype(bool)
-    is_1b = df.get("is_1b", pd.Series(False, index=df.index)).fillna(False).astype(bool)
-    is_2b = df.get("is_2b", pd.Series(False, index=df.index)).fillna(False).astype(bool)
-    is_3b = df.get("is_3b", pd.Series(False, index=df.index)).fillna(False).astype(bool)
-    is_hr = df.get("is_hr", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+    is_bb = df.get("is_bb", False)
+    is_hbp = df.get("is_hbp", False)
+    is_1b = df.get("is_1b", False)
+    is_2b = df.get("is_2b", False)
+    is_3b = df.get("is_3b", False)
+    is_hr = df.get("is_hr", False)
 
     out.loc[is_bb | is_hbp] = "walk_hbp"
     out.loc[is_1b] = "single"
@@ -71,9 +59,6 @@ def build_pa_target(df: pd.DataFrame) -> pd.Series:
 
 def encode_pa_target(y: pd.Series) -> np.ndarray:
     y = y.astype("string").fillna("out")
-    unknown = sorted(set(y.unique()) - set(PA_OUTCOME_TO_ID.keys()))
-    if unknown:
-        raise ValueError(f"Unknown PA target classes found: {unknown}")
     return y.map(PA_OUTCOME_TO_ID).astype(int).to_numpy()
 
 
@@ -81,9 +66,12 @@ def decode_pa_target(y: np.ndarray | list[int]) -> list[str]:
     return [PA_ID_TO_OUTCOME[int(v)] for v in y]
 
 
-def _infer_feature_types(df: pd.DataFrame, feature_columns: list[str]) -> tuple[list[str], list[str]]:
-    numeric_features: list[str] = []
-    categorical_features: list[str] = []
+def _infer_feature_types(
+    df: pd.DataFrame,
+    feature_columns: list[str],
+) -> tuple[list[str], list[str]]:
+    numeric_features = []
+    categorical_features = []
 
     for col in feature_columns:
         if pd.api.types.is_numeric_dtype(df[col]):
@@ -192,14 +180,14 @@ def predict_pa_outcome_proba(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
     X = df[artifact.feature_columns].copy()
+
     proba = artifact.model.predict_proba(X)
 
-    out = pd.DataFrame(
+    return pd.DataFrame(
         proba,
         columns=[f"p_{c}" for c in artifact.class_names],
         index=df.index,
     )
-    return out
 
 
 def predict_pa_outcome_class(
@@ -207,8 +195,14 @@ def predict_pa_outcome_class(
     df: pd.DataFrame,
 ) -> pd.Series:
     X = df[artifact.feature_columns].copy()
+
     pred = artifact.model.predict(X)
-    return pd.Series(decode_pa_target(pred), index=df.index, name="pred_pa_outcome")
+
+    return pd.Series(
+        decode_pa_target(pred),
+        index=df.index,
+        name="pred_pa_outcome",
+    )
 
 
 def save_pa_outcome_artifact(
@@ -245,7 +239,6 @@ def save_pa_outcome_artifact(
 
 def load_pa_outcome_artifact(model_path: str | Path) -> PaOutcomeArtifact:
     model_path = Path(model_path)
+
     with model_path.open("rb") as f:
-        artifact = pickle.load(f)
-    return artifact
-PY
+        return pickle.load(f)
