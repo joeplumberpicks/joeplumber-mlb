@@ -44,7 +44,7 @@ LEAKAGE_DROP_COLS = {
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build sim inputs from PA mart.")
+    parser = argparse.ArgumentParser(description="Build sim inputs from PA mart using explicit player IDs.")
     parser.add_argument("--game-date", type=str, required=True)
     parser.add_argument("--away-team", type=str, required=True)
     parser.add_argument("--home-team", type=str, required=True)
@@ -60,16 +60,26 @@ def _parse_ids(text: str) -> list[int]:
     return [int(x.strip()) for x in text.split(",") if x.strip()]
 
 
+def _strip_to_sim_safe(df: pd.DataFrame, keep_cols: list[str]) -> pd.DataFrame:
+    cols = [c for c in df.columns if c not in LEAKAGE_DROP_COLS or c in keep_cols]
+    out = df[cols].copy()
+
+    if "lineup_slot" in out.columns:
+        out["lineup_slot"] = pd.to_numeric(out["lineup_slot"], errors="coerce")
+
+    return out
+
+
 def _latest_rows_for_batters(
     mart: pd.DataFrame,
     batter_ids: list[int],
     as_of_date: pd.Timestamp,
-    team: str,
+    team_code: str,
 ) -> pd.DataFrame:
     df = mart.copy()
     df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
-    df = df[df["game_date"] < as_of_date].copy()
     df["batter_id"] = pd.to_numeric(df["batter_id"], errors="coerce").astype("Int64")
+    df = df[df["game_date"] < as_of_date].copy()
 
     out_rows = []
     for slot, batter_id in enumerate(batter_ids, start=1):
@@ -79,23 +89,22 @@ def _latest_rows_for_batters(
         row = sub.iloc[-1].copy()
         row["batter_id"] = batter_id
         row["lineup_slot"] = slot
-        row["batting_team"] = team
+        row["batting_team"] = team_code
         out_rows.append(row)
 
-    out = pd.DataFrame(out_rows).reset_index(drop=True)
-    return out
+    return pd.DataFrame(out_rows).reset_index(drop=True)
 
 
 def _latest_row_for_pitcher(
     mart: pd.DataFrame,
     pitcher_id: int,
-    team: str,
     as_of_date: pd.Timestamp,
+    team_code: str,
 ) -> pd.DataFrame:
     df = mart.copy()
     df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
-    df = df[df["game_date"] < as_of_date].copy()
     df["pitcher_id"] = pd.to_numeric(df["pitcher_id"], errors="coerce").astype("Int64")
+    df = df[df["game_date"] < as_of_date].copy()
 
     sub = df[df["pitcher_id"] == pitcher_id].sort_values("game_date")
     if sub.empty:
@@ -103,18 +112,8 @@ def _latest_row_for_pitcher(
 
     row = sub.iloc[-1].copy()
     row["pitcher_id"] = pitcher_id
-    row["fielding_team"] = team
+    row["fielding_team"] = team_code
     return pd.DataFrame([row])
-
-
-def _strip_to_sim_safe(df: pd.DataFrame, keep_id_cols: list[str]) -> pd.DataFrame:
-    cols = [c for c in df.columns if c not in LEAKAGE_DROP_COLS or c in keep_id_cols]
-    out = df[cols].copy()
-
-    if "lineup_slot" in out.columns:
-        out["lineup_slot"] = pd.to_numeric(out["lineup_slot"], errors="coerce")
-
-    return out
 
 
 def main() -> None:
@@ -137,31 +136,31 @@ def main() -> None:
         mart=mart,
         batter_ids=away_batters,
         as_of_date=as_of_date,
-        team=args.away_team,
+        team_code=args.away_team,
     )
     lineup_home = _latest_rows_for_batters(
         mart=mart,
         batter_ids=home_batters,
         as_of_date=as_of_date,
-        team=args.home_team,
+        team_code=args.home_team,
     )
     pitcher_away = _latest_row_for_pitcher(
         mart=mart,
         pitcher_id=args.away_pitcher_id,
-        team=args.away_team,
         as_of_date=as_of_date,
+        team_code=args.away_team,
     )
     pitcher_home = _latest_row_for_pitcher(
         mart=mart,
         pitcher_id=args.home_pitcher_id,
-        team=args.home_team,
         as_of_date=as_of_date,
+        team_code=args.home_team,
     )
 
-    lineup_away = _strip_to_sim_safe(lineup_away, keep_id_cols=["batter_id", "lineup_slot", "batting_team"])
-    lineup_home = _strip_to_sim_safe(lineup_home, keep_id_cols=["batter_id", "lineup_slot", "batting_team"])
-    pitcher_away = _strip_to_sim_safe(pitcher_away, keep_id_cols=["pitcher_id", "fielding_team"])
-    pitcher_home = _strip_to_sim_safe(pitcher_home, keep_id_cols=["pitcher_id", "fielding_team"])
+    lineup_away = _strip_to_sim_safe(lineup_away, keep_cols=["batter_id", "lineup_slot", "batting_team"])
+    lineup_home = _strip_to_sim_safe(lineup_home, keep_cols=["batter_id", "lineup_slot", "batting_team"])
+    pitcher_away = _strip_to_sim_safe(pitcher_away, keep_cols=["pitcher_id", "fielding_team"])
+    pitcher_home = _strip_to_sim_safe(pitcher_home, keep_cols=["pitcher_id", "fielding_team"])
 
     away_lineup_out = out_dir / f"{args.away_team}_{args.game_date}_lineup.csv"
     home_lineup_out = out_dir / f"{args.home_team}_{args.game_date}_lineup.csv"
