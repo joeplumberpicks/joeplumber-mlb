@@ -41,12 +41,12 @@ class PaOutcomeArtifact:
 def build_pa_target(df: pd.DataFrame) -> pd.Series:
     out = pd.Series("out", index=df.index, dtype="string")
 
-    is_bb = df.get("is_bb", False)
-    is_hbp = df.get("is_hbp", False)
-    is_1b = df.get("is_1b", False)
-    is_2b = df.get("is_2b", False)
-    is_3b = df.get("is_3b", False)
-    is_hr = df.get("is_hr", False)
+    is_bb = df.get("is_bb", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+    is_hbp = df.get("is_hbp", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+    is_1b = df.get("is_1b", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+    is_2b = df.get("is_2b", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+    is_3b = df.get("is_3b", pd.Series(False, index=df.index)).fillna(False).astype(bool)
+    is_hr = df.get("is_hr", pd.Series(False, index=df.index)).fillna(False).astype(bool)
 
     out.loc[is_bb | is_hbp] = "walk_hbp"
     out.loc[is_1b] = "single"
@@ -59,6 +59,9 @@ def build_pa_target(df: pd.DataFrame) -> pd.Series:
 
 def encode_pa_target(y: pd.Series) -> np.ndarray:
     y = y.astype("string").fillna("out")
+    unknown = sorted(set(y.unique()) - set(PA_OUTCOME_TO_ID.keys()))
+    if unknown:
+        raise ValueError(f"Unknown PA target classes found: {unknown}")
     return y.map(PA_OUTCOME_TO_ID).astype(int).to_numpy()
 
 
@@ -70,8 +73,8 @@ def _infer_feature_types(
     df: pd.DataFrame,
     feature_columns: list[str],
 ) -> tuple[list[str], list[str]]:
-    numeric_features = []
-    categorical_features = []
+    numeric_features: list[str] = []
+    categorical_features: list[str] = []
 
     for col in feature_columns:
         if pd.api.types.is_numeric_dtype(df[col]):
@@ -97,7 +100,7 @@ def make_pa_outcome_pipeline(
 
     cat_tf = Pipeline(
         steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("imputer", SimpleImputer(strategy="constant", fill_value="MISSING")),
             (
                 "encoder",
                 OrdinalEncoder(
@@ -143,6 +146,27 @@ def make_pa_outcome_pipeline(
     return pipe, numeric_features, categorical_features
 
 
+def _sanitize_features_for_sklearn(
+    df: pd.DataFrame,
+    numeric_features: list[str],
+    categorical_features: list[str],
+) -> pd.DataFrame:
+    out = df.copy()
+
+    for col in numeric_features:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    for col in categorical_features:
+        out[col] = (
+            out[col]
+            .astype("string")
+            .fillna("MISSING")
+            .astype(object)
+        )
+
+    return out
+
+
 def fit_pa_outcome_model(
     train_df: pd.DataFrame,
     feature_columns: list[str],
@@ -156,6 +180,11 @@ def fit_pa_outcome_model(
 
     y = encode_pa_target(train_df["pa_outcome_target"])
     X = train_df[feature_columns].copy()
+    X = _sanitize_features_for_sklearn(
+        X,
+        numeric_features=numeric_features,
+        categorical_features=categorical_features,
+    )
 
     pipe.fit(X, y)
 
@@ -180,6 +209,11 @@ def predict_pa_outcome_proba(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
     X = df[artifact.feature_columns].copy()
+    X = _sanitize_features_for_sklearn(
+        X,
+        numeric_features=artifact.numeric_features,
+        categorical_features=artifact.categorical_features,
+    )
 
     proba = artifact.model.predict_proba(X)
 
@@ -195,6 +229,11 @@ def predict_pa_outcome_class(
     df: pd.DataFrame,
 ) -> pd.Series:
     X = df[artifact.feature_columns].copy()
+    X = _sanitize_features_for_sklearn(
+        X,
+        numeric_features=artifact.numeric_features,
+        categorical_features=artifact.categorical_features,
+    )
 
     pred = artifact.model.predict(X)
 
@@ -241,4 +280,6 @@ def load_pa_outcome_artifact(model_path: str | Path) -> PaOutcomeArtifact:
     model_path = Path(model_path)
 
     with model_path.open("rb") as f:
-        return pickle.load(f)
+        artifact = pickle.load(f)
+
+    return artifact
