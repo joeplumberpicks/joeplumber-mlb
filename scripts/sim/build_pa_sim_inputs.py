@@ -15,36 +15,12 @@ from src.utils.config import load_config
 from src.utils.drive import resolve_data_dirs
 
 
-LEAKAGE_DROP_COLS = {
-    "pa_outcome_target",
-    "event_type",
-    "game_date",
-    "game_pk",
-    "pa_index",
-    "outs_after_pa",
-    "rbi",
-    "runs_scored_on_pa",
-    "is_pa",
-    "is_ab",
-    "is_1b",
-    "is_2b",
-    "is_3b",
-    "is_hr",
-    "is_bb",
-    "is_hbp",
-    "is_so",
-    "pitch_number_start",
-    "pitch_number_end",
-    "launch_speed",
-    "launch_angle",
-    "hit_distance_sc",
-    "hc_x",
-    "hc_y",
-}
+BATTING_KEEP_EXACT = {"batter_id", "lineup_slot", "batting_team"}
+PITCHING_KEEP_EXACT = {"pitcher_id", "fielding_team"}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build sim inputs from PA mart using explicit player IDs.")
+    parser = argparse.ArgumentParser(description="Build clean PA sim inputs from PA outcome mart.")
     parser.add_argument("--game-date", type=str, required=True)
     parser.add_argument("--away-team", type=str, required=True)
     parser.add_argument("--home-team", type=str, required=True)
@@ -58,16 +34,6 @@ def parse_args() -> argparse.Namespace:
 
 def _parse_ids(text: str) -> list[int]:
     return [int(x.strip()) for x in text.split(",") if x.strip()]
-
-
-def _strip_to_sim_safe(df: pd.DataFrame, keep_cols: list[str]) -> pd.DataFrame:
-    cols = [c for c in df.columns if c not in LEAKAGE_DROP_COLS or c in keep_cols]
-    out = df[cols].copy()
-
-    if "lineup_slot" in out.columns:
-        out["lineup_slot"] = pd.to_numeric(out["lineup_slot"], errors="coerce")
-
-    return out
 
 
 def _latest_rows_for_batters(
@@ -87,10 +53,13 @@ def _latest_rows_for_batters(
         if sub.empty:
             raise ValueError(f"No historical mart row found for batter_id={batter_id}")
         row = sub.iloc[-1].copy()
-        row["batter_id"] = batter_id
-        row["lineup_slot"] = slot
-        row["batting_team"] = team_code
-        out_rows.append(row)
+
+        keep_cols = [c for c in row.index if c.startswith("bat_")]
+        clean = row[keep_cols].to_dict()
+        clean["batter_id"] = batter_id
+        clean["lineup_slot"] = slot
+        clean["batting_team"] = team_code
+        out_rows.append(clean)
 
     return pd.DataFrame(out_rows).reset_index(drop=True)
 
@@ -111,9 +80,25 @@ def _latest_row_for_pitcher(
         raise ValueError(f"No historical mart row found for pitcher_id={pitcher_id}")
 
     row = sub.iloc[-1].copy()
-    row["pitcher_id"] = pitcher_id
-    row["fielding_team"] = team_code
-    return pd.DataFrame([row])
+    keep_cols = [c for c in row.index if c.startswith("pit_")]
+    clean = row[keep_cols].to_dict()
+    clean["pitcher_id"] = pitcher_id
+    clean["fielding_team"] = team_code
+
+    return pd.DataFrame([clean])
+
+
+def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in out.columns:
+        if col in {"batting_team", "fielding_team"}:
+            out[col] = out[col].astype("string")
+            continue
+        if col in {"batter_id", "pitcher_id", "lineup_slot"}:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+            continue
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
 
 
 def main() -> None:
@@ -157,10 +142,10 @@ def main() -> None:
         team_code=args.home_team,
     )
 
-    lineup_away = _strip_to_sim_safe(lineup_away, keep_cols=["batter_id", "lineup_slot", "batting_team"])
-    lineup_home = _strip_to_sim_safe(lineup_home, keep_cols=["batter_id", "lineup_slot", "batting_team"])
-    pitcher_away = _strip_to_sim_safe(pitcher_away, keep_cols=["pitcher_id", "fielding_team"])
-    pitcher_home = _strip_to_sim_safe(pitcher_home, keep_cols=["pitcher_id", "fielding_team"])
+    lineup_away = _coerce_numeric(lineup_away)
+    lineup_home = _coerce_numeric(lineup_home)
+    pitcher_away = _coerce_numeric(pitcher_away)
+    pitcher_home = _coerce_numeric(pitcher_home)
 
     away_lineup_out = out_dir / f"{args.away_team}_{args.game_date}_lineup.csv"
     home_lineup_out = out_dir / f"{args.home_team}_{args.game_date}_lineup.csv"
@@ -176,10 +161,10 @@ def main() -> None:
     print("JOE PLUMBER PA SIM INPUT BUILD")
     print("========================================")
     print(f"mart_path={mart_path}")
-    print(f"away_lineup_out={away_lineup_out}")
-    print(f"home_lineup_out={home_lineup_out}")
-    print(f"away_pitcher_out={away_pitcher_out}")
-    print(f"home_pitcher_out={home_pitcher_out}")
+    print(f"away_lineup_out={away_lineup_out} rows={len(lineup_away):,} cols={len(lineup_away.columns):,}")
+    print(f"home_lineup_out={home_lineup_out} rows={len(lineup_home):,} cols={len(lineup_home.columns):,}")
+    print(f"away_pitcher_out={away_pitcher_out} rows={len(pitcher_away):,} cols={len(pitcher_away.columns):,}")
+    print(f"home_pitcher_out={home_pitcher_out} rows={len(pitcher_home):,} cols={len(pitcher_home.columns):,}")
 
 
 if __name__ == "__main__":
