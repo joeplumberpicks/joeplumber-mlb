@@ -15,10 +15,6 @@ from src.utils.config import load_config
 from src.utils.drive import resolve_data_dirs
 
 
-BATTING_KEEP_EXACT = {"batter_id", "lineup_slot", "batting_team"}
-PITCHING_KEEP_EXACT = {"pitcher_id", "fielding_team"}
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build clean PA sim inputs from PA outcome mart.")
     parser.add_argument("--game-date", type=str, required=True)
@@ -34,6 +30,16 @@ def parse_args() -> argparse.Namespace:
 
 def _parse_ids(text: str) -> list[int]:
     return [int(x.strip()) for x in text.split(",") if x.strip()]
+
+
+def _coerce_numeric_except_strings(df: pd.DataFrame, string_cols: set[str]) -> pd.DataFrame:
+    out = df.copy()
+    for col in out.columns:
+        if col in string_cols:
+            out[col] = out[col].astype("string")
+        else:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    return out
 
 
 def _latest_rows_for_batters(
@@ -52,6 +58,7 @@ def _latest_rows_for_batters(
         sub = df[df["batter_id"] == batter_id].sort_values("game_date")
         if sub.empty:
             raise ValueError(f"No historical mart row found for batter_id={batter_id}")
+
         row = sub.iloc[-1].copy()
 
         keep_cols = [c for c in row.index if c.startswith("bat_")]
@@ -61,7 +68,9 @@ def _latest_rows_for_batters(
         clean["batting_team"] = team_code
         out_rows.append(clean)
 
-    return pd.DataFrame(out_rows).reset_index(drop=True)
+    out = pd.DataFrame(out_rows).reset_index(drop=True)
+    out = _coerce_numeric_except_strings(out, {"batting_team"})
+    return out
 
 
 def _latest_row_for_pitcher(
@@ -85,19 +94,8 @@ def _latest_row_for_pitcher(
     clean["pitcher_id"] = pitcher_id
     clean["fielding_team"] = team_code
 
-    return pd.DataFrame([clean])
-
-
-def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    for col in out.columns:
-        if col in {"batting_team", "fielding_team"}:
-            out[col] = out[col].astype("string")
-            continue
-        if col in {"batter_id", "pitcher_id", "lineup_slot"}:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
-            continue
-        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = pd.DataFrame([clean])
+    out = _coerce_numeric_except_strings(out, {"fielding_team"})
     return out
 
 
@@ -142,15 +140,10 @@ def main() -> None:
         team_code=args.home_team,
     )
 
-    lineup_away = _coerce_numeric(lineup_away)
-    lineup_home = _coerce_numeric(lineup_home)
-    pitcher_away = _coerce_numeric(pitcher_away)
-    pitcher_home = _coerce_numeric(pitcher_home)
-
     away_lineup_out = out_dir / f"{args.away_team}_{args.game_date}_lineup.csv"
     home_lineup_out = out_dir / f"{args.home_team}_{args.game_date}_lineup.csv"
-    away_pitcher_out = out_dir / f"{args.away_team}_{args.game_date}_pitcher.csv"
-    home_pitcher_out = out_dir / f"{args.home_team}_{args.game_date}_pitcher.csv"
+    away_pitcher_out = out_dir / f"{args.away_team}_{args.game-date}_pitcher.csv"
+    home_pitcher_out = out_dir / f"{args.home_team}_{args.game-date}_pitcher.csv"
 
     lineup_away.to_csv(away_lineup_out, index=False)
     lineup_home.to_csv(home_lineup_out, index=False)
