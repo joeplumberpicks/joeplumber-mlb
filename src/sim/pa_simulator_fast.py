@@ -34,6 +34,10 @@ class GameState:
     score_home: int = 0
     batter_idx_away: int = 0
     batter_idx_home: int = 0
+    bf_starter_away: int = 0
+    bf_starter_home: int = 0
+    using_bullpen_away: int = 0
+    using_bullpen_home: int = 0
 
 
 def encode_base_state(on_1b: int, on_2b: int, on_3b: int) -> str:
@@ -215,10 +219,12 @@ def _cache_key(
     batter_row: dict[str, Any],
     pitcher_row: dict[str, Any],
     state: GameState,
+    pitcher_mode: str,
 ) -> tuple:
     return (
         int(batter_row.get("batter_id")),
         int(pitcher_row.get("pitcher_id")),
+        pitcher_mode,
         int(batter_row.get("lineup_slot", -1)) if pd.notna(batter_row.get("lineup_slot", np.nan)) else -1,
         state.inning,
         state.half,
@@ -236,8 +242,9 @@ def get_pa_probabilities_fast(
     state: GameState,
     cache: dict[tuple, dict[str, float]],
     feature_columns: list[str],
+    pitcher_mode: str,
 ) -> dict[str, float]:
-    key = _cache_key(batter_row, pitcher_row, state)
+    key = _cache_key(batter_row, pitcher_row, state, pitcher_mode)
     if key in cache:
         return cache[key]
 
@@ -248,8 +255,7 @@ def get_pa_probabilities_fast(
     )
 
     usable_feature_columns = [c for c in feature_columns if c not in DROP_DEAD_FEATURES]
-    row_payload = {c: sim_row.get(c, np.nan) for c in usable_feature_columns}
-    sim_df = pd.DataFrame([row_payload])
+    sim_df = pd.DataFrame([{c: sim_row.get(c, np.nan) for c in usable_feature_columns}])
 
     proba = predict_pa_outcome_proba(artifact, sim_df).iloc[0].to_dict()
     probs = {
@@ -269,8 +275,12 @@ def simulate_single_game_fast(
     artifact: PaOutcomeArtifact,
     lineup_away: pd.DataFrame,
     lineup_home: pd.DataFrame,
-    pitcher_away: pd.Series,
-    pitcher_home: pd.Series,
+    starter_away: pd.Series,
+    starter_home: pd.Series,
+    bullpen_away: pd.Series | None,
+    bullpen_home: pd.Series | None,
+    starter_bf_cap_away: int,
+    starter_bf_cap_home: int,
     rng: np.random.Generator,
     max_innings: int = 9,
     extra_innings_cap: int = 12,
@@ -284,8 +294,10 @@ def simulate_single_game_fast(
 
     away_rows = [lineup_away.iloc[i].to_dict() for i in range(len(lineup_away))]
     home_rows = [lineup_home.iloc[i].to_dict() for i in range(len(lineup_home))]
-    pitcher_away_dict = pitcher_away.to_dict()
-    pitcher_home_dict = pitcher_home.to_dict()
+    starter_away_dict = starter_away.to_dict()
+    starter_home_dict = starter_home.to_dict()
+    bullpen_away_dict = bullpen_away.to_dict() if bullpen_away is not None else None
+    bullpen_home_dict = bullpen_home.to_dict() if bullpen_home is not None else None
 
     cache: dict[tuple, dict[str, float]] = {}
     feature_columns = list(artifact.feature_columns)
@@ -305,11 +317,26 @@ def simulate_single_game_fast(
         if state.half == "TOP":
             batter_idx = state.batter_idx_away % len(away_rows)
             batter_row = away_rows[batter_idx]
-            pitcher_row = pitcher_home_dict
+
+            if bullpen_home_dict is not None and state.bf_starter_home >= starter_bf_cap_home:
+                pitcher_row = bullpen_home_dict
+                pitcher_mode = "bullpen_home"
+                state.using_bullpen_home = 1
+            else:
+                pitcher_row = starter_home_dict
+                pitcher_mode = "starter_home"
+
         else:
             batter_idx = state.batter_idx_home % len(home_rows)
             batter_row = home_rows[batter_idx]
-            pitcher_row = pitcher_away_dict
+
+            if bullpen_away_dict is not None and state.bf_starter_away >= starter_bf_cap_away:
+                pitcher_row = bullpen_away_dict
+                pitcher_mode = "bullpen_away"
+                state.using_bullpen_away = 1
+            else:
+                pitcher_row = starter_away_dict
+                pitcher_mode = "starter_away"
 
         probs = get_pa_probabilities_fast(
             artifact=artifact,
@@ -318,6 +345,7 @@ def simulate_single_game_fast(
             state=state,
             cache=cache,
             feature_columns=feature_columns,
+            pitcher_mode=pitcher_mode,
         )
 
         outcome = choose_outcome_from_probs(probs, rng=rng)
@@ -329,6 +357,7 @@ def simulate_single_game_fast(
             "base_state_before": encode_base_state(state.on_1b, state.on_2b, state.on_3b),
             "batter_id": batter_row.get("batter_id"),
             "pitcher_id": pitcher_row.get("pitcher_id"),
+            "pitcher_mode": pitcher_mode,
             "outcome": outcome,
             "half_inning_pa_count": current_half_pa_count,
             **{f"p_{k}": float(v) for k, v in probs.items()},
@@ -341,8 +370,12 @@ def simulate_single_game_fast(
 
         if state.half == "TOP":
             state.batter_idx_away += 1
+            if pitcher_mode == "starter_home":
+                state.bf_starter_home += 1
         else:
             state.batter_idx_home += 1
+            if pitcher_mode == "starter_away":
+                state.bf_starter_away += 1
 
         current_half_pa_count += 1
         pa_log.append(pa_record)
@@ -362,6 +395,10 @@ def simulate_single_game_fast(
         "away_win": int(state.score_away > state.score_home),
         "is_tie_cap": int(state.score_home == state.score_away),
         "cache_size": int(len(cache)),
+        "used_bullpen_away": int(state.using_bullpen_away),
+        "used_bullpen_home": int(state.using_bullpen_home),
+        "bf_starter_away": int(state.bf_starter_away),
+        "bf_starter_home": int(state.bf_starter_home),
     }
 
     if return_pa_log:
@@ -385,4 +422,8 @@ def summarize_sim_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "p_total_le_7_5": float((df["total_runs"] <= 7).mean()),
         "p_total_ge_8_5": float((df["total_runs"] >= 9).mean()),
         "mean_cache_size": float(df["cache_size"].mean()) if "cache_size" in df.columns else np.nan,
+        "bullpen_used_pct_away": float(df["used_bullpen_away"].mean()) if "used_bullpen_away" in df.columns else np.nan,
+        "bullpen_used_pct_home": float(df["used_bullpen_home"].mean()) if "used_bullpen_home" in df.columns else np.nan,
+        "mean_bf_starter_away": float(df["bf_starter_away"].mean()) if "bf_starter_away" in df.columns else np.nan,
+        "mean_bf_starter_home": float(df["bf_starter_home"].mean()) if "bf_starter_home" in df.columns else np.nan,
     }
