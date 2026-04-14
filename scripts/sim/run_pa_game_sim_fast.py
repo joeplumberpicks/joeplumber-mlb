@@ -21,11 +21,15 @@ from src.utils.drive import resolve_data_dirs
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run fast PA-based game simulation.")
+    parser = argparse.ArgumentParser(description="Run fast PA-based game simulation with bullpen handoff.")
     parser.add_argument("--away-lineup", type=str, required=True)
     parser.add_argument("--home-lineup", type=str, required=True)
-    parser.add_argument("--away-pitcher", type=str, required=True)
-    parser.add_argument("--home-pitcher", type=str, required=True)
+    parser.add_argument("--away-starter", type=str, required=True)
+    parser.add_argument("--home-starter", type=str, required=True)
+    parser.add_argument("--away-bullpen", type=str, default=None)
+    parser.add_argument("--home-bullpen", type=str, default=None)
+    parser.add_argument("--away-starter-bf-cap", type=int, default=24)
+    parser.add_argument("--home-starter-bf-cap", type=int, default=24)
     parser.add_argument("--model-path", type=str, required=True)
     parser.add_argument("--n-sims", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
@@ -46,10 +50,12 @@ def _read_table(path: str) -> pd.DataFrame:
     raise ValueError(f"Unsupported file type: {p}")
 
 
-def _load_pitcher_row(path: str) -> pd.Series:
+def _load_single_row(path: str | None) -> pd.Series | None:
+    if path is None:
+        return None
     df = _read_table(path)
     if len(df) != 1:
-        raise ValueError(f"Pitcher input must contain exactly 1 row: {path}")
+        raise ValueError(f"Single-row input required: {path}")
     return df.iloc[0]
 
 
@@ -63,8 +69,10 @@ def main() -> None:
 
     lineup_away = _read_table(args.away_lineup)
     lineup_home = _read_table(args.home_lineup)
-    pitcher_away = _load_pitcher_row(args.away_pitcher)
-    pitcher_home = _load_pitcher_row(args.home_pitcher)
+    starter_away = _load_single_row(args.away_starter)
+    starter_home = _load_single_row(args.home_starter)
+    bullpen_away = _load_single_row(args.away_bullpen)
+    bullpen_home = _load_single_row(args.home_bullpen)
 
     artifact = load_pa_outcome_artifact(args.model_path)
     rng = np.random.default_rng(args.seed)
@@ -73,10 +81,12 @@ def main() -> None:
     started = time.time()
 
     print("========================================")
-    print("JOE PLUMBER FAST PA GAME SIM")
+    print("JOE PLUMBER FAST PA GAME SIM + BULLPEN")
     print("========================================")
     print(f"n_sims={args.n_sims}")
     print(f"model_path={args.model_path}")
+    print(f"away_starter_bf_cap={args.away_starter_bf_cap}")
+    print(f"home_starter_bf_cap={args.home_starter_bf_cap}")
     print("")
 
     for i in range(args.n_sims):
@@ -84,8 +94,12 @@ def main() -> None:
             artifact=artifact,
             lineup_away=lineup_away,
             lineup_home=lineup_home,
-            pitcher_away=pitcher_away,
-            pitcher_home=pitcher_home,
+            starter_away=starter_away,
+            starter_home=starter_home,
+            bullpen_away=bullpen_away,
+            bullpen_home=bullpen_home,
+            starter_bf_cap_away=args.away_starter_bf_cap,
+            starter_bf_cap_home=args.home_starter_bf_cap,
             rng=rng,
             max_innings=9,
             extra_innings_cap=12,
