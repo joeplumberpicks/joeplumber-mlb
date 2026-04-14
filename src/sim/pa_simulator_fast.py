@@ -153,6 +153,40 @@ def _get_num(row: dict[str, Any], key: str) -> float:
     return float(val) if pd.notna(val) else np.nan
 
 
+def _clip_int(value: float, low: int, high: int) -> int:
+    return int(max(low, min(high, round(value))))
+
+
+def estimate_starter_bf_cap(starter_row: dict[str, Any]) -> int:
+    """
+    Dynamic starter hook based on available rolling workload features.
+    Uses the best available signal in this order:
+    1) pit_batters_faced_roll30 directly
+    2) pit_batters_faced_roll15
+    3) pit_batters_faced_roll7
+    Then scales to an expected per-start leash and clips to a sane band.
+    """
+    bf30 = _get_num(starter_row, "pit_batters_faced_roll30")
+    bf15 = _get_num(starter_row, "pit_batters_faced_roll15")
+    bf7 = _get_num(starter_row, "pit_batters_faced_roll7")
+
+    # Heuristic per-start conversion without needing explicit GS counts in current mart
+    if pd.notna(bf30) and bf30 > 0:
+        est = 12.0 + (bf30 / 4.5)
+        return _clip_int(est, 18, 30)
+
+    if pd.notna(bf15) and bf15 > 0:
+        est = 11.0 + (bf15 / 2.5)
+        return _clip_int(est, 18, 30)
+
+    if pd.notna(bf7) and bf7 > 0:
+        est = 10.0 + bf7
+        return _clip_int(est, 18, 30)
+
+    # Fallback default
+    return 24
+
+
 def build_pre_pa_row(
     batter_row: dict[str, Any],
     pitcher_row: dict[str, Any],
@@ -279,8 +313,8 @@ def simulate_single_game_fast(
     starter_home: pd.Series,
     bullpen_away: pd.Series | None,
     bullpen_home: pd.Series | None,
-    starter_bf_cap_away: int,
-    starter_bf_cap_home: int,
+    starter_bf_cap_away: int | None,
+    starter_bf_cap_home: int | None,
     rng: np.random.Generator,
     max_innings: int = 9,
     extra_innings_cap: int = 12,
@@ -298,6 +332,9 @@ def simulate_single_game_fast(
     starter_home_dict = starter_home.to_dict()
     bullpen_away_dict = bullpen_away.to_dict() if bullpen_away is not None else None
     bullpen_home_dict = bullpen_home.to_dict() if bullpen_home is not None else None
+
+    dynamic_bf_cap_away = starter_bf_cap_away if starter_bf_cap_away is not None else estimate_starter_bf_cap(starter_away_dict)
+    dynamic_bf_cap_home = starter_bf_cap_home if starter_bf_cap_home is not None else estimate_starter_bf_cap(starter_home_dict)
 
     cache: dict[tuple, dict[str, float]] = {}
     feature_columns = list(artifact.feature_columns)
@@ -318,7 +355,7 @@ def simulate_single_game_fast(
             batter_idx = state.batter_idx_away % len(away_rows)
             batter_row = away_rows[batter_idx]
 
-            if bullpen_home_dict is not None and state.bf_starter_home >= starter_bf_cap_home:
+            if bullpen_home_dict is not None and state.bf_starter_home >= dynamic_bf_cap_home:
                 pitcher_row = bullpen_home_dict
                 pitcher_mode = "bullpen_home"
                 state.using_bullpen_home = 1
@@ -330,7 +367,7 @@ def simulate_single_game_fast(
             batter_idx = state.batter_idx_home % len(home_rows)
             batter_row = home_rows[batter_idx]
 
-            if bullpen_away_dict is not None and state.bf_starter_away >= starter_bf_cap_away:
+            if bullpen_away_dict is not None and state.bf_starter_away >= dynamic_bf_cap_away:
                 pitcher_row = bullpen_away_dict
                 pitcher_mode = "bullpen_away"
                 state.using_bullpen_away = 1
@@ -399,6 +436,8 @@ def simulate_single_game_fast(
         "used_bullpen_home": int(state.using_bullpen_home),
         "bf_starter_away": int(state.bf_starter_away),
         "bf_starter_home": int(state.bf_starter_home),
+        "starter_bf_cap_away": int(dynamic_bf_cap_away),
+        "starter_bf_cap_home": int(dynamic_bf_cap_home),
     }
 
     if return_pa_log:
@@ -426,4 +465,6 @@ def summarize_sim_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "bullpen_used_pct_home": float(df["used_bullpen_home"].mean()) if "used_bullpen_home" in df.columns else np.nan,
         "mean_bf_starter_away": float(df["bf_starter_away"].mean()) if "bf_starter_away" in df.columns else np.nan,
         "mean_bf_starter_home": float(df["bf_starter_home"].mean()) if "bf_starter_home" in df.columns else np.nan,
+        "mean_starter_bf_cap_away": float(df["starter_bf_cap_away"].mean()) if "starter_bf_cap_away" in df.columns else np.nan,
+        "mean_starter_bf_cap_home": float(df["starter_bf_cap_home"].mean()) if "starter_bf_cap_home" in df.columns else np.nan,
     }
