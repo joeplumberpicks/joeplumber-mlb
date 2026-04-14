@@ -31,36 +31,21 @@ def _load_parquet(path: Path) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
-def _pick_existing(df: pd.DataFrame, candidates: list[str]) -> list[str]:
-    return [c for c in candidates if c in df.columns]
-
-
-def _safe_to_numeric(df: pd.DataFrame, cols: list[str]) -> None:
-    for c in cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-
-
-def _clip_rate(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce").clip(lower=0.0, upper=1.0)
-
-
 def _prep_pa(pa: pd.DataFrame) -> pd.DataFrame:
     out = pa.copy()
 
     if "game_date" not in out.columns:
         raise ValueError("PA table missing game_date")
+
     out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce")
 
     if "season" not in out.columns:
         out["season"] = out["game_date"].dt.year
 
-    required = ["game_pk", "batter_id", "pitcher_id"]
-    for col in required:
+    for col in ["game_pk", "batter_id", "pitcher_id", "season"]:
         if col not in out.columns:
             raise ValueError(f"PA table missing required column: {col}")
-        out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
-
-    out["season"] = pd.to_numeric(out["season"], errors="coerce").astype("Int64")
+        out[col] = pd.to_numeric(out[col], errors="coerce")
 
     for col in ["inning", "outs_before_pa", "outs_after_pa", "pa_index"]:
         if col in out.columns:
@@ -94,15 +79,12 @@ def _prep_pa(pa: pd.DataFrame) -> pd.DataFrame:
 def _prep_batter_roll(br: pd.DataFrame) -> pd.DataFrame:
     out = br.copy()
 
-    batter_id_col = "batter_id" if "batter_id" in out.columns else ("batter" if "batter" in out.columns else None)
-    if batter_id_col is None:
-        raise ValueError("batter_game_rolling.parquet missing batter_id/batter column")
+    if "batter" in out.columns and "batter_id" not in out.columns:
+        out = out.rename(columns={"batter": "batter_id"})
 
-    if batter_id_col != "batter_id":
-        out = out.rename(columns={batter_id_col: "batter_id"})
-
-    out["batter_id"] = pd.to_numeric(out["batter_id"], errors="coerce").astype("Int64")
-    out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
+    for col in ["game_pk", "batter_id", "season"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
 
     if "game_date" in out.columns:
         out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce")
@@ -113,18 +95,42 @@ def _prep_batter_roll(br: pd.DataFrame) -> pd.DataFrame:
 def _prep_pitcher_roll(pr: pd.DataFrame) -> pd.DataFrame:
     out = pr.copy()
 
-    pitcher_id_col = "pitcher_id" if "pitcher_id" in out.columns else ("pitcher" if "pitcher" in out.columns else None)
-    if pitcher_id_col is None:
-        raise ValueError("pitcher_game_rolling.parquet missing pitcher_id/pitcher column")
+    if "pitcher" in out.columns and "pitcher_id" not in out.columns:
+        out = out.rename(columns={"pitcher": "pitcher_id"})
 
-    if pitcher_id_col != "pitcher_id":
-        out = out.rename(columns={pitcher_id_col: "pitcher_id"})
-
-    out["pitcher_id"] = pd.to_numeric(out["pitcher_id"], errors="coerce").astype("Int64")
-    out["game_pk"] = pd.to_numeric(out["game_pk"], errors="coerce").astype("Int64")
+    for col in ["game_pk", "pitcher_id", "season"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
 
     if "game_date" in out.columns:
         out["game_date"] = pd.to_datetime(out["game_date"], errors="coerce")
+
+    return out
+
+
+def _select_batter_roll_cols(br: pd.DataFrame) -> list[str]:
+    keep = ["game_pk", "batter_id"]
+    keep += [c for c in br.columns if c.startswith("bat_")]
+    return [c for c in keep if c in br.columns]
+
+
+def _select_pitcher_roll_cols(pr: pd.DataFrame) -> list[str]:
+    keep = ["game_pk", "pitcher_id"]
+    keep += [c for c in pr.columns if c.startswith("pit_")]
+    return [c for c in keep if c in pr.columns]
+
+
+def _join_rollings(pa: pd.DataFrame, br: pd.DataFrame, pr: pd.DataFrame) -> pd.DataFrame:
+    out = pa.copy()
+
+    br_cols = _select_batter_roll_cols(br)
+    pr_cols = _select_pitcher_roll_cols(pr)
+
+    br_small = br[br_cols].copy().drop_duplicates(subset=["game_pk", "batter_id"], keep="last")
+    pr_small = pr[pr_cols].copy().drop_duplicates(subset=["game_pk", "pitcher_id"], keep="last")
+
+    out = out.merge(br_small, on=["game_pk", "batter_id"], how="left")
+    out = out.merge(pr_small, on=["game_pk", "pitcher_id"], how="left")
 
     return out
 
@@ -140,99 +146,41 @@ def _build_base_context_features(df: pd.DataFrame) -> pd.DataFrame:
         out["base_runner_count"] = out[["on_1b", "on_2b", "on_3b"]].sum(axis=1)
         out["risp_flag"] = ((out["on_2b"] == 1) | (out["on_3b"] == 1)).astype(int)
         out["bases_empty_flag"] = (out["base_runner_count"] == 0).astype(int)
+    else:
+        out["on_1b"] = 0
+        out["on_2b"] = 0
+        out["on_3b"] = 0
+        out["base_runner_count"] = 0
+        out["risp_flag"] = 0
+        out["bases_empty_flag"] = 1
 
     if "inning_topbot" in out.columns:
         itb = out["inning_topbot"].astype("string").str.upper()
         out["is_top_inning"] = itb.eq("TOP").astype(int)
         out["is_bot_inning"] = itb.eq("BOT").astype(int)
+    else:
+        out["is_top_inning"] = np.nan
+        out["is_bot_inning"] = np.nan
 
     if "inning" in out.columns:
         out["inning"] = pd.to_numeric(out["inning"], errors="coerce")
         out["inning_bucket"] = pd.cut(
             out["inning"],
-            bins=[0, 3, 6, 20],
+            bins=[0, 3, 6, 99],
             labels=["early", "mid", "late"],
             right=True,
         ).astype("string")
+    else:
+        out["inning_bucket"] = pd.Series(pd.NA, index=out.index, dtype="string")
 
     if "outs_before_pa" in out.columns:
         out["outs_before_pa"] = pd.to_numeric(out["outs_before_pa"], errors="coerce")
         out["two_out_flag"] = out["outs_before_pa"].eq(2).astype(int)
+    else:
+        out["two_out_flag"] = np.nan
 
-    return out
-
-
-def _select_batter_roll_cols(br: pd.DataFrame) -> list[str]:
-    candidates = [
-        "game_pk", "batter_id",
-        "pa_roll3", "pa_roll7", "pa_roll15", "pa_roll30",
-        "ab_roll3", "ab_roll7", "ab_roll15", "ab_roll30",
-        "hits_roll3", "hits_roll7", "hits_roll15", "hits_roll30",
-        "hr_roll3", "hr_roll7", "hr_roll15", "hr_roll30",
-        "tb_roll3", "tb_roll7", "tb_roll15", "tb_roll30",
-        "bb_roll3", "bb_roll7", "bb_roll15", "bb_roll30",
-        "so_roll3", "so_roll7", "so_roll15", "so_roll30",
-        "hit_rate_roll3", "hit_rate_roll7", "hit_rate_roll15", "hit_rate_roll30",
-        "hr_rate_roll3", "hr_rate_roll7", "hr_rate_roll15", "hr_rate_roll30",
-        "tb_pa_rate_roll3", "tb_pa_rate_roll7", "tb_pa_rate_roll15", "tb_pa_rate_roll30",
-        "bb_rate_roll3", "bb_rate_roll7", "bb_rate_roll15", "bb_rate_roll30",
-        "so_rate_roll3", "so_rate_roll7", "so_rate_roll15", "so_rate_roll30",
-        "contact_rate_roll3", "contact_rate_roll7", "contact_rate_roll15", "contact_rate_roll30",
-        "whiff_rate_roll3", "whiff_rate_roll7", "whiff_rate_roll15", "whiff_rate_roll30",
-        "hard_hit_rate_roll3", "hard_hit_rate_roll7", "hard_hit_rate_roll15", "hard_hit_rate_roll30",
-        "barrel_rate_roll3", "barrel_rate_roll7", "barrel_rate_roll15", "barrel_rate_roll30",
-        "avg_ev_roll3", "avg_ev_roll7", "avg_ev_roll15", "avg_ev_roll30",
-        "avg_la_roll3", "avg_la_roll7", "avg_la_roll15", "avg_la_roll30",
-        "gb_rate_roll3", "gb_rate_roll7", "gb_rate_roll15", "gb_rate_roll30",
-        "fb_rate_roll3", "fb_rate_roll7", "fb_rate_roll15", "fb_rate_roll30",
-        "pull_rate_roll3", "pull_rate_roll7", "pull_rate_roll15", "pull_rate_roll30",
-        "iso_roll3", "iso_roll7", "iso_roll15", "iso_roll30",
-    ]
-    return _pick_existing(br, candidates)
-
-
-def _select_pitcher_roll_cols(pr: pd.DataFrame) -> list[str]:
-    candidates = [
-        "game_pk", "pitcher_id",
-        "batters_faced_roll3", "batters_faced_roll7", "batters_faced_roll15", "batters_faced_roll30",
-        "hits_allowed_roll3", "hits_allowed_roll7", "hits_allowed_roll15", "hits_allowed_roll30",
-        "hr_allowed_roll3", "hr_allowed_roll7", "hr_allowed_roll15", "hr_allowed_roll30",
-        "bb_allowed_roll3", "bb_allowed_roll7", "bb_allowed_roll15", "bb_allowed_roll30",
-        "so_roll3", "so_roll7", "so_roll15", "so_roll30",
-        "runs_allowed_roll3", "runs_allowed_roll7", "runs_allowed_roll15", "runs_allowed_roll30",
-        "tb_allowed_roll3", "tb_allowed_roll7", "tb_allowed_roll15", "tb_allowed_roll30",
-        "k_rate_roll3", "k_rate_roll7", "k_rate_roll15", "k_rate_roll30",
-        "bb_rate_roll3", "bb_rate_roll7", "bb_rate_roll15", "bb_rate_roll30",
-        "hr_rate_roll3", "hr_rate_roll7", "hr_rate_roll15", "hr_rate_roll30",
-        "hit_rate_roll3", "hit_rate_roll7", "hit_rate_roll15", "hit_rate_roll30",
-        "runs_rate_roll3", "runs_rate_roll7", "runs_rate_roll15", "runs_rate_roll30",
-        "contact_rate_roll3", "contact_rate_roll7", "contact_rate_roll15", "contact_rate_roll30",
-        "whiff_rate_roll3", "whiff_rate_roll7", "whiff_rate_roll15", "whiff_rate_roll30",
-        "hard_hit_rate_roll3", "hard_hit_rate_roll7", "hard_hit_rate_roll15", "hard_hit_rate_roll30",
-        "barrel_rate_roll3", "barrel_rate_roll7", "barrel_rate_roll15", "barrel_rate_roll30",
-        "avg_ev_roll3", "avg_ev_roll7", "avg_ev_roll15", "avg_ev_roll30",
-        "avg_la_roll3", "avg_la_roll7", "avg_la_roll15", "avg_la_roll30",
-        "gb_rate_roll3", "gb_rate_roll7", "gb_rate_roll15", "gb_rate_roll30",
-        "fb_rate_roll3", "fb_rate_roll7", "fb_rate_roll15", "fb_rate_roll30",
-    ]
-    return _pick_existing(pr, candidates)
-
-
-def _join_rollings(pa: pd.DataFrame, br: pd.DataFrame, pr: pd.DataFrame) -> pd.DataFrame:
-    out = pa.copy()
-
-    br_cols = _select_batter_roll_cols(br)
-    pr_cols = _select_pitcher_roll_cols(pr)
-
-    br_small = br[br_cols].copy().rename(
-        columns={c: f"bat_{c}" for c in br_cols if c not in {"game_pk", "batter_id"}}
-    )
-    pr_small = pr[pr_cols].copy().rename(
-        columns={c: f"pit_{c}" for c in pr_cols if c not in {"game_pk", "pitcher_id"}}
-    )
-
-    out = out.merge(br_small, on=["game_pk", "batter_id"], how="left")
-    out = out.merge(pr_small, on=["game_pk", "pitcher_id"], how="left")
+    # placeholder until real lineup slot source is joined
+    out["lineup_slot"] = np.nan
 
     return out
 
@@ -240,113 +188,28 @@ def _join_rollings(pa: pd.DataFrame, br: pd.DataFrame, pr: pd.DataFrame) -> pd.D
 def _engineer_matchup_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
-    for col in [
-        "bat_hit_rate_roll30", "bat_hr_rate_roll30", "bat_bb_rate_roll30", "bat_so_rate_roll30",
-        "bat_contact_rate_roll30", "bat_whiff_rate_roll30", "bat_hard_hit_rate_roll30", "bat_barrel_rate_roll30",
-        "bat_iso_roll30", "bat_tb_pa_rate_roll30",
-        "pit_hit_rate_roll30", "pit_hr_rate_roll30", "pit_bb_rate_roll30", "pit_k_rate_roll30",
-        "pit_contact_rate_roll30", "pit_whiff_rate_roll30", "pit_hard_hit_rate_roll30", "pit_barrel_rate_roll30",
-        "pit_runs_rate_roll30",
-    ]:
-        if col in out.columns:
-            out[col] = pd.to_numeric(out[col], errors="coerce")
-
-    diff_pairs = [
+    pairs_diff = [
         ("matchup_hit_rate_diff", "bat_hit_rate_roll30", "pit_hit_rate_roll30"),
         ("matchup_hr_rate_diff", "bat_hr_rate_roll30", "pit_hr_rate_roll30"),
         ("matchup_bb_rate_diff", "bat_bb_rate_roll30", "pit_bb_rate_roll30"),
         ("matchup_k_pressure_diff", "bat_so_rate_roll30", "pit_k_rate_roll30"),
-        ("matchup_contact_diff", "bat_contact_rate_roll30", "pit_contact_rate_roll30"),
-        ("matchup_whiff_diff", "bat_whiff_rate_roll30", "pit_whiff_rate_roll30"),
-        ("matchup_hard_hit_diff", "bat_hard_hit_rate_roll30", "pit_hard_hit_rate_roll30"),
-        ("matchup_barrel_diff", "bat_barrel_rate_roll30", "pit_barrel_rate_roll30"),
-        ("matchup_power_diff", "bat_iso_roll30", "pit_hr_rate_roll30"),
+        ("matchup_power_diff", "bat_tb_per_pa_roll30", "pit_tb_allowed_per_bf_roll30"),
     ]
 
-    for new_col, a, b in diff_pairs:
+    for new_col, a, b in pairs_diff:
         if a in out.columns and b in out.columns:
             out[new_col] = pd.to_numeric(out[a], errors="coerce") - pd.to_numeric(out[b], errors="coerce")
 
-    interaction_pairs = [
+    pairs_x = [
         ("matchup_hr_pressure_x", "bat_hr_rate_roll30", "pit_hr_rate_roll30"),
         ("matchup_hit_pressure_x", "bat_hit_rate_roll30", "pit_hit_rate_roll30"),
         ("matchup_walk_pressure_x", "bat_bb_rate_roll30", "pit_bb_rate_roll30"),
         ("matchup_k_pressure_x", "bat_so_rate_roll30", "pit_k_rate_roll30"),
-        ("matchup_contact_x", "bat_contact_rate_roll30", "pit_contact_rate_roll30"),
-        ("matchup_hard_hit_x", "bat_hard_hit_rate_roll30", "pit_hard_hit_rate_roll30"),
-        ("matchup_barrel_x", "bat_barrel_rate_roll30", "pit_barrel_rate_roll30"),
     ]
 
-    for new_col, a, b in interaction_pairs:
+    for new_col, a, b in pairs_x:
         if a in out.columns and b in out.columns:
             out[new_col] = pd.to_numeric(out[a], errors="coerce") * pd.to_numeric(out[b], errors="coerce")
-
-    return out
-
-
-def _engineer_form_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-
-    windows = [3, 7, 15, 30]
-
-    for w in windows:
-        bat_pa = f"bat_pa_roll{w}"
-        bat_hits = f"bat_hits_roll{w}"
-        bat_hr = f"bat_hr_roll{w}"
-        bat_bb = f"bat_bb_roll{w}"
-        bat_so = f"bat_so_roll{w}"
-        bat_tb = f"bat_tb_roll{w}"
-
-        if bat_pa in out.columns and bat_hits in out.columns:
-            out[f"bat_hit_rate_calc_roll{w}"] = pd.to_numeric(out[bat_hits], errors="coerce") / pd.to_numeric(out[bat_pa], errors="coerce")
-        if bat_pa in out.columns and bat_hr in out.columns:
-            out[f"bat_hr_rate_calc_roll{w}"] = pd.to_numeric(out[bat_hr], errors="coerce") / pd.to_numeric(out[bat_pa], errors="coerce")
-        if bat_pa in out.columns and bat_bb in out.columns:
-            out[f"bat_bb_rate_calc_roll{w}"] = pd.to_numeric(out[bat_bb], errors="coerce") / pd.to_numeric(out[bat_pa], errors="coerce")
-        if bat_pa in out.columns and bat_so in out.columns:
-            out[f"bat_so_rate_calc_roll{w}"] = pd.to_numeric(out[bat_so], errors="coerce") / pd.to_numeric(out[bat_pa], errors="coerce")
-        if bat_pa in out.columns and bat_tb in out.columns:
-            out[f"bat_tb_pa_rate_calc_roll{w}"] = pd.to_numeric(out[bat_tb], errors="coerce") / pd.to_numeric(out[bat_pa], errors="coerce")
-
-        pit_bf = f"pit_batters_faced_roll{w}"
-        pit_hits = f"pit_hits_allowed_roll{w}"
-        pit_hr = f"pit_hr_allowed_roll{w}"
-        pit_bb = f"pit_bb_allowed_roll{w}"
-        pit_runs = f"pit_runs_allowed_roll{w}"
-
-        if pit_bf in out.columns and pit_hits in out.columns:
-            out[f"pit_hit_rate_calc_roll{w}"] = pd.to_numeric(out[pit_hits], errors="coerce") / pd.to_numeric(out[pit_bf], errors="coerce")
-        if pit_bf in out.columns and pit_hr in out.columns:
-            out[f"pit_hr_rate_calc_roll{w}"] = pd.to_numeric(out[pit_hr], errors="coerce") / pd.to_numeric(out[pit_bf], errors="coerce")
-        if pit_bf in out.columns and pit_bb in out.columns:
-            out[f"pit_bb_rate_calc_roll{w}"] = pd.to_numeric(out[pit_bb], errors="coerce") / pd.to_numeric(out[pit_bf], errors="coerce")
-        if pit_bf in out.columns and pit_runs in out.columns:
-            out[f"pit_runs_rate_calc_roll{w}"] = pd.to_numeric(out[pit_runs], errors="coerce") / pd.to_numeric(out[pit_bf], errors="coerce")
-
-    return out
-
-
-def _engineer_stability_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-
-    def delta(col_a: str, col_b: str, new_col: str) -> None:
-        if col_a in out.columns and col_b in out.columns:
-            out[new_col] = pd.to_numeric(out[col_a], errors="coerce") - pd.to_numeric(out[col_b], errors="coerce")
-
-    delta("bat_hit_rate_roll7", "bat_hit_rate_roll30", "bat_hit_rate_trend_7v30")
-    delta("bat_hr_rate_roll7", "bat_hr_rate_roll30", "bat_hr_rate_trend_7v30")
-    delta("bat_bb_rate_roll7", "bat_bb_rate_roll30", "bat_bb_rate_trend_7v30")
-    delta("bat_so_rate_roll7", "bat_so_rate_roll30", "bat_so_rate_trend_7v30")
-    delta("bat_contact_rate_roll7", "bat_contact_rate_roll30", "bat_contact_trend_7v30")
-    delta("bat_hard_hit_rate_roll7", "bat_hard_hit_rate_roll30", "bat_hard_hit_trend_7v30")
-    delta("bat_barrel_rate_roll7", "bat_barrel_rate_roll30", "bat_barrel_trend_7v30")
-
-    delta("pit_hit_rate_roll7", "pit_hit_rate_roll30", "pit_hit_rate_trend_7v30")
-    delta("pit_hr_rate_roll7", "pit_hr_rate_roll30", "pit_hr_rate_trend_7v30")
-    delta("pit_bb_rate_roll7", "pit_bb_rate_roll30", "pit_bb_rate_trend_7v30")
-    delta("pit_k_rate_roll7", "pit_k_rate_roll30", "pit_k_rate_trend_7v30")
-    delta("pit_hard_hit_rate_roll7", "pit_hard_hit_rate_roll30", "pit_hard_hit_trend_7v30")
-    delta("pit_barrel_rate_roll7", "pit_barrel_rate_roll30", "pit_barrel_trend_7v30")
 
     return out
 
@@ -354,9 +217,8 @@ def _engineer_stability_features(df: pd.DataFrame) -> pd.DataFrame:
 def _postprocess_types(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
-    string_cols = _pick_existing(
-        out,
-        [
+    string_cols = [
+        c for c in [
             "pa_outcome_target",
             "event_type",
             "inning_topbot",
@@ -364,25 +226,17 @@ def _postprocess_types(df: pd.DataFrame) -> pd.DataFrame:
             "batting_team",
             "fielding_team",
             "inning_bucket",
-        ],
-    )
+        ] if c in out.columns
+    ]
     for col in string_cols:
         out[col] = out[col].astype("string")
-
-    num_cols = [c for c in out.columns if c not in string_cols and c not in {"game_date"}]
-    for col in num_cols:
-        if out[col].dtype == "object":
-            maybe_num = pd.to_numeric(out[col], errors="coerce")
-            if maybe_num.notna().sum() > 0:
-                out[col] = maybe_num
 
     return out
 
 
 def _sort_cols_for_preview(df: pd.DataFrame) -> list[str]:
-    front = _pick_existing(
-        df,
-        [
+    front = [
+        c for c in [
             "game_date",
             "season",
             "game_pk",
@@ -394,8 +248,8 @@ def _sort_cols_for_preview(df: pd.DataFrame) -> list[str]:
             "base_state_before",
             "pa_outcome_target",
             "event_type",
-        ],
-    )
+        ] if c in df.columns
+    ]
     rest = [c for c in df.columns if c not in front]
     return front + rest
 
@@ -411,8 +265,6 @@ def build_pa_outcome_mart(
 
     df = _join_rollings(pa, batter_roll, pitcher_roll)
     df = _build_base_context_features(df)
-    df = _engineer_form_features(df)
-    df = _engineer_stability_features(df)
     df = _engineer_matchup_features(df)
     df = _postprocess_types(df)
 
@@ -433,22 +285,29 @@ def main() -> None:
     by_season_out_dir.mkdir(parents=True, exist_ok=True)
     pa_outcome_out_dir.mkdir(parents=True, exist_ok=True)
 
-    pa_path = processed_dir / "pa.parquet"
-    batter_roll_path = processed_dir / "batter_game_rolling.parquet"
-    pitcher_roll_path = processed_dir / "pitcher_game_rolling.parquet"
-
-    pa = _load_parquet(pa_path)
-    batter_roll = _load_parquet(batter_roll_path)
-    pitcher_roll = _load_parquet(pitcher_roll_path)
+    pa = _load_parquet(processed_dir / "pa.parquet")
+    batter_roll = _load_parquet(processed_dir / "batter_game_rolling.parquet")
+    pitcher_roll = _load_parquet(processed_dir / "pitcher_game_rolling.parquet")
 
     print("========================================")
     print("JOE PLUMBER PA OUTCOME MART BUILD")
     print("========================================")
-    print(f"pa_path={pa_path}")
-    print(f"batter_roll_path={batter_roll_path}")
-    print(f"pitcher_roll_path={pitcher_roll_path}")
+    print(f"pa_rows={len(pa):,}")
+    print(f"batter_roll_rows={len(batter_roll):,}")
+    print(f"pitcher_roll_rows={len(pitcher_roll):,}")
 
     mart = build_pa_outcome_mart(pa=pa, batter_roll=batter_roll, pitcher_roll=pitcher_roll)
+
+    bat_cols = [c for c in mart.columns if c.startswith("bat_")]
+    pit_cols = [c for c in mart.columns if c.startswith("pit_")]
+    matchup_cols = [c for c in mart.columns if c.startswith("matchup_")]
+
+    print("")
+    print(f"mart_rows={len(mart):,}")
+    print(f"mart_cols={len(mart.columns):,}")
+    print(f"bat_cols={len(bat_cols)}")
+    print(f"pit_cols={len(pit_cols)}")
+    print(f"matchup_cols={len(matchup_cols)}")
 
     if args.season is not None:
         mart = mart[mart["season"] == args.season].copy()
