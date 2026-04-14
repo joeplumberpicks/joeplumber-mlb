@@ -10,7 +10,6 @@ from src.models.pa_outcome_model import PaOutcomeArtifact, predict_pa_outcome_pr
 
 
 PA_CLASSES = ["out", "walk_hbp", "single", "double", "triple", "home_run"]
-
 DROP_DEAD_FEATURES = {
     "pitch_number_start",
     "pitch_number_end",
@@ -20,6 +19,7 @@ DROP_DEAD_FEATURES = {
     "hc_x",
     "hc_y",
 }
+HALF_INNING_PA_CAP = 25
 
 
 @dataclass
@@ -248,11 +248,7 @@ def get_pa_probabilities_fast(
     )
 
     usable_feature_columns = [c for c in feature_columns if c not in DROP_DEAD_FEATURES]
-
-    row_payload = {}
-    for c in usable_feature_columns:
-        row_payload[c] = sim_row.get(c, np.nan)
-
+    row_payload = {c: sim_row.get(c, np.nan) for c in usable_feature_columns}
     sim_df = pd.DataFrame([row_payload])
 
     proba = predict_pa_outcome_proba(artifact, sim_df).iloc[0].to_dict()
@@ -294,12 +290,17 @@ def simulate_single_game_fast(
     cache: dict[tuple, dict[str, float]] = {}
     feature_columns = list(artifact.feature_columns)
 
+    current_half_pa_count = 0
+
     while True:
         if state.inning > max_innings:
             if state.score_away != state.score_home:
                 break
             if state.inning > extra_innings_cap:
                 break
+
+        if current_half_pa_count >= HALF_INNING_PA_CAP:
+            state.outs = 3
 
         if state.half == "TOP":
             batter_idx = state.batter_idx_away % len(away_rows)
@@ -329,6 +330,7 @@ def simulate_single_game_fast(
             "batter_id": batter_row.get("batter_id"),
             "pitcher_id": pitcher_row.get("pitcher_id"),
             "outcome": outcome,
+            "half_inning_pa_count": current_half_pa_count,
             **{f"p_{k}": float(v) for k, v in probs.items()},
         }
 
@@ -342,10 +344,12 @@ def simulate_single_game_fast(
         else:
             state.batter_idx_home += 1
 
+        current_half_pa_count += 1
         pa_log.append(pa_record)
 
         if state.outs >= 3:
             state = advance_half_inning(state)
+            current_half_pa_count = 0
 
         if state.inning >= max_innings and state.half == "TOP" and state.score_home > state.score_away:
             break
@@ -369,7 +373,7 @@ def simulate_single_game_fast(
 def summarize_sim_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     df = pd.DataFrame(results)
 
-    summary = {
+    return {
         "n_sims": int(len(df)),
         "home_win_pct": float(df["home_win"].mean()),
         "away_win_pct": float(df["away_win"].mean()),
@@ -382,4 +386,3 @@ def summarize_sim_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "p_total_ge_8_5": float((df["total_runs"] >= 9).mean()),
         "mean_cache_size": float(df["cache_size"].mean()) if "cache_size" in df.columns else np.nan,
     }
-    return summary
