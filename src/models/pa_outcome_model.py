@@ -146,6 +146,14 @@ def make_pa_outcome_pipeline(
     return pipe, numeric_features, categorical_features
 
 
+def _ensure_expected_columns(df: pd.DataFrame, expected_columns: list[str]) -> pd.DataFrame:
+    out = df.copy()
+    for col in expected_columns:
+        if col not in out.columns:
+            out[col] = np.nan
+    return out
+
+
 def _sanitize_features_for_sklearn(
     df: pd.DataFrame,
     numeric_features: list[str],
@@ -208,7 +216,8 @@ def predict_pa_outcome_proba(
     artifact: PaOutcomeArtifact,
     df: pd.DataFrame,
 ) -> pd.DataFrame:
-    X = df[artifact.feature_columns].copy()
+    X = _ensure_expected_columns(df, artifact.feature_columns)
+    X = X[artifact.feature_columns].copy()
     X = _sanitize_features_for_sklearn(
         X,
         numeric_features=artifact.numeric_features,
@@ -228,7 +237,8 @@ def predict_pa_outcome_class(
     artifact: PaOutcomeArtifact,
     df: pd.DataFrame,
 ) -> pd.Series:
-    X = df[artifact.feature_columns].copy()
+    X = _ensure_expected_columns(df, artifact.feature_columns)
+    X = X[artifact.feature_columns].copy()
     X = _sanitize_features_for_sklearn(
         X,
         numeric_features=artifact.numeric_features,
