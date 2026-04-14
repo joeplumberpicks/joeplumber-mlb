@@ -60,8 +60,8 @@ def _latest_rows_for_batters(
             raise ValueError(f"No historical mart row found for batter_id={batter_id}")
 
         row = sub.iloc[-1].copy()
-
         keep_cols = [c for c in row.index if c.startswith("bat_")]
+
         clean = row[keep_cols].to_dict()
         clean["batter_id"] = batter_id
         clean["lineup_slot"] = slot
@@ -90,6 +90,7 @@ def _latest_row_for_pitcher(
 
     row = sub.iloc[-1].copy()
     keep_cols = [c for c in row.index if c.startswith("pit_")]
+
     clean = row[keep_cols].to_dict()
     clean["pitcher_id"] = pitcher_id
     clean["fielding_team"] = team_code
@@ -142,8 +143,8 @@ def main() -> None:
 
     away_lineup_out = out_dir / f"{args.away_team}_{args.game_date}_lineup.csv"
     home_lineup_out = out_dir / f"{args.home_team}_{args.game_date}_lineup.csv"
-    away_pitcher_out = out_dir / f"{args.away_team}_{args.game-date}_pitcher.csv"
-    home_pitcher_out = out_dir / f"{args.home_team}_{args.game-date}_pitcher.csv"
+    away_pitcher_out = out_dir / f"{args.away_team}_{args.game_date}_pitcher.csv"
+    home_pitcher_out = out_dir / f"{args.home_team}_{args.game_date}_pitcher.csv"
 
     lineup_away.to_csv(away_lineup_out, index=False)
     lineup_home.to_csv(home_lineup_out, index=False)
