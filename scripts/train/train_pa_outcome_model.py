@@ -26,49 +26,128 @@ from src.utils.config import load_config
 from src.utils.drive import resolve_data_dirs
 
 
+SAFE_EXACT_FEATURES = [
+    "inning",
+    "outs_before_pa",
+    "base_state_before",
+    "on_1b",
+    "on_2b",
+    "on_3b",
+    "base_runner_count",
+    "risp_flag",
+    "bases_empty_flag",
+    "is_top_inning",
+    "is_bot_inning",
+    "two_out_flag",
+    "inning_bucket",
+    "lineup_slot",
+]
+
+SAFE_BAT_PREFIXES = [
+    "bat_pa_roll",
+    "bat_ab_roll",
+    "bat_hits_roll",
+    "bat_hr_roll",
+    "bat_tb_roll",
+    "bat_bb_roll",
+    "bat_so_roll",
+    "bat_hit_rate_roll",
+    "bat_hr_rate_roll",
+    "bat_tb_pa_rate_roll",
+    "bat_bb_rate_roll",
+    "bat_so_rate_roll",
+    "bat_contact_rate_roll",
+    "bat_whiff_rate_roll",
+    "bat_hard_hit_rate_roll",
+    "bat_barrel_rate_roll",
+    "bat_avg_ev_roll",
+    "bat_avg_la_roll",
+    "bat_gb_rate_roll",
+    "bat_fb_rate_roll",
+    "bat_pull_rate_roll",
+    "bat_iso_roll",
+    "bat_hit_rate_calc_roll",
+    "bat_hr_rate_calc_roll",
+    "bat_bb_rate_calc_roll",
+    "bat_so_rate_calc_roll",
+    "bat_tb_pa_rate_calc_roll",
+    "bat_hit_rate_trend_7v30",
+    "bat_hr_rate_trend_7v30",
+    "bat_bb_rate_trend_7v30",
+    "bat_so_rate_trend_7v30",
+    "bat_contact_trend_7v30",
+    "bat_hard_hit_trend_7v30",
+    "bat_barrel_trend_7v30",
+]
+
+SAFE_PIT_PREFIXES = [
+    "pit_batters_faced_roll",
+    "pit_hits_allowed_roll",
+    "pit_hr_allowed_roll",
+    "pit_bb_allowed_roll",
+    "pit_so_roll",
+    "pit_runs_allowed_roll",
+    "pit_tb_allowed_roll",
+    "pit_k_rate_roll",
+    "pit_bb_rate_roll",
+    "pit_hr_rate_roll",
+    "pit_hit_rate_roll",
+    "pit_runs_rate_roll",
+    "pit_contact_rate_roll",
+    "pit_whiff_rate_roll",
+    "pit_hard_hit_rate_roll",
+    "pit_barrel_rate_roll",
+    "pit_avg_ev_roll",
+    "pit_avg_la_roll",
+    "pit_gb_rate_roll",
+    "pit_fb_rate_roll",
+    "pit_hit_rate_calc_roll",
+    "pit_hr_rate_calc_roll",
+    "pit_bb_rate_calc_roll",
+    "pit_runs_rate_calc_roll",
+    "pit_hit_rate_trend_7v30",
+    "pit_hr_rate_trend_7v30",
+    "pit_bb_rate_trend_7v30",
+    "pit_k_rate_trend_7v30",
+    "pit_hard_hit_trend_7v30",
+    "pit_barrel_trend_7v30",
+]
+
+SAFE_MATCHUP_PREFIXES = [
+    "matchup_hit_rate_diff",
+    "matchup_hr_rate_diff",
+    "matchup_bb_rate_diff",
+    "matchup_k_pressure_diff",
+    "matchup_contact_diff",
+    "matchup_whiff_diff",
+    "matchup_hard_hit_diff",
+    "matchup_barrel_diff",
+    "matchup_power_diff",
+    "matchup_hr_pressure_x",
+    "matchup_hit_pressure_x",
+    "matchup_walk_pressure_x",
+    "matchup_k_pressure_x",
+    "matchup_contact_x",
+    "matchup_hard_hit_x",
+    "matchup_barrel_x",
+]
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train PA outcome model from mart.")
-    parser.add_argument(
-        "--train-seasons",
-        type=str,
-        default="2019,2020,2021,2022,2023,2024",
-        help="Comma-separated training seasons.",
-    )
-    parser.add_argument(
-        "--test-seasons",
-        type=str,
-        default="2025",
-        help="Comma-separated test seasons.",
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="configs/project.yaml",
-        help="Project config path relative to repo root.",
-    )
-    parser.add_argument(
-        "--mart-path",
-        type=str,
-        default=None,
-        help="Optional explicit mart path. Defaults to data/marts/pa_outcome/pa_outcome_features.parquet",
-    )
+    parser = argparse.ArgumentParser(description="Train PA outcome model from mart with strict safe features.")
+    parser.add_argument("--train-seasons", type=str, default="2019,2020,2021,2022,2023,2024")
+    parser.add_argument("--test-seasons", type=str, default="2025")
+    parser.add_argument("--config", type=str, default="configs/project.yaml")
+    parser.add_argument("--mart-path", type=str, default=None)
     parser.add_argument("--random-state", type=int, default=42)
     return parser.parse_args()
 
 
 def _parse_seasons(text: str) -> list[int]:
-    vals: list[int] = []
-    for token in str(text).split(","):
-        token = token.strip()
-        if token:
-            vals.append(int(token))
+    vals = [int(t.strip()) for t in str(text).split(",") if t.strip()]
     if not vals:
         raise ValueError(f"No seasons parsed from: {text}")
     return vals
-
-
-def _pick_existing(df: pd.DataFrame, candidates: list[str]) -> list[str]:
-    return [c for c in candidates if c in df.columns]
 
 
 def _load_mart(mart_path: Path) -> pd.DataFrame:
@@ -95,43 +174,24 @@ def _prep_mart(df: pd.DataFrame) -> pd.DataFrame:
 
     out = out[out["season"].notna()].copy()
     out = out[out["pa_outcome_target"].notna()].copy()
-
-    valid_classes = set(PA_OUTCOME_CLASSES)
-    out = out[out["pa_outcome_target"].isin(valid_classes)].copy()
-
+    out = out[out["pa_outcome_target"].isin(set(PA_OUTCOME_CLASSES))].copy()
     return out
 
 
+def _is_safe_feature(col: str) -> bool:
+    if col in SAFE_EXACT_FEATURES:
+        return True
+    for prefix in SAFE_BAT_PREFIXES + SAFE_PIT_PREFIXES + SAFE_MATCHUP_PREFIXES:
+        if col.startswith(prefix):
+            return True
+    return False
+
+
 def _build_feature_columns(df: pd.DataFrame) -> list[str]:
-    exclude = {
-        "game_date",
-        "season",
-        "game_pk",
-        "pa_index",
-        "batter_id",
-        "pitcher_id",
-        "pa_outcome_target",
-        "event_type",
-        "is_pa",
-        "is_ab",
-        "is_1b",
-        "is_2b",
-        "is_3b",
-        "is_hr",
-        "is_bb",
-        "is_hbp",
-        "is_so",
-        "outs_after_pa",
-        "rbi",
-        "runs_scored_on_pa",
-    }
-
-    feature_columns = [c for c in df.columns if c not in exclude]
-
+    feature_columns = [c for c in df.columns if _is_safe_feature(c)]
     if not feature_columns:
-        raise ValueError("No feature columns found in mart.")
-
-    return feature_columns
+        raise ValueError("No strict safe feature columns found in mart.")
+    return sorted(feature_columns)
 
 
 def _multiclass_metrics(df: pd.DataFrame, proba: pd.DataFrame, pred: pd.Series) -> dict:
@@ -141,7 +201,7 @@ def _multiclass_metrics(df: pd.DataFrame, proba: pd.DataFrame, pred: pd.Series) 
     proba_cols = [f"p_{c}" for c in PA_OUTCOME_CLASSES]
     proba_mat = proba[proba_cols].to_numpy()
 
-    metrics = {
+    return {
         "n_test": int(len(df)),
         "accuracy": float(accuracy_score(y_true, pred)),
         "top2_accuracy": float(
@@ -159,18 +219,10 @@ def _multiclass_metrics(df: pd.DataFrame, proba: pd.DataFrame, pred: pd.Series) 
                 labels=np.arange(len(PA_OUTCOME_CLASSES)),
             )
         ),
-        "class_rates_test": {
-            c: float((y_true == c).mean()) for c in PA_OUTCOME_CLASSES
-        },
-        "pred_rates_test": {
-            c: float((pred == c).mean()) for c in PA_OUTCOME_CLASSES
-        },
-        "mean_predicted_probability": {
-            c: float(proba[f"p_{c}"].mean()) for c in PA_OUTCOME_CLASSES
-        },
+        "class_rates_test": {c: float((y_true == c).mean()) for c in PA_OUTCOME_CLASSES},
+        "pred_rates_test": {c: float((pred == c).mean()) for c in PA_OUTCOME_CLASSES},
+        "mean_predicted_probability": {c: float(proba[f"p_{c}"].mean()) for c in PA_OUTCOME_CLASSES},
     }
-
-    return metrics
 
 
 def main() -> None:
@@ -189,14 +241,10 @@ def main() -> None:
     models_dir.mkdir(parents=True, exist_ok=True)
     backtests_dir.mkdir(parents=True, exist_ok=True)
 
-    mart_path = (
-        Path(args.mart_path)
-        if args.mart_path is not None
-        else marts_dir / "pa_outcome" / "pa_outcome_features.parquet"
-    )
+    mart_path = Path(args.mart_path) if args.mart_path else marts_dir / "pa_outcome" / "pa_outcome_features.parquet"
 
     print("========================================")
-    print("JOE PLUMBER PA OUTCOME TRAIN")
+    print("JOE PLUMBER STRICT SAFE PA OUTCOME TRAIN")
     print("========================================")
     print(f"train_seasons={train_seasons}")
     print(f"test_seasons={test_seasons}")
@@ -227,7 +275,7 @@ def main() -> None:
     metrics = _multiclass_metrics(test_df, test_proba, test_pred)
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    artifact_name = f"pa_outcome_xgb_mart_TEST{'-'.join(map(str, test_seasons))}_{stamp}"
+    artifact_name = f"pa_outcome_xgb_strictsafe_TEST{'-'.join(map(str, test_seasons))}_{stamp}"
 
     saved = save_pa_outcome_artifact(
         artifact=artifact,
@@ -235,45 +283,36 @@ def main() -> None:
         artifact_name=artifact_name,
     )
 
-    preview_cols = _pick_existing(
-        test_df,
-        [
-            "game_date",
-            "season",
-            "game_pk",
-            "pa_index",
-            "batter_id",
-            "pitcher_id",
-            "inning",
-            "outs_before_pa",
-            "base_state_before",
-            "event_type",
-            "pa_outcome_target",
-        ],
-    )
+    preview_cols = [c for c in ["game_date", "season", "game_pk", "pa_index", "batter_id", "pitcher_id", "inning", "outs_before_pa", "base_state_before", "pa_outcome_target"] if c in test_df.columns]
     preview = test_df[preview_cols].copy()
     preview["pred_pa_outcome"] = test_pred
     preview = pd.concat([preview.reset_index(drop=True), test_proba.reset_index(drop=True)], axis=1)
 
     preview_path = backtests_dir / f"{artifact_name}_preview.parquet"
     metrics_path = backtests_dir / f"{artifact_name}_metrics.json"
+    feature_list_path = backtests_dir / f"{artifact_name}_features.txt"
 
     preview.to_parquet(preview_path, index=False)
-
-    payload = {
-        "artifact_name": artifact_name,
-        "train_seasons": train_seasons,
-        "test_seasons": test_seasons,
-        "feature_count": len(feature_columns),
-        "feature_columns": feature_columns,
-        "model_path": saved["model_path"],
-        "meta_path": saved["meta_path"],
-        "preview_path": str(preview_path),
-        "metrics": metrics,
-    }
-
     with metrics_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+        json.dump(
+            {
+                "artifact_name": artifact_name,
+                "train_seasons": train_seasons,
+                "test_seasons": test_seasons,
+                "feature_count": len(feature_columns),
+                "feature_columns": feature_columns,
+                "model_path": saved["model_path"],
+                "meta_path": saved["meta_path"],
+                "preview_path": str(preview_path),
+                "metrics": metrics,
+            },
+            f,
+            indent=2,
+        )
+
+    with feature_list_path.open("w", encoding="utf-8") as f:
+        for col in feature_columns:
+            f.write(col + "\n")
 
     print("")
     print("=== TRAIN SUMMARY ===")
@@ -298,6 +337,7 @@ def main() -> None:
     print("meta_out:", saved["meta_path"])
     print("metrics_out:", metrics_path)
     print("preview_out:", preview_path)
+    print("feature_list_out:", feature_list_path)
 
 
 if __name__ == "__main__":
