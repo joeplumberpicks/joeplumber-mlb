@@ -71,10 +71,6 @@ def _clip_int(value: float, low: int, high: int) -> int:
 def estimate_starter_bf_cap(starter_row: dict[str, Any]) -> int:
     """
     Dynamic starter hook with workload-first, quality-fallback logic.
-
-    Priority:
-    1) Use rolling batters faced directly when available.
-    2) Otherwise estimate leash from quality/workload proxies.
     """
     bf30 = _get_num(starter_row, "pit_batters_faced_roll30")
     bf15 = _get_num(starter_row, "pit_batters_faced_roll15")
@@ -338,6 +334,9 @@ def simulate_single_game_fast(
     state = GameState()
     pa_log: list[dict[str, Any]] = []
 
+    top1_runs = 0
+    bot1_runs = 0
+
     lineup_away = lineup_away.reset_index(drop=True).copy()
     lineup_home = lineup_home.reset_index(drop=True).copy()
 
@@ -415,7 +414,16 @@ def simulate_single_game_fast(
             **{f"p_{k}": float(v) for k, v in probs.items()},
         }
 
+        pre_half = state.half
+        pre_inning = state.inning
+
         state, runs_scored = apply_pa_outcome(state, outcome)
+
+        if pre_inning == 1 and pre_half == "TOP":
+            top1_runs += runs_scored
+        elif pre_inning == 1 and pre_half == "BOT":
+            bot1_runs += runs_scored
+
         pa_record["runs_scored_on_pa"] = runs_scored
         pa_record["score_away_after"] = state.score_away
         pa_record["score_home_after"] = state.score_home
@@ -453,6 +461,13 @@ def simulate_single_game_fast(
         "bf_starter_home": int(state.bf_starter_home),
         "starter_bf_cap_away": int(dynamic_bf_cap_away),
         "starter_bf_cap_home": int(dynamic_bf_cap_home),
+        "top1_runs": int(top1_runs),
+        "bot1_runs": int(bot1_runs),
+        "first_inning_runs": int(top1_runs + bot1_runs),
+        "top1_run": int(top1_runs > 0),
+        "bot1_run": int(bot1_runs > 0),
+        "yrfi": int((top1_runs + bot1_runs) > 0),
+        "nrfi": int((top1_runs + bot1_runs) == 0),
     }
 
     if return_pa_log:
@@ -482,4 +497,11 @@ def summarize_sim_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_bf_starter_home": float(df["bf_starter_home"].mean()) if "bf_starter_home" in df.columns else np.nan,
         "mean_starter_bf_cap_away": float(df["starter_bf_cap_away"].mean()) if "starter_bf_cap_away" in df.columns else np.nan,
         "mean_starter_bf_cap_home": float(df["starter_bf_cap_home"].mean()) if "starter_bf_cap_home" in df.columns else np.nan,
+        "mean_top1_runs": float(df["top1_runs"].mean()) if "top1_runs" in df.columns else np.nan,
+        "mean_bot1_runs": float(df["bot1_runs"].mean()) if "bot1_runs" in df.columns else np.nan,
+        "mean_first_inning_runs": float(df["first_inning_runs"].mean()) if "first_inning_runs" in df.columns else np.nan,
+        "p_top1_run": float(df["top1_run"].mean()) if "top1_run" in df.columns else np.nan,
+        "p_bot1_run": float(df["bot1_run"].mean()) if "bot1_run" in df.columns else np.nan,
+        "p_yrfi": float(df["yrfi"].mean()) if "yrfi" in df.columns else np.nan,
+        "p_nrfi": float(df["nrfi"].mean()) if "nrfi" in df.columns else np.nan,
     }
