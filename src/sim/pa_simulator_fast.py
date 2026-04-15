@@ -73,7 +73,7 @@ def estimate_starter_bf_cap(starter_row: dict[str, Any]) -> int:
     Dynamic starter hook with workload-first, quality-fallback logic.
 
     Priority:
-    1) Use explicit rolling batters faced if available.
+    1) Use rolling batters faced directly when available.
     2) Otherwise estimate leash from quality/workload proxies.
     """
     bf30 = _get_num(starter_row, "pit_batters_faced_roll30")
@@ -81,11 +81,11 @@ def estimate_starter_bf_cap(starter_row: dict[str, Any]) -> int:
     bf7 = _get_num(starter_row, "pit_batters_faced_roll7")
 
     if pd.notna(bf30) and bf30 > 0:
-        return _clip_int(12.0 + (bf30 / 4.5), 18, 30)
+        return _clip_int(bf30, 18, 30)
     if pd.notna(bf15) and bf15 > 0:
-        return _clip_int(11.0 + (bf15 / 2.5), 18, 30)
+        return _clip_int(bf15 + 2, 18, 30)
     if pd.notna(bf7) and bf7 > 0:
-        return _clip_int(10.0 + bf7, 18, 30)
+        return _clip_int(bf7 + 6, 18, 30)
 
     k_rate = _get_num(starter_row, "pit_k_rate_roll30")
     bb_rate = _get_num(starter_row, "pit_bb_rate_roll30")
@@ -105,9 +105,9 @@ def estimate_starter_bf_cap(starter_row: dict[str, Any]) -> int:
     if pd.notna(hr_rate):
         score -= 15.0 * hr_rate
     if pd.notna(outs_pg):
-        score += 0.35 * outs_pg
+        score += 3.0 * outs_pg
     if pd.notna(ip30):
-        score += 0.15 * ip30
+        score += 0.2 * ip30
 
     if score >= 7.5:
         return 27
