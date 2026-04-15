@@ -16,12 +16,24 @@ from src.utils.drive import resolve_data_dirs
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build clean PA sim inputs from PA outcome mart.")
+    parser = argparse.ArgumentParser(
+        description="Build live PA sim inputs from rolling tables."
+    )
     parser.add_argument("--game-date", type=str, required=True)
     parser.add_argument("--away-team", type=str, required=True)
     parser.add_argument("--home-team", type=str, required=True)
-    parser.add_argument("--away-batters", type=str, required=True, help="Comma-separated batter_ids in lineup order")
-    parser.add_argument("--home-batters", type=str, required=True, help="Comma-separated batter_ids in lineup order")
+    parser.add_argument(
+        "--away-batters",
+        type=str,
+        required=True,
+        help="Comma-separated batter_ids in lineup order",
+    )
+    parser.add_argument(
+        "--home-batters",
+        type=str,
+        required=True,
+        help="Comma-separated batter_ids in lineup order",
+    )
     parser.add_argument("--away-pitcher-id", type=int, required=True)
     parser.add_argument("--home-pitcher-id", type=int, required=True)
     parser.add_argument("--config", type=str, default="configs/project.yaml")
@@ -32,7 +44,111 @@ def _parse_ids(text: str) -> list[int]:
     return [int(x.strip()) for x in text.split(",") if x.strip()]
 
 
-def _coerce_numeric_except_strings(df: pd.DataFrame, string_cols: set[str]) -> pd.DataFrame:
+def _load_batter_rollings(path: Path) -> pd.DataFrame:
+    df = pd.read_parquet(path).copy()
+
+    if "batter" in df.columns and "batter_id" not in df.columns:
+        df = df.rename(columns={"batter": "batter_id"})
+
+    required = ["game_date", "game_pk", "batter_id"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"batter rolling missing columns: {missing}")
+
+    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+    df["game_pk"] = pd.to_numeric(df["game_pk"], errors="coerce")
+    df["batter_id"] = pd.to_numeric(df["batter_id"], errors="coerce")
+
+    return df
+
+
+def _load_pitcher_rollings(path: Path) -> pd.DataFrame:
+    df = pd.read_parquet(path).copy()
+
+    if "pitcher" in df.columns and "pitcher_id" not in df.columns:
+        df = df.rename(columns={"pitcher": "pitcher_id"})
+
+    required = ["game_date", "game_pk", "pitcher_id"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"pitcher rolling missing columns: {missing}")
+
+    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+    df["game_pk"] = pd.to_numeric(df["game_pk"], errors="coerce")
+    df["pitcher_id"] = pd.to_numeric(df["pitcher_id"], errors="coerce")
+
+    return df
+
+
+def _latest_batter_rows(
+    batter_roll: pd.DataFrame,
+    batter_ids: list[int],
+    as_of_date: pd.Timestamp,
+    team_code: str,
+) -> pd.DataFrame:
+    df = batter_roll[batter_roll["game_date"] < as_of_date].copy()
+
+    out_rows: list[dict] = []
+    for slot, batter_id in enumerate(batter_ids, start=1):
+        sub = df[df["batter_id"] == batter_id].sort_values(
+            ["game_date", "game_pk"], kind="stable"
+        )
+        if sub.empty:
+            raise ValueError(
+                f"No batter rolling row found before {as_of_date.date()} for batter_id={batter_id}"
+            )
+
+        row = sub.iloc[-1].copy()
+
+        keep_cols = [
+            c
+            for c in row.index
+            if c in {"batter_id", "batter_name"} or c.startswith("bat_")
+        ]
+
+        clean = row[keep_cols].to_dict()
+        clean["batter_id"] = int(batter_id)
+        clean["lineup_slot"] = slot
+        clean["batting_team"] = team_code
+        out_rows.append(clean)
+
+    out = pd.DataFrame(out_rows).reset_index(drop=True)
+    return out
+
+
+def _latest_pitcher_row(
+    pitcher_roll: pd.DataFrame,
+    pitcher_id: int,
+    as_of_date: pd.Timestamp,
+    team_code: str,
+) -> pd.DataFrame:
+    df = pitcher_roll[pitcher_roll["game_date"] < as_of_date].copy()
+    sub = df[df["pitcher_id"] == pitcher_id].sort_values(
+        ["game_date", "game_pk"], kind="stable"
+    )
+
+    if sub.empty:
+        raise ValueError(
+            f"No pitcher rolling row found before {as_of_date.date()} for pitcher_id={pitcher_id}"
+        )
+
+    row = sub.iloc[-1].copy()
+
+    keep_cols = [
+        c
+        for c in row.index
+        if c in {"pitcher_id", "pitcher_name"} or c.startswith("pit_")
+    ]
+
+    clean = row[keep_cols].to_dict()
+    clean["pitcher_id"] = int(pitcher_id)
+    clean["fielding_team"] = team_code
+
+    out = pd.DataFrame([clean]).reset_index(drop=True)
+    return out
+
+
+def _coerce_output_types(df: pd.DataFrame, string_cols: set[str]) -> pd.DataFrame:
     out = df.copy()
     for col in out.columns:
         if col in string_cols:
@@ -42,104 +158,57 @@ def _coerce_numeric_except_strings(df: pd.DataFrame, string_cols: set[str]) -> p
     return out
 
 
-def _latest_rows_for_batters(
-    mart: pd.DataFrame,
-    batter_ids: list[int],
-    as_of_date: pd.Timestamp,
-    team_code: str,
-) -> pd.DataFrame:
-    df = mart.copy()
-    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
-    df["batter_id"] = pd.to_numeric(df["batter_id"], errors="coerce").astype("Int64")
-    df = df[df["game_date"] < as_of_date].copy()
-
-    out_rows = []
-    for slot, batter_id in enumerate(batter_ids, start=1):
-        sub = df[df["batter_id"] == batter_id].sort_values("game_date")
-        if sub.empty:
-            raise ValueError(f"No historical mart row found for batter_id={batter_id}")
-
-        row = sub.iloc[-1].copy()
-        keep_cols = [c for c in row.index if c.startswith("bat_")]
-
-        clean = row[keep_cols].to_dict()
-        clean["batter_id"] = batter_id
-        clean["lineup_slot"] = slot
-        clean["batting_team"] = team_code
-        out_rows.append(clean)
-
-    out = pd.DataFrame(out_rows).reset_index(drop=True)
-    out = _coerce_numeric_except_strings(out, {"batting_team"})
-    return out
-
-
-def _latest_row_for_pitcher(
-    mart: pd.DataFrame,
-    pitcher_id: int,
-    as_of_date: pd.Timestamp,
-    team_code: str,
-) -> pd.DataFrame:
-    df = mart.copy()
-    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
-    df["pitcher_id"] = pd.to_numeric(df["pitcher_id"], errors="coerce").astype("Int64")
-    df = df[df["game_date"] < as_of_date].copy()
-
-    sub = df[df["pitcher_id"] == pitcher_id].sort_values("game_date")
-    if sub.empty:
-        raise ValueError(f"No historical mart row found for pitcher_id={pitcher_id}")
-
-    row = sub.iloc[-1].copy()
-    keep_cols = [c for c in row.index if c.startswith("pit_")]
-
-    clean = row[keep_cols].to_dict()
-    clean["pitcher_id"] = pitcher_id
-    clean["fielding_team"] = team_code
-
-    out = pd.DataFrame([clean])
-    out = _coerce_numeric_except_strings(out, {"fielding_team"})
-    return out
-
-
 def main() -> None:
     args = parse_args()
 
     config = load_config((REPO_ROOT / args.config).resolve())
     dirs = resolve_data_dirs(config=config, prefer_drive=True)
 
-    mart_path = Path(dirs["marts_dir"]) / "pa_outcome" / "pa_outcome_features.parquet"
+    processed_dir = Path(dirs["processed_dir"])
     out_dir = Path(dirs["outputs_dir"]) / "pa_sim_inputs"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    mart = pd.read_parquet(mart_path)
+    batter_roll_path = processed_dir / "batter_game_rolling.parquet"
+    pitcher_roll_path = processed_dir / "pitcher_game_rolling.parquet"
+
+    batter_roll = _load_batter_rollings(batter_roll_path)
+    pitcher_roll = _load_pitcher_rollings(pitcher_roll_path)
+
     as_of_date = pd.Timestamp(args.game_date)
 
     away_batters = _parse_ids(args.away_batters)
     home_batters = _parse_ids(args.home_batters)
 
-    lineup_away = _latest_rows_for_batters(
-        mart=mart,
+    lineup_away = _latest_batter_rows(
+        batter_roll=batter_roll,
         batter_ids=away_batters,
         as_of_date=as_of_date,
         team_code=args.away_team,
     )
-    lineup_home = _latest_rows_for_batters(
-        mart=mart,
+    lineup_home = _latest_batter_rows(
+        batter_roll=batter_roll,
         batter_ids=home_batters,
         as_of_date=as_of_date,
         team_code=args.home_team,
     )
-    pitcher_away = _latest_row_for_pitcher(
-        mart=mart,
+
+    pitcher_away = _latest_pitcher_row(
+        pitcher_roll=pitcher_roll,
         pitcher_id=args.away_pitcher_id,
         as_of_date=as_of_date,
         team_code=args.away_team,
     )
-    pitcher_home = _latest_row_for_pitcher(
-        mart=mart,
+    pitcher_home = _latest_pitcher_row(
+        pitcher_roll=pitcher_roll,
         pitcher_id=args.home_pitcher_id,
         as_of_date=as_of_date,
         team_code=args.home_team,
     )
+
+    lineup_away = _coerce_output_types(lineup_away, {"batter_name", "batting_team"})
+    lineup_home = _coerce_output_types(lineup_home, {"batter_name", "batting_team"})
+    pitcher_away = _coerce_output_types(pitcher_away, {"pitcher_name", "fielding_team"})
+    pitcher_home = _coerce_output_types(pitcher_home, {"pitcher_name", "fielding_team"})
 
     away_lineup_out = out_dir / f"{args.away_team}_{args.game_date}_lineup.csv"
     home_lineup_out = out_dir / f"{args.home_team}_{args.game_date}_lineup.csv"
@@ -152,13 +221,25 @@ def main() -> None:
     pitcher_home.to_csv(home_pitcher_out, index=False)
 
     print("========================================")
-    print("JOE PLUMBER PA SIM INPUT BUILD")
+    print("JOE PLUMBER LIVE PA SIM INPUT BUILD")
     print("========================================")
-    print(f"mart_path={mart_path}")
+    print(f"batter_roll_path={batter_roll_path}")
+    print(f"pitcher_roll_path={pitcher_roll_path}")
     print(f"away_lineup_out={away_lineup_out} rows={len(lineup_away):,} cols={len(lineup_away.columns):,}")
     print(f"home_lineup_out={home_lineup_out} rows={len(lineup_home):,} cols={len(lineup_home.columns):,}")
     print(f"away_pitcher_out={away_pitcher_out} rows={len(pitcher_away):,} cols={len(pitcher_away.columns):,}")
     print(f"home_pitcher_out={home_pitcher_out} rows={len(pitcher_home):,} cols={len(pitcher_home.columns):,}")
+
+    away_non_null = lineup_away.notna().mean().mean()
+    home_non_null = lineup_home.notna().mean().mean()
+    away_pitcher_non_null = pitcher_away.notna().mean().mean()
+    home_pitcher_non_null = pitcher_home.notna().mean().mean()
+
+    print("")
+    print(f"away_lineup_non_null_rate={away_non_null:.3f}")
+    print(f"home_lineup_non_null_rate={home_non_null:.3f}")
+    print(f"away_pitcher_non_null_rate={away_pitcher_non_null:.3f}")
+    print(f"home_pitcher_non_null_rate={home_pitcher_non_null:.3f}")
 
 
 if __name__ == "__main__":
