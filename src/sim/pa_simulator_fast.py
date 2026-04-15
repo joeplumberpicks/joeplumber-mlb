@@ -59,6 +59,67 @@ def inning_bucket(inning: int) -> str:
     return "late"
 
 
+def _get_num(row: dict[str, Any], key: str) -> float:
+    val = row.get(key, np.nan)
+    return float(val) if pd.notna(val) else np.nan
+
+
+def _clip_int(value: float, low: int, high: int) -> int:
+    return int(max(low, min(high, round(value))))
+
+
+def estimate_starter_bf_cap(starter_row: dict[str, Any]) -> int:
+    """
+    Dynamic starter hook with workload-first, quality-fallback logic.
+
+    Priority:
+    1) Use explicit rolling batters faced if available.
+    2) Otherwise estimate leash from quality/workload proxies.
+    """
+    bf30 = _get_num(starter_row, "pit_batters_faced_roll30")
+    bf15 = _get_num(starter_row, "pit_batters_faced_roll15")
+    bf7 = _get_num(starter_row, "pit_batters_faced_roll7")
+
+    if pd.notna(bf30) and bf30 > 0:
+        return _clip_int(12.0 + (bf30 / 4.5), 18, 30)
+    if pd.notna(bf15) and bf15 > 0:
+        return _clip_int(11.0 + (bf15 / 2.5), 18, 30)
+    if pd.notna(bf7) and bf7 > 0:
+        return _clip_int(10.0 + bf7, 18, 30)
+
+    k_rate = _get_num(starter_row, "pit_k_rate_roll30")
+    bb_rate = _get_num(starter_row, "pit_bb_rate_roll30")
+    hit_rate = _get_num(starter_row, "pit_hit_rate_roll30")
+    hr_rate = _get_num(starter_row, "pit_hr_rate_roll30")
+    outs_pg = _get_num(starter_row, "pit_outs_per_game_roll30")
+    ip30 = _get_num(starter_row, "pit_ip_roll30")
+
+    score = 0.0
+
+    if pd.notna(k_rate):
+        score += 20.0 * k_rate
+    if pd.notna(bb_rate):
+        score -= 12.0 * bb_rate
+    if pd.notna(hit_rate):
+        score -= 10.0 * hit_rate
+    if pd.notna(hr_rate):
+        score -= 15.0 * hr_rate
+    if pd.notna(outs_pg):
+        score += 0.35 * outs_pg
+    if pd.notna(ip30):
+        score += 0.15 * ip30
+
+    if score >= 7.5:
+        return 27
+    if score >= 5.5:
+        return 25
+    if score >= 3.5:
+        return 23
+    if score >= 1.5:
+        return 21
+    return 19
+
+
 def apply_pa_outcome(
     state: GameState,
     outcome: str,
@@ -148,45 +209,6 @@ def choose_outcome_from_probs(
     return str(rng.choice(PA_CLASSES, p=p))
 
 
-def _get_num(row: dict[str, Any], key: str) -> float:
-    val = row.get(key, np.nan)
-    return float(val) if pd.notna(val) else np.nan
-
-
-def _clip_int(value: float, low: int, high: int) -> int:
-    return int(max(low, min(high, round(value))))
-
-
-def estimate_starter_bf_cap(starter_row: dict[str, Any]) -> int:
-    """
-    Dynamic starter hook based on available rolling workload features.
-    Uses the best available signal in this order:
-    1) pit_batters_faced_roll30 directly
-    2) pit_batters_faced_roll15
-    3) pit_batters_faced_roll7
-    Then scales to an expected per-start leash and clips to a sane band.
-    """
-    bf30 = _get_num(starter_row, "pit_batters_faced_roll30")
-    bf15 = _get_num(starter_row, "pit_batters_faced_roll15")
-    bf7 = _get_num(starter_row, "pit_batters_faced_roll7")
-
-    # Heuristic per-start conversion without needing explicit GS counts in current mart
-    if pd.notna(bf30) and bf30 > 0:
-        est = 12.0 + (bf30 / 4.5)
-        return _clip_int(est, 18, 30)
-
-    if pd.notna(bf15) and bf15 > 0:
-        est = 11.0 + (bf15 / 2.5)
-        return _clip_int(est, 18, 30)
-
-    if pd.notna(bf7) and bf7 > 0:
-        est = 10.0 + bf7
-        return _clip_int(est, 18, 30)
-
-    # Fallback default
-    return 24
-
-
 def build_pre_pa_row(
     batter_row: dict[str, Any],
     pitcher_row: dict[str, Any],
@@ -221,11 +243,7 @@ def build_pre_pa_row(
         ("matchup_hr_rate_diff", "bat_hr_rate_roll30", "pit_hr_rate_roll30"),
         ("matchup_bb_rate_diff", "bat_bb_rate_roll30", "pit_bb_rate_roll30"),
         ("matchup_k_pressure_diff", "bat_so_rate_roll30", "pit_k_rate_roll30"),
-        ("matchup_contact_diff", "bat_contact_rate_roll30", "pit_contact_rate_roll30"),
-        ("matchup_whiff_diff", "bat_whiff_rate_roll30", "pit_whiff_rate_roll30"),
-        ("matchup_hard_hit_diff", "bat_hard_hit_rate_roll30", "pit_hard_hit_rate_roll30"),
-        ("matchup_barrel_diff", "bat_barrel_rate_roll30", "pit_barrel_rate_roll30"),
-        ("matchup_power_diff", "bat_iso_roll30", "pit_hr_rate_roll30"),
+        ("matchup_power_diff", "bat_tb_per_pa_roll30", "pit_tb_allowed_per_bf_roll30"),
     ]
     for new_col, a, b in pairs_diff:
         av = _get_num(row, a)
@@ -237,9 +255,6 @@ def build_pre_pa_row(
         ("matchup_hit_pressure_x", "bat_hit_rate_roll30", "pit_hit_rate_roll30"),
         ("matchup_walk_pressure_x", "bat_bb_rate_roll30", "pit_bb_rate_roll30"),
         ("matchup_k_pressure_x", "bat_so_rate_roll30", "pit_k_rate_roll30"),
-        ("matchup_contact_x", "bat_contact_rate_roll30", "pit_contact_rate_roll30"),
-        ("matchup_hard_hit_x", "bat_hard_hit_rate_roll30", "pit_hard_hit_rate_roll30"),
-        ("matchup_barrel_x", "bat_barrel_rate_roll30", "pit_barrel_rate_roll30"),
     ]
     for new_col, a, b in pairs_x:
         av = _get_num(row, a)
