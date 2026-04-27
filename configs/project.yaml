@@ -93,3 +93,9 @@ outputs:
 logging:
   level: INFO
   log_to_file: true
+
+  rotowire:
+  projected_lineups_url: "https://www.rotowire.com/baseball/daily-lineups.php"
+  confirmed_lineups_url: "https://www.rotowire.com/baseball/daily-lineups.php"
+  starting_pitchers_url: "https://www.rotowire.com/baseball/daily-lineups.php"
+  request_timeout: 30
