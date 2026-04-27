@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-from datetime import datetime
 
 import argparse
 import json
@@ -21,23 +20,21 @@ from src.utils.config import load_config
 from src.utils.drive import resolve_data_dirs
 
 
-# ------------------------
-# ARGUMENTS
-# ------------------------
-def parse_args():
-    parser = argparse.ArgumentParser()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run fast PA-based game simulation with dynamic starter hook."
+    )
 
-    # NEW (for slate runner)
-    parser.add_argument("--away-batters-file", type=str)
-    parser.add_argument("--home-batters-file", type=str)
-    parser.add_argument("--away-pitcher-id", type=int)
-    parser.add_argument("--home-pitcher-id", type=int)
+    parser.add_argument("--away-lineup", type=str, required=True)
+    parser.add_argument("--home-lineup", type=str, required=True)
+    parser.add_argument("--away-starter", type=str, required=True)
+    parser.add_argument("--home-starter", type=str, required=True)
 
-    # OLD (keep compatibility)
-    parser.add_argument("--away-lineup", type=str)
-    parser.add_argument("--home-lineup", type=str)
-    parser.add_argument("--away-starter", type=str)
-    parser.add_argument("--home-starter", type=str)
+    parser.add_argument("--away-bullpen", type=str, default=None)
+    parser.add_argument("--home-bullpen", type=str, default=None)
+
+    parser.add_argument("--away-starter-bf-cap", type=int, default=None)
+    parser.add_argument("--home-starter-bf-cap", type=int, default=None)
 
     parser.add_argument("--model-path", type=str, required=True)
     parser.add_argument("--n-sims", type=int, default=1000)
@@ -45,85 +42,69 @@ def parse_args():
     parser.add_argument("--config", type=str, default="configs/project.yaml")
 
     parser.add_argument("--out-csv", type=str, default=None)
+    parser.add_argument("--out-json", type=str, default=None)
 
     return parser.parse_args()
 
 
-# ------------------------
-# HELPERS
-# ------------------------
-def _read_table(path):
+def _read_table(path: str) -> pd.DataFrame:
     p = Path(path)
-    if p.suffix == ".csv":
+    if not p.exists():
+        raise FileNotFoundError(f"Missing file: {p}")
+
+    if p.suffix.lower() == ".csv":
         return pd.read_csv(p)
-    if p.suffix == ".parquet":
+
+    if p.suffix.lower() == ".parquet":
         return pd.read_parquet(p)
-    raise ValueError("Unsupported file type")
+
+    raise ValueError(f"Unsupported file type: {p}")
 
 
-def load_starter_from_id(player_id, season, date, dirs):
-    """
-    Pull starter row from live pitcher features
-    """
-    path = Path(dirs["data_dir"]) / "processed" / "live" / f"pitcher_game_rolling_{season}_{date}.parquet"
+def _load_single_row(path: str | None) -> pd.Series | None:
+    if path is None:
+        return None
 
-    if not path.exists():
-        raise FileNotFoundError(f"Missing pitcher features: {path}")
-
-    df = pd.read_parquet(path)
-    row = df[df["player_id"] == player_id]
-
-    if row.empty:
-        raise ValueError(f"No pitcher row for id {player_id}")
-
-    return row.iloc[0]
-
-
-def build_lineup_df(path):
     df = _read_table(path)
-    return df
+
+    if len(df) != 1:
+        raise ValueError(f"Single-row input required: {path}")
+
+    return df.iloc[0]
 
 
-# ------------------------
-# MAIN
-# ------------------------
-def main():
+def main() -> None:
     args = parse_args()
 
     config = load_config((REPO_ROOT / args.config).resolve())
     dirs = resolve_data_dirs(config=config, prefer_drive=True)
 
+    outputs_dir = Path(dirs["outputs_dir"]) / "pa_sims"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    lineup_away = _read_table(args.away_lineup)
+    lineup_home = _read_table(args.home_lineup)
+
+    starter_away = _load_single_row(args.away_starter)
+    starter_home = _load_single_row(args.home_starter)
+
+    bullpen_away = _load_single_row(args.away_bullpen)
+    bullpen_home = _load_single_row(args.home_bullpen)
+
     artifact = load_pa_outcome_artifact(args.model_path)
     rng = np.random.default_rng(args.seed)
 
-    # ------------------------
-    # LINEUPS
-    # ------------------------
-    if args.away_batters_file:
-        lineup_away = build_lineup_df(args.away_batters_file)
-        lineup_home = build_lineup_df(args.home_batters_file)
-    else:
-        lineup_away = _read_table(args.away_lineup)
-        lineup_home = _read_table(args.home_lineup)
-
-    # ------------------------
-    # STARTERS
-    # ------------------------
-    if args.away_pitcher_id:
-        season = config["seasons_default"][-1]
-        date = datetime.today().strftime("%Y-%m-%d")
-
-        starter_away = load_starter_from_id(args.away_pitcher_id, season, date, dirs)
-        starter_home = load_starter_from_id(args.home_pitcher_id, season, date, dirs)
-    else:
-        starter_away = _read_table(args.away_starter).iloc[0]
-        starter_home = _read_table(args.home_starter).iloc[0]
-
-    # ------------------------
-    # SIM LOOP
-    # ------------------------
     results = []
-    start = time.time()
+    started = time.time()
+
+    print("========================================")
+    print("JOE PLUMBER FAST PA GAME SIM + DYNAMIC HOOK")
+    print("========================================")
+    print(f"n_sims={args.n_sims}")
+    print(f"model_path={args.model_path}")
+    print(f"away_starter_bf_cap={args.away_starter_bf_cap}")
+    print(f"home_starter_bf_cap={args.home_starter_bf_cap}")
+    print("")
 
     for i in range(args.n_sims):
         res = simulate_single_game_fast(
@@ -132,31 +113,47 @@ def main():
             lineup_home=lineup_home,
             starter_away=starter_away,
             starter_home=starter_home,
-            bullpen_away=None,
-            bullpen_home=None,
+            bullpen_away=bullpen_away,
+            bullpen_home=bullpen_home,
+            starter_bf_cap_away=args.away_starter_bf_cap,
+            starter_bf_cap_home=args.home_starter_bf_cap,
             rng=rng,
+            max_innings=9,
+            extra_innings_cap=12,
+            return_pa_log=False,
         )
+
         results.append(res)
 
+        progress_every = max(1, min(100, args.n_sims // 10 if args.n_sims >= 10 else 1))
+        if (i + 1) % progress_every == 0:
+            elapsed = time.time() - started
+            print(f"completed_sims={i + 1}/{args.n_sims} elapsed_sec={elapsed:.2f}")
+
+    sim_df = pd.DataFrame(results)
+
     summary = summarize_sim_results(results)
+    summary["elapsed_seconds"] = float(time.time() - started)
 
-    # ------------------------
-    # SAVE CLEAN OUTPUT
-    # ------------------------
-    output = {
-        "home_win_pct": summary["home_win_pct"],
-        "away_win_pct": summary["away_win_pct"],
-        "p_nrfi": summary["p_nrfi"],
-        "p_yrfi": summary["p_yrfi"],
-        "mean_total_runs": summary["mean_total_runs"],
-    }
+    out_csv = Path(args.out_csv) if args.out_csv else outputs_dir / "pa_game_sim_results_fast.csv"
+    out_json = Path(args.out_json) if args.out_json else outputs_dir / "pa_game_sim_summary_fast.json"
 
-    out_path = Path(args.out_csv) if args.out_csv else Path("sim_summary.csv")
-    pd.DataFrame([output]).to_csv(out_path, index=False)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    out_json.parent.mkdir(parents=True, exist_ok=True)
 
-    print("\n=== SIM SUMMARY ===")
-    print(json.dumps(output, indent=2))
-    print(f"\nSaved: {out_path}")
+    # Save one-row summary CSV for slate runner compatibility.
+    pd.DataFrame([summary]).to_csv(out_csv, index=False)
+
+    # Save JSON summary too, for older workflows.
+    with out_json.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print("")
+    print("=== SIM SUMMARY ===")
+    print(json.dumps(summary, indent=2))
+    print("")
+    print(f"results_out={out_csv}")
+    print(f"summary_out={out_json}")
 
 
 if __name__ == "__main__":
