@@ -178,8 +178,20 @@ def normalize_lineup_records(
                 errors="coerce",
             ).astype("Int64"),
             "player_name": df.get("player_name", df.get("name", df.get("batter_name"))).astype("string"),
-            "handedness_bat": df.get("handedness_bat", df.get("bats")).astype("string"),
-            "handedness_throw": df.get("handedness_throw", df.get("throws")).astype("string"),
+            "handedness_bat": (
+    df["handedness_bat"]
+    if "handedness_bat" in df.columns
+    else df["bats"]
+    if "bats" in df.columns
+    else pd.Series(pd.NA, index=df.index)
+).astype("string"),
+            "handedness_throw": (
+    df["handedness_throw"]
+    if "handedness_throw" in df.columns
+    else df["throws"]
+    if "throws" in df.columns
+    else pd.Series(pd.NA, index=df.index)
+).astype("string"),
             "position": df.get("position", df.get("pos")).astype("string"),
             "is_starting_lineup": (
                 df.get("is_starting_lineup", True)
